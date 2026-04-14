@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+detect_ghcr_owner() {
+  local owner="narwhal-cloud"
+  if command -v git >/dev/null 2>&1; then
+    local remote_url
+    remote_url="$(git -C "$ROOT_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    if [[ -n "$remote_url" ]]; then
+      if [[ "$remote_url" =~ github\.com[:/]([^/]+)/[^/]+(\.git)?$ ]]; then
+        owner="${BASH_REMATCH[1]}"
+      fi
+    fi
+  fi
+  echo "$owner"
+}
+
+generate_secret() {
+  tr -d '-' </proc/sys/kernel/random/uuid | cut -c 1-25
+}
+
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "Please run as root: sudo bash scripts/install-client.sh"
   exit 1
@@ -12,15 +32,18 @@ if ! command -v podman >/dev/null 2>&1; then
   apt-get install -y podman
 fi
 
-read -rp "Image source [local/github] (default local): " IMAGE_SOURCE
-IMAGE_SOURCE=${IMAGE_SOURCE:-local}
+read -rp "Image source [local/github] (default github): " IMAGE_SOURCE
+IMAGE_SOURCE=${IMAGE_SOURCE:-github}
 IMAGE_SOURCE=$(echo "$IMAGE_SOURCE" | tr '[:upper:]' '[:lower:]')
 
-read -rp "GitHub image (for github source) [ghcr.io/narwhal-cloud/podman-watcher-client:latest]: " GITHUB_IMAGE
-GITHUB_IMAGE=${GITHUB_IMAGE:-ghcr.io/narwhal-cloud/podman-watcher-client:latest}
+DEFAULT_GITHUB_IMAGE="ghcr.io/$(detect_ghcr_owner)/podman-watcher-client:latest"
+read -rp "GitHub image (for github source) [${DEFAULT_GITHUB_IMAGE}]: " GITHUB_IMAGE
+GITHUB_IMAGE=${GITHUB_IMAGE:-$DEFAULT_GITHUB_IMAGE}
 
 read -rp "Server URL (e.g. http://1.2.3.4:8080): " SERVER_URL
-read -rp "Shared secret: " SECRET
+DEFAULT_SECRET="$(generate_secret)"
+read -rp "Shared secret [${DEFAULT_SECRET}]: " SECRET
+SECRET=${SECRET:-$DEFAULT_SECRET}
 read -rp "Host ID [$(hostname)]: " HOST_ID
 HOST_ID=${HOST_ID:-$(hostname)}
 read -rp "Collect interval seconds [300]: " INTERVAL
@@ -43,8 +66,13 @@ case "$IMAGE_SOURCE" in
     podman build -t "$IMAGE_NAME" -f client/Dockerfile client
     ;;
   github)
-    podman pull "$GITHUB_IMAGE"
-    IMAGE_NAME="$GITHUB_IMAGE"
+    echo "Trying to pull $GITHUB_IMAGE..."
+    if podman pull "$GITHUB_IMAGE"; then
+      IMAGE_NAME="$GITHUB_IMAGE"
+    else
+      echo "[WARN] Pull github image failed. Falling back to local build (this avoids GHCR 403/private image issues)."
+      podman build -t "$IMAGE_NAME" -f client/Dockerfile client
+    fi
     ;;
   *)
     echo "Unsupported image source: $IMAGE_SOURCE"

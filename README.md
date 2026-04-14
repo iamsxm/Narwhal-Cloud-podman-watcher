@@ -151,10 +151,9 @@ sudo journalctl -u narwhal-monitor-client -n 120 --no-pager
 
 ```bash
 podman ps --format '{{.ID}}|{{.Names}}|{{.Image}}'
-CONTAINER_NAME="2f6f527a"   # 改成你自己的容器名（例如上面 ps 输出里的 Names）
-podman stats --no-stream --format json "$CONTAINER_NAME"
-podman stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}' "$CONTAINER_NAME"
-podman inspect "$CONTAINER_NAME" --format '{{.State.Pid}}'
+podman stats --no-stream --format json <容器名>
+podman stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}' <容器名>
+podman inspect <容器名> --format '{{.State.Pid}}'
 ```
 
 判断标准：

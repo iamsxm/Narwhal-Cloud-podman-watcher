@@ -497,12 +497,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
 
     stats_json = run([runtime, "stats", "--no-stream", "--format", "json", name])
     parsed_stats = _parse_stats_json(stats_json)
-    stats_tpl = run([runtime, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}", name])
-    if not stats_tpl.strip():
-        # 部分运行时不支持 NetIO，尝试 NetInput/NetOutput 组合。
-        stats_tpl = run(
-            [runtime, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetInput}}|{{.NetOutput}}", name]
-        )
+    stats_tpl = run([runtime, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}", name])
     parsed_tpl = _parse_stats_template(stats_tpl)
     stats_compact = run([runtime, "stats", "--no-stream", "--format", "{{.CPU}}|{{.MemUsageBytes}}|{{.NetInput}}|{{.NetOutput}}", name])
     parsed_compact = _parse_stats_compact(stats_compact)

@@ -249,16 +249,16 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
     net_tx_total_bytes = 0
 
     parts = (stats_text or "").strip().split("|")
-    if len(parts) >= 4:
+    if len(parts) >= 3:
         cpu_percent = _normalize_stat_number(parts[0])
         mem_bytes = parse_size(parts[1].split("/")[0].strip())
         net = parts[2].split("/")
         if len(net) == 2:
             net_rx_total_bytes = parse_size(net[0].strip())
             net_tx_total_bytes = parse_size(net[1].strip())
-        if net_rx_total_bytes <= 0:
+        if len(parts) >= 4 and net_rx_total_bytes <= 0:
             net_rx_total_bytes = parse_size(parts[2].strip())
-        if net_tx_total_bytes <= 0:
+        if len(parts) >= 5 and net_tx_total_bytes <= 0:
             net_tx_total_bytes = parse_size(parts[3].strip())
 
     return {
@@ -317,6 +317,35 @@ def _count_connections_from_pid(pid: int) -> int:
     for name in files:
         total += _count_proc_net_lines(f"{base}/{name}")
     return total
+
+
+def _read_net_bytes_from_pid(pid: int) -> Tuple[int, int]:
+    if pid <= 0:
+        return 0, 0
+    path = f"/proc/{pid}/net/dev"
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return 0, 0
+    if len(lines) <= 2:
+        return 0, 0
+
+    rx_total = 0
+    tx_total = 0
+    for line in lines[2:]:
+        if ":" not in line:
+            continue
+        _, data = line.split(":", 1)
+        cols = data.split()
+        if len(cols) < 16:
+            continue
+        try:
+            rx_total += int(cols[0])
+            tx_total += int(cols[8])
+        except ValueError:
+            continue
+    return rx_total, tx_total
 
 
 def _count_connections_from_exec(runtime: str, name: str) -> int:
@@ -461,55 +490,74 @@ def collect_container(name: str, container_id: str = "") -> Dict:
 
     cpu_percent = 0.0
     mem = 0
+    rx_total = 0
+    tx_total = 0
     net_rx = 0.0
     net_tx = 0.0
 
     stats_json = run([runtime, "stats", "--no-stream", "--format", "json", name])
     parsed_stats = _parse_stats_json(stats_json)
-    cpu_percent = float(parsed_stats["cpu_percent"])
-    mem = int(parsed_stats["mem_bytes"])
-    rx_total = int(parsed_stats["net_rx_total_bytes"])
-    tx_total = int(parsed_stats["net_tx_total_bytes"])
-    container_key = container_id or name
-    net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
+    stats_tpl = run([runtime, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}", name])
+    if not stats_tpl.strip():
+        # 部分运行时不支持 NetIO，尝试 NetInput/NetOutput 组合。
+        stats_tpl = run(
+            [runtime, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetInput}}|{{.NetOutput}}", name]
+        )
+    parsed_tpl = _parse_stats_template(stats_tpl)
+    stats_compact = run([runtime, "stats", "--no-stream", "--format", "{{.CPU}}|{{.MemUsageBytes}}|{{.NetInput}}|{{.NetOutput}}", name])
+    parsed_compact = _parse_stats_compact(stats_compact)
 
-    if cpu_percent <= 0 and mem <= 0 and rx_total <= 0 and tx_total <= 0:
-        stats_tpl = run([runtime, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}", name])
-        parsed_tpl = _parse_stats_template(stats_tpl)
-        cpu_percent = float(parsed_tpl["cpu_percent"])
-        mem = int(parsed_tpl["mem_bytes"])
-        rx_total = int(parsed_tpl["net_rx_total_bytes"])
-        tx_total = int(parsed_tpl["net_tx_total_bytes"])
-        net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
-        if cpu_percent <= 0 and mem <= 0 and rx_total <= 0 and tx_total <= 0:
-            stats_compact = run(
-                [runtime, "stats", "--no-stream", "--format", "{{.CPU}}|{{.MemUsageBytes}}|{{.NetInput}}|{{.NetOutput}}", name]
-            )
-            parsed_compact = _parse_stats_compact(stats_compact)
-            cpu_percent = float(parsed_compact["cpu_percent"])
-            mem = int(parsed_compact["mem_bytes"])
-            rx_total = int(parsed_compact["net_rx_total_bytes"])
-            tx_total = int(parsed_compact["net_tx_total_bytes"])
-            net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
-        if stats_json.strip() == "" and stats_tpl.strip() == "":
-            warn_key = f"{runtime}:stats-empty"
-            if warn_key not in _warned_parse_paths:
-                _warned_parse_paths.add(warn_key)
-                print(f"warn: '{runtime} stats' returned empty output; CPU/内存/网络将显示为 0。")
+    cpu_candidates = [parsed_stats["cpu_percent"], parsed_tpl["cpu_percent"], parsed_compact["cpu_percent"]]
+    mem_candidates = [parsed_stats["mem_bytes"], parsed_tpl["mem_bytes"], parsed_compact["mem_bytes"]]
+    net_candidates = [
+        (parsed_stats["net_rx_total_bytes"], parsed_stats["net_tx_total_bytes"]),
+        (parsed_tpl["net_rx_total_bytes"], parsed_tpl["net_tx_total_bytes"]),
+        (parsed_compact["net_rx_total_bytes"], parsed_compact["net_tx_total_bytes"]),
+    ]
+
+    for c in cpu_candidates:
+        if float(c) > 0:
+            cpu_percent = float(c)
+            break
+    for m in mem_candidates:
+        if int(m) > 0:
+            mem = int(m)
+            break
+    for rx_c, tx_c in net_candidates:
+        if int(rx_c) > 0 or int(tx_c) > 0:
+            rx_total = int(rx_c)
+            tx_total = int(tx_c)
+            break
 
     inspect = run([runtime, "inspect", name])
     conn_count = 0
+    pid = 0
     if inspect:
         try:
             d = json.loads(inspect)[0]
-            pid = d.get("State", {}).get("Pid", 0)
+            pid = int(d.get("State", {}).get("Pid", 0) or 0)
             if pid:
-                conn_count = _count_connections_from_pid(int(pid))
+                conn_count = _count_connections_from_pid(pid)
                 if conn_count <= 0:
                     conn_out = run(["sh", "-lc", f"ss -Hantup | grep -c 'pid={pid},'"])
                     conn_count = int(conn_out.strip() or 0)
         except Exception:
             pass
+
+    if rx_total <= 0 and tx_total <= 0 and pid > 0:
+        proc_rx, proc_tx = _read_net_bytes_from_pid(pid)
+        if proc_rx > 0 or proc_tx > 0:
+            rx_total = proc_rx
+            tx_total = proc_tx
+
+    container_key = container_id or name
+    net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
+
+    if stats_json.strip() == "" and stats_tpl.strip() == "" and stats_compact.strip() == "":
+        warn_key = f"{runtime}:stats-empty"
+        if warn_key not in _warned_parse_paths:
+            _warned_parse_paths.add(warn_key)
+            print(f"warn: '{runtime} stats' returned empty output; CPU/内存/网络将显示为 0。")
     if conn_count <= 0:
         conn_count = _count_connections_from_exec(runtime, name)
 

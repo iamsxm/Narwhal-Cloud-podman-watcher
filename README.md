@@ -114,6 +114,24 @@ sudo bash /tmp/narwhal-bootstrap-install.sh
 
 > 安全建议：Cloudflare Token 请仅授予单一 Zone 的最小权限，避免使用全局 API Key。
 
+## 宿主机原始值一键采集（排查/改造前确认）
+
+在任意宿主机执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/podcctv/Narwhal-Cloud-podman-watcher/main/scripts/collect-podman-raw.sh -o /tmp/collect-podman-raw.sh
+chmod +x /tmp/collect-podman-raw.sh
+sudo /tmp/collect-podman-raw.sh
+```
+
+或在本仓库里直接执行：
+
+```bash
+sudo bash scripts/collect-podman-raw.sh
+```
+
+输出为 `/tmp/podman-raw-<UTC时间戳>.tar.gz`，包含宿主机与容器的原始指标（CPU 计数器、线程/进程、内存、网络 IO、容器 inspect/stats/top 等）。将压缩包回传后，可按真实字段改造成“Client 原始值透传，Server 统一统计分析”。
+
 ## 监控项
 
 - 容器 CPU 占用

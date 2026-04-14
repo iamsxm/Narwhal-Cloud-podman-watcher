@@ -78,6 +78,8 @@ sudo bash /tmp/narwhal-bootstrap-install.sh
   - Server: `/opt/narwhal-monitor/server.env` + `/opt/narwhal-monitor/server-install.env`
   - Client: `/opt/narwhal-monitor/client.env` + `/opt/narwhal-monitor/client-install.env`
 - 自动重建/重启容器，无需重新输入历史参数。
+- 默认自动清理无用资源（旧镜像、未使用容器/网络/卷、apt 缓存与无用依赖），缓解磁盘空间压力。
+  - 如需跳过：运行前设置 `SKIP_CLEANUP_ON_UPDATE=1`。
 
 ## HTTPS 配置指引（两种公网证书方式）
 

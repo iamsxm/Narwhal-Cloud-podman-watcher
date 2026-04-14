@@ -42,6 +42,29 @@ update_repo_self() {
   git -C "$ROOT_DIR" pull --ff-only
 }
 
+cleanup_after_update() {
+  if [[ "${SKIP_CLEANUP_ON_UPDATE:-0}" == "1" ]]; then
+    echo "[INFO] 检测到 SKIP_CLEANUP_ON_UPDATE=1，跳过更新后清理。"
+    return
+  fi
+
+  echo "[INFO] 更新完成，开始清理无用文件与旧镜像..."
+
+  if command -v podman >/dev/null 2>&1; then
+    podman container prune -f >/dev/null 2>&1 || true
+    podman image prune -af >/dev/null 2>&1 || true
+    podman volume prune -f >/dev/null 2>&1 || true
+    podman network prune -f >/dev/null 2>&1 || true
+    echo "[INFO] Podman 无用资源清理完成。"
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    apt-get clean >/dev/null 2>&1 || true
+    echo "[INFO] apt 缓存与无用依赖清理完成。"
+  fi
+}
+
 run_installer() {
   local target="$1"
   local mode="$2"
@@ -87,6 +110,7 @@ main() {
     update)
       update_repo_self
       run_installer "$mode" update
+      cleanup_after_update
       ;;
     *)
       echo "[ERROR] 不支持的操作: $action"

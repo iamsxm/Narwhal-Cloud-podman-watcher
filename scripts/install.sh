@@ -87,30 +87,82 @@ run_installer() {
   esac
 }
 
+remove_container_if_exists() {
+  local name="$1"
+  if podman container exists "$name" >/dev/null 2>&1; then
+    echo "[INFO] 删除容器: $name"
+    podman rm -f "$name" >/dev/null 2>&1 || true
+  fi
+}
+
+remove_image_if_exists() {
+  local image="$1"
+  if podman image exists "$image" >/dev/null 2>&1; then
+    echo "[INFO] 删除镜像: $image"
+    podman rmi -f "$image" >/dev/null 2>&1 || true
+  fi
+}
+
+uninstall_narwhal_related() {
+  echo "[INFO] 开始卸载 Narwhal-Cloud-podman-watcher 相关 Podman 资源..."
+  echo "[INFO] 仅清理本项目相关资源，不会删除其他已有 Podman 容器。"
+
+  if command -v podman >/dev/null 2>&1; then
+    remove_container_if_exists "narwhal-monitor-client"
+    remove_container_if_exists "narwhal-monitor-server"
+    remove_container_if_exists "narwhal-monitor-caddy"
+
+    local images_to_remove=(
+      "narwhal-monitor-client:latest"
+      "narwhal-monitor-server:latest"
+      "ghcr.io/narwhal-cloud/podman-watcher-client:latest"
+      "ghcr.io/narwhal-cloud/podman-watcher-server:latest"
+    )
+    local image=""
+    for image in "${images_to_remove[@]}"; do
+      remove_image_if_exists "$image"
+    done
+  else
+    echo "[WARN] 未检测到 podman，跳过容器/镜像删除，仅清理本项目配置目录。"
+  fi
+
+  if [[ -d "/opt/narwhal-monitor" ]]; then
+    echo "[INFO] 删除配置与数据目录: /opt/narwhal-monitor"
+    rm -rf /opt/narwhal-monitor
+  fi
+
+  echo "[OK] 卸载完成：Narwhal-Cloud-podman-watcher 相关资源已清理。"
+}
+
 main() {
   require_root
 
   echo "=== Narwhal Monitor 一键安装/更新器 ==="
   echo "该脚本会自动补齐依赖，并启动交互式安装或无感更新。"
 
-  install_deps
-
   local action
-  read -rp "请选择操作 [install/update] (默认 install): " action
+  read -rp "请选择操作 [install/update/uninstall] (默认 install): " action
   action=${action:-install}
-
-  local mode
-  read -rp "请选择目标 [server/client/both] (默认 client): " mode
-  mode=${mode:-client}
 
   case "$action" in
     install)
+      install_deps
+      local mode
+      read -rp "请选择目标 [server/client/both] (默认 client): " mode
+      mode=${mode:-client}
       run_installer "$mode" install
       ;;
     update)
+      install_deps
+      local mode
+      read -rp "请选择目标 [server/client/both] (默认 client): " mode
+      mode=${mode:-client}
       update_repo_self
       run_installer "$mode" update
       cleanup_after_update
+      ;;
+    uninstall)
+      uninstall_narwhal_related
       ;;
     *)
       echo "[ERROR] 不支持的操作: $action"

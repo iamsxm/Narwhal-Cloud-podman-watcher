@@ -125,7 +125,7 @@ async def report(
 
 
 @app.get("/api/v1/latest")
-def latest() -> JSONResponse:
+def latest(include_stale: bool = False) -> JSONResponse:
     conn = db()
     rows = conn.execute(
         """
@@ -136,6 +136,18 @@ def latest() -> JSONResponse:
             GROUP BY host_id, container_name
         ) m ON r.host_id=m.host_id AND r.container_name=m.container_name AND r.ts=m.max_ts
         ORDER BY r.host_id, r.container_name
+        """
+    ).fetchall()
+
+    host_rows = conn.execute(
+        """
+        SELECT r.host_id, r.payload_json, r.ts
+        FROM reports r
+        JOIN (
+            SELECT host_id, MAX(ts) AS max_ts
+            FROM reports
+            GROUP BY host_id
+        ) m ON r.host_id=m.host_id AND r.ts=m.max_ts
         """
     ).fetchall()
 
@@ -155,14 +167,23 @@ def latest() -> JSONResponse:
     conn.close()
     avg_map = {(x["host_id"], x["container_name"]): x for x in avg_rows}
 
+    host_disk_map: Dict[str, Dict[str, Any]] = {}
+    for h in host_rows:
+        payload = json.loads(h["payload_json"]) if h["payload_json"] else {}
+        host_disk_map[h["host_id"]] = payload.get("disk", {})
+
     now = int(time.time())
     out = []
     for r in rows:
         payload = json.loads(r["payload_json"]) if r["payload_json"] else {}
         disk = payload.get("disk", {})
+        host_disk = host_disk_map.get(r["host_id"], {})
         avg = avg_map.get((r["host_id"], r["container_name"]))
         alert_disk = (r["disk_used_percent"] or 0) >= ALERT_DISK_THRESHOLD_PERCENT
         stale = (now - r["ts"]) > STALE_SECONDS
+        if stale and not include_stale:
+            continue
+        container_disk = payload.get("container_disk", {})
         out.append({
             "host_id": r["host_id"],
             "container_name": r["container_name"],
@@ -173,9 +194,11 @@ def latest() -> JSONResponse:
             "conn_count": int(avg["conn_avg"] if avg else r["conn_count"]),
             "disk_file": r["disk_file"],
             "disk_used_percent": r["disk_used_percent"],
-            "disk_root_device": disk.get("root_device", ""),
-            "disk_root_avail_bytes": disk.get("root_avail_bytes", 0),
-            "disk_data_avail_bytes": disk.get("data_avail_bytes", 0),
+            "disk_root_device": host_disk.get("root_device") or disk.get("root_device", ""),
+            "disk_root_avail_bytes": host_disk.get("root_avail_bytes") or disk.get("root_avail_bytes", 0),
+            "disk_data_avail_bytes": host_disk.get("data_avail_bytes") or disk.get("data_avail_bytes", 0),
+            "container_disk_rw_bytes": container_disk.get("rw_bytes", 0),
+            "container_disk_rootfs_bytes": container_disk.get("rootfs_bytes", 0),
             "podman_network_ok_v4": bool(r["podman_network_ok_v4"]),
             "podman_network_ok_v6": bool(r["podman_network_ok_v6"]),
             "timestamp": r["ts"],
@@ -244,8 +267,8 @@ svg{width:100%;height:200px;border-top:1px solid #ddd}
 </style>
 </head><body>
 <h2>Podman Monitor Dashboard</h2>
-<p>每 15 秒自动刷新。CPU/连接数/网速展示最近 5 分钟平均值。红色表示预警。</p>
-<table id='t'><thead><tr><th>主机</th><th>容器</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>磁盘(主盘 & /data 可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
+<p>每 15 秒自动刷新。CPU/连接数/网速展示最近 5 分钟平均值。红色表示预警。默认隐藏超时未上报容器（疑似历史数据）。</p>
+<table id='t'><thead><tr><th>主机</th><th>容器</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>容器磁盘(RW/RootFS)</th><th>磁盘(主盘 & /data 可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
   <div class='legend'>
@@ -287,7 +310,8 @@ async function load(){
       if(idx===0){
         html += `<td rowspan='${rows.length}'>${host}</td>`;
       }
-      html += `<td>${x.container_name}</td><td class='${cls}'>${Number(x.cpu_percent||0).toFixed(2)}</td><td>${x.conn_count}</td><td>${bpsToMbps(x.net_rx_bps).toFixed(2)}</td><td>${bpsToMbps(x.net_tx_bps).toFixed(2)}</td>`;
+      const containerDiskText = `${fmtBytes(x.container_disk_rw_bytes)} / ${fmtBytes(x.container_disk_rootfs_bytes)}`;
+      html += `<td>${x.container_name}</td><td class='${cls}'>${Number(x.cpu_percent||0).toFixed(2)}</td><td>${x.conn_count}</td><td>${bpsToMbps(x.net_rx_bps).toFixed(2)}</td><td>${bpsToMbps(x.net_tx_bps).toFixed(2)}</td><td>${containerDiskText}</td>`;
       if(idx===0){
         html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${diskText}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v4?'ok':'bad'}'>${x.podman_network_ok_v4?'✅️':'❌️'}</td>`;

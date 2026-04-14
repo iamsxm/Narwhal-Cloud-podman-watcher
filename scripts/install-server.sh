@@ -178,6 +178,30 @@ CADDY
     fi
   fi
 
+  if [[ "$tls_cert_mode" == "cloudflare_dns" ]]; then
+    local -a cf_caddy_candidates=(
+      "$caddy_image"
+      "ghcr.io/caddy-dns/cloudflare:latest"
+      "docker.io/caddy-dns/cloudflare:2"
+    )
+    local selected_image=""
+    local img=""
+    for img in "${cf_caddy_candidates[@]}"; do
+      [[ -z "$img" ]] && continue
+      if podman pull "$img" >/dev/null 2>&1; then
+        selected_image="$img"
+        break
+      fi
+    done
+    if [[ -z "$selected_image" ]]; then
+      echo "[ERROR] Unable to pull Cloudflare DNS Caddy image."
+      echo "        Tried: ${cf_caddy_candidates[*]}"
+      echo "        Please verify network access / registry reachability, or set tls_cert_mode=auto/internal."
+      exit 1
+    fi
+    caddy_image="$selected_image"
+  fi
+
   local -a podman_args=(
     run -d --name "$TLS_CONTAINER_NAME"
     --restart=always
@@ -294,7 +318,7 @@ main() {
 
     if [[ "$tls_cert_mode" == "cloudflare_dns" ]]; then
       cloudflare_api_token="$(ask_with_default "Cloudflare API token (Zone DNS Edit)" "$default_cloudflare_api_token")"
-      caddy_image="docker.io/caddy-dns/cloudflare:latest"
+      caddy_image="ghcr.io/caddy-dns/cloudflare:latest"
     else
       cloudflare_api_token=""
       caddy_image="docker.io/library/caddy:2"

@@ -184,7 +184,7 @@ async function load(){
   for(const x of d.items){
     const tr=document.createElement('tr');
     const cls=(x.alerts.disk||x.alerts.stale||x.alerts.network)?'bad':'';
-    tr.innerHTML=`<td>${x.host_id}</td><td>${x.container_name}</td><td class='${cls}'>${x.cpu_percent.toFixed(2)}</td><td>${x.conn_count}</td><td>${x.net_rx_bps.toFixed(0)}</td><td>${x.net_tx_bps.toFixed(0)}</td><td class='${x.alerts.disk?'bad':''}'>${(x.disk_used_percent||0).toFixed(1)}</td><td class='${x.podman_network_ok_v4?'':'bad'}'>${x.podman_network_ok_v4}</td><td class='${x.podman_network_ok_v6?'':'bad'}'>${x.podman_network_ok_v6}</td><td class='${x.alerts.stale?'bad':''}'>${x.timestamp_iso}</td>`;
+    tr.innerHTML=`<td>${x.host_id}</td><td>${x.container_name}</td><td class='${cls}'>${x.cpu_percent.toFixed(2)}</td><td>${x.conn_count}</td><td>${x.net_rx_bps.toFixed(0)}</td><td>${x.net_tx_bps.toFixed(0)}</td><td class='${x.alerts.disk?'bad':''}'>${(x.disk_used_percent||0).toFixed(1)}</td><td class='${x.podman_network_ok_v4?'':'bad'}'>${x.podman_network_ok_v4?'✅️':'❌️'}</td><td class='${x.podman_network_ok_v6?'':'bad'}'>${x.podman_network_ok_v6?'✅️':'❌️'}</td><td class='${x.alerts.stale?'bad':''}'>${x.timestamp_iso}</td>`;
     b.appendChild(tr);
   }
 }

@@ -22,7 +22,7 @@ jobs:
       matrix:
         include:
           - image_name: podman-watcher-server
-            dockerfile: Dockerfile
+            dockerfile: ./server/Dockerfile
             context: ./server
 
     steps:

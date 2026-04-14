@@ -175,6 +175,14 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
             _find_value_ci(item, ["CPU", "CPUPerc", "CPU%", "cpu_percent", "cpu"])
             or _pick_first(item, ["CPU", "CPUPerc", "CPU%"])
         )
+        if cpu_percent <= 0:
+            cpu_nano = _normalize_stat_number(
+                _find_value_ci(item, ["CPUNano", "cpu_nano", "cpu_nanoseconds", "cpu_time"])
+            )
+            if cpu_nano > 0:
+                # 某些运行时仅提供累计 CPU 时间，无法可靠算百分比。
+                # 这里保留为 0，后续会尝试 template/top 兜底。
+                cpu_percent = 0.0
 
         mem_usage = _find_value_ci(item, ["MemUsage", "Mem Usage", "mem_usage", "memory"])
         if mem_usage is None:
@@ -209,6 +217,23 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
             net_rx_total_bytes = int(net_in)
             net_tx_total_bytes = int(net_out)
 
+        if net_rx_total_bytes <= 0 and net_tx_total_bytes <= 0:
+            network_obj = _find_value_ci(item, ["Network", "Networks", "network", "networks"])
+            if isinstance(network_obj, dict):
+                rx_sum = 0.0
+                tx_sum = 0.0
+                for net_item in network_obj.values():
+                    if not isinstance(net_item, dict):
+                        continue
+                    rx_sum += _normalize_stat_number(
+                        _find_value_ci(net_item, ["RxBytes", "rx_bytes", "rx", "received"])
+                    )
+                    tx_sum += _normalize_stat_number(
+                        _find_value_ci(net_item, ["TxBytes", "tx_bytes", "tx", "transmit"])
+                    )
+                net_rx_total_bytes = int(rx_sum)
+                net_tx_total_bytes = int(tx_sum)
+
     return {
         "cpu_percent": cpu_percent,
         "mem_bytes": mem_bytes,
@@ -241,6 +266,18 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
         "mem_bytes": mem_bytes,
         "net_rx_total_bytes": net_rx_total_bytes,
         "net_tx_total_bytes": net_tx_total_bytes,
+    }
+
+
+def _parse_stats_compact(stats_text: str) -> Dict[str, float | int]:
+    parts = (stats_text or "").strip().split("|")
+    if len(parts) < 4:
+        return {"cpu_percent": 0.0, "mem_bytes": 0, "net_rx_total_bytes": 0, "net_tx_total_bytes": 0}
+    return {
+        "cpu_percent": _normalize_stat_number(parts[0]),
+        "mem_bytes": parse_size(parts[1]),
+        "net_rx_total_bytes": parse_size(parts[2]),
+        "net_tx_total_bytes": parse_size(parts[3]),
     }
 
 
@@ -280,6 +317,22 @@ def _count_connections_from_pid(pid: int) -> int:
     for name in files:
         total += _count_proc_net_lines(f"{base}/{name}")
     return total
+
+
+def _count_connections_from_exec(runtime: str, name: str) -> int:
+    if not runtime:
+        return 0
+    out = run(
+        [
+            runtime,
+            "exec",
+            name,
+            "sh",
+            "-lc",
+            "ss -Hantup 2>/dev/null | wc -l || (netstat -antup 2>/dev/null | tail -n +3 | wc -l)",
+        ]
+    )
+    return int(out.strip() or 0) if out.strip().isdigit() else 0
 
 
 def collect_top_cpu_process(name: str) -> Dict[str, object]:
@@ -428,6 +481,16 @@ def collect_container(name: str, container_id: str = "") -> Dict:
         rx_total = int(parsed_tpl["net_rx_total_bytes"])
         tx_total = int(parsed_tpl["net_tx_total_bytes"])
         net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
+        if cpu_percent <= 0 and mem <= 0 and rx_total <= 0 and tx_total <= 0:
+            stats_compact = run(
+                [runtime, "stats", "--no-stream", "--format", "{{.CPU}}|{{.MemUsageBytes}}|{{.NetInput}}|{{.NetOutput}}", name]
+            )
+            parsed_compact = _parse_stats_compact(stats_compact)
+            cpu_percent = float(parsed_compact["cpu_percent"])
+            mem = int(parsed_compact["mem_bytes"])
+            rx_total = int(parsed_compact["net_rx_total_bytes"])
+            tx_total = int(parsed_compact["net_tx_total_bytes"])
+            net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
         if stats_json.strip() == "" and stats_tpl.strip() == "":
             warn_key = f"{runtime}:stats-empty"
             if warn_key not in _warned_parse_paths:
@@ -447,10 +510,14 @@ def collect_container(name: str, container_id: str = "") -> Dict:
                     conn_count = int(conn_out.strip() or 0)
         except Exception:
             pass
+    if conn_count <= 0:
+        conn_count = _count_connections_from_exec(runtime, name)
 
     disk = collect_disk_alert()
     container_disk = collect_container_disk_usage(name)
     top_cpu_process = collect_top_cpu_process(name)
+    if cpu_percent <= 0 and float(top_cpu_process.get("cpu_percent") or 0) > 0:
+        cpu_percent = float(top_cpu_process.get("cpu_percent") or 0)
     return {
         "id": container_id,
         "name": name,

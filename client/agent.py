@@ -260,6 +260,28 @@ def _derive_net_bps(container_key: str, rx_total: int, tx_total: int) -> Tuple[f
     return rx_delta / dt, tx_delta / dt
 
 
+def _count_proc_net_lines(path: str) -> int:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return 0
+    if len(lines) <= 1:
+        return 0
+    return len(lines) - 1
+
+
+def _count_connections_from_pid(pid: int) -> int:
+    if pid <= 0:
+        return 0
+    base = f"/proc/{pid}/net"
+    files = ("tcp", "tcp6", "udp", "udp6")
+    total = 0
+    for name in files:
+        total += _count_proc_net_lines(f"{base}/{name}")
+    return total
+
+
 def collect_top_cpu_process(name: str) -> Dict[str, object]:
     runtime = get_container_bin()
     if not runtime:
@@ -419,8 +441,10 @@ def collect_container(name: str, container_id: str = "") -> Dict:
             d = json.loads(inspect)[0]
             pid = d.get("State", {}).get("Pid", 0)
             if pid:
-                conn_out = run(["sh", "-lc", f"ss -Hantup | grep -c 'pid={pid},'"])
-                conn_count = int(conn_out.strip() or 0)
+                conn_count = _count_connections_from_pid(int(pid))
+                if conn_count <= 0:
+                    conn_out = run(["sh", "-lc", f"ss -Hantup | grep -c 'pid={pid},'"])
+                    conn_count = int(conn_out.strip() or 0)
         except Exception:
             pass
 

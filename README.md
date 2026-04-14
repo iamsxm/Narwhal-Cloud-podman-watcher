@@ -132,6 +132,64 @@ sudo bash scripts/collect-podman-raw.sh
 
 输出为 `/tmp/podman-raw-<UTC时间戳>.tar.gz`，包含宿主机与容器的原始指标（CPU 计数器、线程/进程、内存、网络 IO、容器 inspect/stats/top 等）。将压缩包回传后，可按真实字段改造成“Client 原始值透传，Server 统一统计分析”。
 
+## 在线验证清单（仍显示 0 时）
+
+> 目标：按“采集 → 上报 → 入库 → 展示”链路逐层定位，到底卡在哪一层。
+
+### 1) 先看 Client 服务是否在稳定上报
+
+```bash
+sudo systemctl status narwhal-monitor-client --no-pager
+sudo journalctl -u narwhal-monitor-client -n 120 --no-pager
+```
+
+重点看日志里是否持续出现：
+- `reported X containers to ...`（上报成功）
+- `report failed: ...`（上报失败，优先处理网络/证书/签名）
+
+### 2) 在 Client 宿主机直接验证 Podman 原始采集
+
+```bash
+podman ps --format '{{.ID}}|{{.Names}}|{{.Image}}'
+podman stats --no-stream --format json <容器名>
+podman stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}' <容器名>
+podman inspect <容器名> --format '{{.State.Pid}}'
+```
+
+判断标准：
+- 如果 `stats` 任一格式有 CPU/网络值，Agent 会按字段择优使用。
+- 如果 `stats` 网络字段为空，Agent 会尝试从 `/proc/<pid>/net/dev` 读累计 RX/TX。
+
+### 3) 在 Server 侧直接看 API 最新值（绕开前端）
+
+```bash
+curl -s http://127.0.0.1:8080/api/v1/latest | jq '.items[] | {host_id,container_name,cpu_percent,net_rx_bps,net_tx_bps,conn_count,timestamp_iso_utc8}'
+```
+
+若这里已经是非 0，而页面还是 0，说明是前端展示缓存/刷新问题。
+
+### 4) 直接查数据库，确认是否入库为 0
+
+```bash
+sqlite3 /opt/narwhal-monitor/data/monitor.db "
+SELECT host_id, container_name, cpu_percent, net_rx_bps, net_tx_bps, conn_count, ts
+FROM reports
+ORDER BY id DESC
+LIMIT 20;"
+```
+
+判断：
+- DB 就是 0：问题在 Client 采集或上报前处理。
+- DB 非 0 但 API/页面是 0：问题在 Server 查询/聚合或前端显示。
+
+### 5) 抓一次完整原始包（用于精确复盘）
+
+```bash
+sudo bash scripts/collect-podman-raw.sh
+```
+
+把输出的 `/tmp/podman-raw-*.tar.gz` 留存，用于逐字段比对（stats/inspect/top/proc）。
+
 ## 监控项
 
 - 容器 CPU 占用

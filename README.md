@@ -156,6 +156,12 @@ podman stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetI
 podman inspect <容器名> --format '{{.State.Pid}}'
 ```
 
+可直接用仓库脚本对**单个容器**做与 Agent 同口径的排查（例如你机器上的 `fuckip-agent`）：
+
+```bash
+sudo bash scripts/query-single-container.sh fuckip-agent
+```
+
 判断标准：
 - 如果 `stats` 任一格式有 CPU/网络值，Agent 会按字段择优使用。
 - 如果 `stats` 网络字段为空，Agent 会尝试从 `/proc/<pid>/net/dev` 读累计 RX/TX。

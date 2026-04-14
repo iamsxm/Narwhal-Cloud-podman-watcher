@@ -40,11 +40,15 @@ sudo bash scripts/install.sh
 ### 3) 交互式安装项说明
 
 #### Server 安装会询问
+- 镜像来源（`local` 本地 build / `github` 直接拉取 GHCR 镜像）
+- GitHub 镜像地址（仅在选择 `github` 时使用，默认 `ghcr.io/narwhal-cloud/podman-watcher-server:latest`）
 - Web 端口（默认 `8080`）
 - 共享密钥（用于 Client 鉴权）
 - 磁盘告警阈值（默认 `80`）
 
 #### Client 安装会询问
+- 镜像来源（`local` 本地 build / `github` 直接拉取 GHCR 镜像）
+- GitHub 镜像地址（仅在选择 `github` 时使用，默认 `ghcr.io/narwhal-cloud/podman-watcher-client:latest`）
 - Server URL（例如 `http://1.2.3.4:8080`）
 - 共享密钥（需要和 Server 一致）
 - Host ID（默认当前机器 hostname）

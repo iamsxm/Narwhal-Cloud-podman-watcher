@@ -18,6 +18,7 @@ _warned_missing_bins = set()
 _podman_bin = None
 _container_bin = None
 _net_counters: Dict[str, Dict[str, float]] = {}
+_warned_parse_paths = set()
 
 
 def _is_containerized_runtime() -> bool:
@@ -121,6 +122,22 @@ def _normalize_stat_number(raw: object) -> float:
         return 0.0
 
 
+def _normalize_key(key: object) -> str:
+    text = str(key or "").strip().lower()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def _find_value_ci(item: Dict[str, object], keys: List[str]) -> object:
+    if not isinstance(item, dict):
+        return None
+    normalized_map = {_normalize_key(k): v for k, v in item.items()}
+    for key in keys:
+        k = _normalize_key(key)
+        if k in normalized_map and normalized_map[k] is not None:
+            return normalized_map[k]
+    return None
+
+
 def _pick_first(item: Dict[str, object], keys: List[str]) -> object:
     for key in keys:
         if key in item and item.get(key) is not None:
@@ -154,23 +171,41 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
         item = payload
 
     if isinstance(item, dict):
-        cpu_percent = _normalize_stat_number(_pick_first(item, ["CPU", "CPUPerc", "CPU%"]))
+        cpu_percent = _normalize_stat_number(
+            _find_value_ci(item, ["CPU", "CPUPerc", "CPU%", "cpu_percent", "cpu"])
+            or _pick_first(item, ["CPU", "CPUPerc", "CPU%"])
+        )
 
-        mem_usage = _pick_first(item, ["MemUsage", "Mem Usage"])
+        mem_usage = _find_value_ci(item, ["MemUsage", "Mem Usage", "mem_usage", "memory"])
+        if mem_usage is None:
+            mem_usage = _pick_first(item, ["MemUsage", "Mem Usage"])
         if mem_usage is not None:
             mem_bytes = parse_size(str(mem_usage).split("/")[0].strip())
         else:
-            mem_bytes = int(_normalize_stat_number(_pick_first(item, ["MemUsageBytes", "MemUsageBytesValue"])))
+            mem_bytes = int(
+                _normalize_stat_number(
+                    _find_value_ci(item, ["MemUsageBytes", "MemUsageBytesValue", "mem_usage_bytes", "memory_bytes"])
+                    or _pick_first(item, ["MemUsageBytes", "MemUsageBytesValue"])
+                )
+            )
 
-        net_io = _pick_first(item, ["NetIO", "Net I/O"])
+        net_io = _find_value_ci(item, ["NetIO", "Net I/O", "net_io"])
+        if net_io is None:
+            net_io = _pick_first(item, ["NetIO", "Net I/O"])
         if net_io is not None:
             net = str(net_io).split("/")
             if len(net) == 2:
                 net_rx_total_bytes = parse_size(net[0].strip())
                 net_tx_total_bytes = parse_size(net[1].strip())
         else:
-            net_in = _normalize_stat_number(_pick_first(item, ["NetInput", "Net In"]))
-            net_out = _normalize_stat_number(_pick_first(item, ["NetOutput", "Net Out"]))
+            net_in = _normalize_stat_number(
+                _find_value_ci(item, ["NetInput", "Net In", "net_input", "rxbytes", "rx"])
+                or _pick_first(item, ["NetInput", "Net In"])
+            )
+            net_out = _normalize_stat_number(
+                _find_value_ci(item, ["NetOutput", "Net Out", "net_output", "txbytes", "tx"])
+                or _pick_first(item, ["NetOutput", "Net Out"])
+            )
             net_rx_total_bytes = int(net_in)
             net_tx_total_bytes = int(net_out)
 
@@ -371,6 +406,11 @@ def collect_container(name: str, container_id: str = "") -> Dict:
         rx_total = int(parsed_tpl["net_rx_total_bytes"])
         tx_total = int(parsed_tpl["net_tx_total_bytes"])
         net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
+        if stats_json.strip() == "" and stats_tpl.strip() == "":
+            warn_key = f"{runtime}:stats-empty"
+            if warn_key not in _warned_parse_paths:
+                _warned_parse_paths.add(warn_key)
+                print(f"warn: '{runtime} stats' returned empty output; CPU/内存/网络将显示为 0。")
 
     inspect = run([runtime, "inspect", name])
     conn_count = 0

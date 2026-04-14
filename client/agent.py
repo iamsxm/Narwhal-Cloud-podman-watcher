@@ -74,12 +74,22 @@ def parse_size(s: str) -> int:
     return int(n * mult)
 
 
-def podman_containers() -> List[str]:
+def podman_containers() -> List[Dict[str, str]]:
     podman = get_podman_bin()
     if not podman:
         return []
-    out = run([podman, "ps", "--format", "{{.Names}}"])
-    return [x.strip() for x in out.splitlines() if x.strip()]
+    out = run([podman, "ps", "--format", "{{.Names}}|{{.Image}}"])
+    items: List[Dict[str, str]] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name, _, image = line.partition("|")
+        image = image.strip()
+        if not image.startswith("docker.io/narwhalcloud/agent"):
+            continue
+        items.append({"name": name.strip(), "image": image})
+    return items
 
 
 def collect_container(name: str) -> Dict:
@@ -140,19 +150,37 @@ def collect_container(name: str) -> Dict:
 
 def collect_disk_alert() -> Dict:
     file_path = os.getenv("WATCH_DISK_FILE", "/xfs_disk.img")
-    if not os.path.exists(file_path):
-        return {"file": file_path, "size_bytes": 0, "used_percent": 0}
+    image_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
-    size = os.path.getsize(file_path)
+    root_device = ""
+    root_avail_bytes = 0
+    df_root = run(["df", "-P", "/"])
+    if df_root:
+        lines = df_root.splitlines()
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            if len(parts) >= 6:
+                root_device = parts[0]
+                root_avail_bytes = int(parts[3]) * 1024
+
+    data_avail_bytes = 0
     df = run(["df", "-P", "/data"])
     used = 0.0
     if df:
         lines = df.splitlines()
         if len(lines) >= 2:
             parts = lines[1].split()
-            if len(parts) >= 5:
+            if len(parts) >= 6:
                 used = float(parts[4].rstrip("%"))
-    return {"file": file_path, "size_bytes": size, "used_percent": used}
+                data_avail_bytes = int(parts[3]) * 1024
+    return {
+        "file": file_path,
+        "size_bytes": image_size,
+        "used_percent": used,
+        "root_device": root_device,
+        "root_avail_bytes": root_avail_bytes,
+        "data_avail_bytes": data_avail_bytes,
+    }
 
 
 def network_health() -> Tuple[bool, bool]:
@@ -207,17 +235,17 @@ def main() -> None:
     args = parser.parse_args()
 
     while True:
-        names = podman_containers()
+        containers = podman_containers()
         v4, v6 = network_health()
         payload = {
             "host_id": args.host_id,
             "timestamp": int(time.time()),
             "podman_network": {"ipv4_ok": v4, "ipv6_ok": v6},
-            "containers": [collect_container(n) for n in names],
+            "containers": [collect_container(c["name"]) for c in containers],
         }
         try:
             push(args.server, args.secret, payload)
-            print(f"reported {len(names)} containers to {args.server}")
+            print(f"reported {len(containers)} containers to {args.server}")
         except Exception as e:
             print(f"report failed: {e}")
         time.sleep(max(60, args.interval))

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  echo "Please run as root: sudo bash scripts/install-client.sh"
+  exit 1
+fi
+
 if ! command -v podman >/dev/null 2>&1; then
   echo "Installing podman..."
   apt-get update
@@ -36,3 +41,19 @@ podman run -d --name narwhal-monitor-client \
   narwhal-monitor-client:latest
 
 echo "Client started and reporting to $SERVER_URL"
+
+cat <<EOF
+
+===== Client Install Summary =====
+Container Name: narwhal-monitor-client
+Server URL: $SERVER_URL
+Shared Secret: $SECRET
+Host ID: $HOST_ID
+Report Interval: $INTERVAL s
+Watch Disk File: /xfs_disk.img
+Podman Socket: /run/podman/podman.sock
+Mounts: /xfs_disk.img (ro), /data (ro)
+Env File: /opt/narwhal-monitor/client.env
+Container Image: narwhal-monitor-client:latest
+==================================
+EOF

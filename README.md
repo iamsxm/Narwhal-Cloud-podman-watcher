@@ -15,34 +15,62 @@
 - 指定磁盘文件（默认 `/xfs_disk.img`）容量与挂载点使用率（默认 `/data`）
 - Podman 网络健康（IPv4 / IPv6）
 
-## 快速安装
+## 快速安装（从 Git 到一键部署）
 
-在仓库根目录执行：
+> 适用环境：Debian / Ubuntu（安装脚本使用 `apt-get` 自动补齐依赖）
 
-### 1) 安装 Server
+### 1) 克隆仓库
 
 ```bash
-bash scripts/install-server.sh
+git clone <your-repo-url> narwhal-cloud-podman-watcher
+cd narwhal-cloud-podman-watcher
 ```
 
-脚本会交互式询问：
-- Web 端口
+### 2) 一键安装（推荐）
+
+```bash
+sudo bash scripts/install.sh
+```
+
+`install.sh` 会自动：
+- 检查并安装依赖：`podman` / `git` / `curl`
+- 进入交互式安装流程
+- 让你选择安装 `server`、`client` 或 `both`
+
+### 3) 交互式安装项说明
+
+#### Server 安装会询问
+- Web 端口（默认 `8080`）
+- 共享密钥（用于 Client 鉴权）
+- 磁盘告警阈值（默认 `80`）
+
+#### Client 安装会询问
+- Server URL（例如 `http://1.2.3.4:8080`）
+- 共享密钥（需要和 Server 一致）
+- Host ID（默认当前机器 hostname）
+- 上报间隔（默认 `300` 秒）
+
+### 4) 安装完成后会打印完整配置清单
+
+Server/Client 安装脚本结束时都会输出：
+- 容器名
+- 端口 / Server URL
 - 共享密钥
-- 磁盘告警阈值
+- Host ID / 上报间隔
+- Env 文件路径
+- 镜像名
+- 挂载目录与关键路径
+
+便于你直接核对部署参数，避免“装完忘了填了什么”。
+
+### 5) 仅安装单端（可选）
+
+```bash
+sudo bash scripts/install-server.sh
+sudo bash scripts/install-client.sh
+```
 
 安装完成后，访问 `http://<server-ip>:<port>/`。
-
-### 2) 安装 Client（每台机器执行）
-
-```bash
-bash scripts/install-client.sh
-```
-
-脚本会交互式询问：
-- Server URL
-- 共享密钥
-- Host ID
-- 上报间隔（默认 300 秒）
 
 ## 容器权限说明（是否 OK）
 

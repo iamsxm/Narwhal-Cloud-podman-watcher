@@ -11,6 +11,7 @@ import time
 from typing import Dict, List, Tuple
 
 import requests
+from urllib.parse import urlparse
 
 
 _warned_missing_bins = set()
@@ -290,7 +291,17 @@ def sign(body: bytes, secret: str, ts: int) -> str:
     return hmac.new(secret.encode(), body + str(ts).encode(), hashlib.sha256).hexdigest()
 
 
+def normalize_server_url(server: str) -> str:
+    cleaned = (server or "").strip()
+    if not cleaned:
+        return "https://127.0.0.1:8080"
+    if not urlparse(cleaned).scheme:
+        cleaned = f"https://{cleaned}"
+    return cleaned
+
+
 def push(server: str, secret: str, payload: Dict) -> None:
+    server = normalize_server_url(server)
     body = json.dumps(payload, ensure_ascii=False).encode()
     ts = int(time.time())
     sig = sign(body, secret, ts)
@@ -305,7 +316,7 @@ def push(server: str, secret: str, payload: Dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--server", default=os.getenv("SERVER_URL", "http://127.0.0.1:8080"))
+    parser.add_argument("--server", default=os.getenv("SERVER_URL", "https://127.0.0.1:8080"))
     parser.add_argument("--secret", default=os.getenv("SHARED_SECRET", "change-me"))
     parser.add_argument("--interval", type=int, default=int(os.getenv("REPORT_INTERVAL", "300")))
     parser.add_argument("--host-id", default=os.getenv("HOST_ID", socket.gethostname()))

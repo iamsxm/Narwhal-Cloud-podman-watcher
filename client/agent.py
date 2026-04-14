@@ -19,15 +19,21 @@ _podman_bin = None
 _net_counters: Dict[str, Dict[str, float]] = {}
 
 
+def _is_containerized_runtime() -> bool:
+    return os.path.exists("/run/.containerenv") or os.path.exists("/.dockerenv")
+
+
 def get_podman_bin() -> str:
     global _podman_bin
     if _podman_bin is not None:
         return _podman_bin
 
     # In containerized deployments we usually mount the host Podman socket.
-    # Prefer podman-remote first so we can see host containers instead of an
-    # empty in-container local Podman store.
-    for name in ("podman-remote", "podman"):
+    # Prefer podman-remote in containers so we can inspect host containers.
+    # For host-based agents prefer local podman first, because podman-remote
+    # often exists but is not configured with a valid CONTAINER_HOST.
+    bin_candidates = ("podman-remote", "podman") if _is_containerized_runtime() else ("podman", "podman-remote")
+    for name in bin_candidates:
         if shutil.which(name):
             _podman_bin = name
             return _podman_bin

@@ -45,8 +45,34 @@ ask_with_default() {
 load_kv_from_file() {
   local f="$1"
   local key="$2"
-  if [[ -f "$f" ]]; then
-    awk -F= -v k="$key" '$1==k{print substr($0, index($0,$2)); exit}' "$f"
+  [[ -f "$f" ]] || return 1
+  awk -v k="$key" '
+    {
+      pos = index($0, "=")
+      if (pos > 0) {
+        current_key = substr($0, 1, pos - 1)
+        if (current_key == k) {
+          print substr($0, pos + 1)
+          found = 1
+          exit
+        }
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$f"
+}
+
+load_non_empty_or_default() {
+  local f="$1"
+  local key="$2"
+  local fallback="$3"
+  local value=""
+
+  value="$(load_kv_from_file "$f" "$key" || true)"
+  if [[ -n "$value" ]]; then
+    echo "$value"
+  else
+    echo "$fallback"
   fi
 }
 
@@ -61,12 +87,12 @@ if ! command -v podman >/dev/null 2>&1; then
   apt-get install -y podman
 fi
 
-default_image_source="$(load_kv_from_file "$CLIENT_INSTALL_ENV_FILE" IMAGE_SOURCE || echo "github")"
-default_github_image="$(load_kv_from_file "$CLIENT_INSTALL_ENV_FILE" GITHUB_IMAGE || echo "ghcr.io/$(detect_ghcr_owner)/podman-watcher-client:latest")"
-default_server_url="$(load_kv_from_file "$CLIENT_ENV_FILE" SERVER_URL || echo "http://127.0.0.1:8080")"
-default_secret="$(load_kv_from_file "$CLIENT_ENV_FILE" SHARED_SECRET || echo "$(generate_secret)")"
-default_host_id="$(load_kv_from_file "$CLIENT_ENV_FILE" HOST_ID || echo "$(hostname)")"
-default_interval="$(load_kv_from_file "$CLIENT_ENV_FILE" REPORT_INTERVAL || echo "300")"
+default_image_source="$(load_non_empty_or_default "$CLIENT_INSTALL_ENV_FILE" IMAGE_SOURCE "github")"
+default_github_image="$(load_non_empty_or_default "$CLIENT_INSTALL_ENV_FILE" GITHUB_IMAGE "ghcr.io/$(detect_ghcr_owner)/podman-watcher-client:latest")"
+default_server_url="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SERVER_URL "http://127.0.0.1:8080")"
+default_secret="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SHARED_SECRET "$(generate_secret)")"
+default_host_id="$(load_non_empty_or_default "$CLIENT_ENV_FILE" HOST_ID "$(hostname)")"
+default_interval="$(load_non_empty_or_default "$CLIENT_ENV_FILE" REPORT_INTERVAL "300")"
 
 image_source="$(ask_with_default "Image source [local/github]" "$default_image_source")"
 image_source=$(echo "$image_source" | tr '[:upper:]' '[:lower:]')

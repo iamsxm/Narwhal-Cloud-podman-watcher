@@ -19,11 +19,13 @@
 
 > 适用环境：Debian / Ubuntu（安装脚本使用 `apt-get` 自动补齐依赖）
 
-### 1) 克隆仓库
+### 1) 克隆仓库（修复）
+
+> 你之前执行的 `git clone podcctv/narwhal-cloud-podman-watcher` 会失败，因为这不是合法的 Git URL。
 
 ```bash
-git clone podcctv/narwhal-cloud-podman-watcher
-cd narwhal-cloud-podman-watcher
+git clone https://github.com/podcctv/Narwhal-Cloud-podman-watcher.git
+cd Narwhal-Cloud-podman-watcher
 ```
 
 ### 2) 一键安装（推荐）
@@ -32,12 +34,19 @@ cd narwhal-cloud-podman-watcher
 sudo bash scripts/install.sh
 ```
 
+### 3) 真·单命令安装（无需手动 clone）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/podcctv/Narwhal-Cloud-podman-watcher/main/scripts/bootstrap-install.sh -o /tmp/narwhal-bootstrap-install.sh
+sudo bash /tmp/narwhal-bootstrap-install.sh
+```
+
 `install.sh` 会自动：
 - 检查并安装依赖：`podman` / `git` / `curl`
 - 进入交互式安装流程
 - 让你选择安装 `server`、`client` 或 `both`
 
-### 3) 交互式安装项说明
+### 4) 交互式安装项说明
 
 #### Server 安装会询问
 - 镜像来源（`local` 本地 build / `github` 直接拉取 GHCR 镜像）
@@ -54,7 +63,7 @@ sudo bash scripts/install.sh
 - Host ID（默认当前机器 hostname）
 - 上报间隔（默认 `300` 秒）
 
-### 4) 安装完成后会打印完整配置清单
+### 5) 安装完成后会打印完整配置清单
 
 Server/Client 安装脚本结束时都会输出：
 - 容器名
@@ -67,7 +76,7 @@ Server/Client 安装脚本结束时都会输出：
 
 便于你直接核对部署参数，避免“装完忘了填了什么”。
 
-### 5) 仅安装单端（可选）
+### 6) 仅安装单端（可选）
 
 ```bash
 sudo bash scripts/install-server.sh

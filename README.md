@@ -152,7 +152,7 @@ sudo journalctl -u narwhal-monitor-client -n 120 --no-pager
 ```bash
 podman ps --format '{{.ID}}|{{.Names}}|{{.Image}}'
 podman stats --no-stream --format json <容器名>
-podman stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}' <容器名>
+podman stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}' <容器名>
 podman inspect <容器名> --format '{{.State.Pid}}'
 ```
 

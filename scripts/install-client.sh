@@ -172,6 +172,7 @@ podman run -d --name "$CONTAINER_NAME" \
   -v /data:/data:ro \
   -e PODMAN_SOCKET=/run/podman/podman.sock \
   -e CONTAINER_HOST=unix:///run/podman/podman.sock \
+  -e PYTHONUNBUFFERED=1 \
   --env-file "$CLIENT_ENV_FILE" \
   "$image_name"
 

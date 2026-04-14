@@ -70,16 +70,21 @@ cleanup_after_update() {
 run_installer() {
   local target="$1"
   local mode="$2"
+  local reset_server_data="${3:-no}"
+  local -a server_extra_args=()
+  if [[ "$reset_server_data" == "yes" ]]; then
+    server_extra_args+=(--reset-data)
+  fi
   case "$target" in
     server)
-      bash "$ROOT_DIR/scripts/install-server.sh" "$mode"
+      bash "$ROOT_DIR/scripts/install-server.sh" "$mode" "${server_extra_args[@]}"
       ;;
     client)
       bash "$ROOT_DIR/scripts/install-client.sh" "$mode"
       ;;
     both)
       echo "[INFO] 先处理 Server，再处理 Client。"
-      bash "$ROOT_DIR/scripts/install-server.sh" "$mode"
+      bash "$ROOT_DIR/scripts/install-server.sh" "$mode" "${server_extra_args[@]}"
       bash "$ROOT_DIR/scripts/install-client.sh" "$mode"
       ;;
     *)
@@ -217,6 +222,7 @@ main() {
   echo "该脚本会自动补齐依赖，并启动交互式安装或无感更新。"
 
   local action
+  local reset_server_data="no"
   read -rp "请选择操作 [install/update/uninstall] (默认 install): " action
   action=${action:-install}
 
@@ -226,15 +232,33 @@ main() {
       local mode
       read -rp "请选择目标 [server/client/both] (默认 client): " mode
       mode=${mode:-client}
-      run_installer "$mode" install
+      if [[ "$mode" == "server" || "$mode" == "both" ]]; then
+        local reset_confirm=""
+        read -rp "是否删除 Server 已有全部采集数据（初始化数据库）[yes/no] (默认 no): " reset_confirm
+        reset_confirm="${reset_confirm:-no}"
+        reset_confirm="$(echo "$reset_confirm" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$reset_confirm" == "yes" || "$reset_confirm" == "y" ]]; then
+          reset_server_data="yes"
+        fi
+      fi
+      run_installer "$mode" install "$reset_server_data"
       ;;
     update)
       install_deps
       local mode
       read -rp "请选择目标 [server/client/both] (默认 client): " mode
       mode=${mode:-client}
+      if [[ "$mode" == "server" || "$mode" == "both" ]]; then
+        local reset_confirm=""
+        read -rp "是否删除 Server 已有全部采集数据（初始化数据库）[yes/no] (默认 no): " reset_confirm
+        reset_confirm="${reset_confirm:-no}"
+        reset_confirm="$(echo "$reset_confirm" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$reset_confirm" == "yes" || "$reset_confirm" == "y" ]]; then
+          reset_server_data="yes"
+        fi
+      fi
       update_repo_self
-      run_installer "$mode" update
+      run_installer "$mode" update "$reset_server_data"
       cleanup_after_update
       ;;
     uninstall)

@@ -121,6 +121,7 @@ sudo bash /tmp/narwhal-bootstrap-install.sh
 - 容器 CPU 占用
 - 容器连接数（按容器 PID 统计 socket）
 - 网络速度（RX/TX）
+- 离线容器生命周期管理：离线后默认保留 1 天并标记离线时长（按小时刷新），超过 1 天默认隐藏，超过 30 天自动删除历史数据
 - 指定磁盘文件容量与挂载点使用率
 - Podman 网络健康（IPv4 / IPv6）
 

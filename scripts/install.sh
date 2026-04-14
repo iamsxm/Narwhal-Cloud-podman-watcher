@@ -102,6 +102,16 @@ remove_container_if_exists() {
   fi
 }
 
+remove_systemd_service_if_exists() {
+  local service_name="$1"
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files | awk '{print $1}' | grep -Fxq "$service_name"; then
+      echo "[INFO] 停止并禁用 systemd 服务: $service_name"
+      systemctl disable --now "$service_name" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
 remove_image_if_exists() {
   local image="$1"
   if podman image exists "$image" >/dev/null 2>&1; then
@@ -205,6 +215,13 @@ uninstall_narwhal_related() {
     remove_images_by_repository_pattern '^ghcr\.io/caddy-dns/cloudflare$'
   else
     echo "[WARN] 未检测到 podman，跳过容器/镜像删除，仅清理本项目配置目录。"
+  fi
+
+  remove_systemd_service_if_exists "narwhal-monitor-client.service"
+  if [[ -f "/etc/systemd/system/narwhal-monitor-client.service" ]]; then
+    echo "[INFO] 删除 systemd 服务文件: /etc/systemd/system/narwhal-monitor-client.service"
+    rm -f /etc/systemd/system/narwhal-monitor-client.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 
   if [[ -d "$INSTALL_BASE_DIR" ]]; then

@@ -4,27 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIENT_ENV_FILE="/opt/narwhal-monitor/client.env"
 CLIENT_INSTALL_ENV_FILE="/opt/narwhal-monitor/client-install.env"
-CONTAINER_NAME="narwhal-monitor-client"
+CLIENT_APP_DIR="/opt/narwhal-monitor/client-agent"
+CLIENT_VENV_DIR="$CLIENT_APP_DIR/.venv"
+SYSTEMD_SERVICE_FILE="/etc/systemd/system/narwhal-monitor-client.service"
 MODE="${1:-install}"
 
 if [[ "$MODE" != "install" && "$MODE" != "update" ]]; then
   echo "[ERROR] 用法: bash scripts/install-client.sh [install|update]"
   exit 1
 fi
-
-detect_ghcr_owner() {
-  local owner="narwhal-cloud"
-  if command -v git >/dev/null 2>&1; then
-    local remote_url
-    remote_url="$(git -C "$ROOT_DIR" config --get remote.origin.url 2>/dev/null || true)"
-    if [[ -n "$remote_url" ]]; then
-      if [[ "$remote_url" =~ github\.com[:/]([^/]+)/[^/]+(\.git)?$ ]]; then
-        owner="${BASH_REMATCH[1]}"
-      fi
-    fi
-  fi
-  echo "$owner"
-}
 
 generate_secret() {
   tr -d '-' </proc/sys/kernel/random/uuid | cut -c 1-25
@@ -87,37 +75,27 @@ if ! command -v podman >/dev/null 2>&1; then
   apt-get install -y podman
 fi
 
-default_image_source="$(load_non_empty_or_default "$CLIENT_INSTALL_ENV_FILE" IMAGE_SOURCE "github")"
-default_github_image="$(load_non_empty_or_default "$CLIENT_INSTALL_ENV_FILE" GITHUB_IMAGE "ghcr.io/$(detect_ghcr_owner)/podman-watcher-client:latest")"
-default_log_enabled="$(load_non_empty_or_default "$CLIENT_INSTALL_ENV_FILE" LOG_ENABLED "yes")"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Installing python3..."
+  apt-get update
+  apt-get install -y python3 python3-venv
+fi
+
+if ! python3 -m venv -h >/dev/null 2>&1; then
+  echo "Installing python3-venv..."
+  apt-get update
+  apt-get install -y python3-venv
+fi
+
 default_server_url="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SERVER_URL "http://127.0.0.1:8080")"
 default_secret="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SHARED_SECRET "$(generate_secret)")"
 default_host_id="$(load_non_empty_or_default "$CLIENT_ENV_FILE" HOST_ID "$(hostname)")"
 default_interval="$(load_non_empty_or_default "$CLIENT_ENV_FILE" REPORT_INTERVAL "300")"
 
-image_source="$(ask_with_default "Image source [local/github]" "$default_image_source")"
-image_source=$(echo "$image_source" | tr '[:upper:]' '[:lower:]')
-github_image="$(ask_with_default "GitHub image (for github source)" "$default_github_image")"
-log_enabled="$(ask_with_default "Enable client logs in 'podman logs' [yes/no]" "$default_log_enabled")"
-log_enabled=$(echo "$log_enabled" | tr '[:upper:]' '[:lower:]')
 server_url="$(ask_with_default "Server URL (e.g. https://server.example.com or https://1.2.3.4)" "$default_server_url")"
 secret="$(ask_with_default "Shared secret" "$default_secret")"
 host_id="$(ask_with_default "Host ID" "$default_host_id")"
 interval="$(ask_with_default "Collect interval seconds" "$default_interval")"
-
-case "$log_enabled" in
-  yes|y|true|1)
-    log_enabled="yes"
-    ;;
-  no|n|false|0)
-    log_enabled="no"
-    ;;
-  *)
-    echo "Unsupported log option: $log_enabled"
-    echo "Please choose 'yes' or 'no'."
-    exit 1
-    ;;
-esac
 
 mkdir -p /opt/narwhal-monitor
 cat >"$CLIENT_ENV_FILE" <<ENV
@@ -129,71 +107,62 @@ WATCH_DISK_FILE=/xfs_disk.img
 ENV
 
 cat >"$CLIENT_INSTALL_ENV_FILE" <<ENV
-IMAGE_SOURCE=$image_source
-GITHUB_IMAGE=$github_image
-LOG_ENABLED=$log_enabled
+RUNTIME=host-agent
+AGENT_DIR=$CLIENT_APP_DIR
 ENV
 
-podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+# 为兼容旧版本，先尝试删除原容器化 client。
+podman rm -f narwhal-monitor-client >/dev/null 2>&1 || true
 
-image_name="narwhal-monitor-client:latest"
-case "$image_source" in
-  local)
-    podman build -t "$image_name" -f client/Dockerfile client
-    ;;
-  github)
-    echo "Trying to pull $github_image..."
-    if podman pull "$github_image"; then
-      image_name="$github_image"
-    else
-      echo "[WARN] Pull github image failed. Falling back to local build (this avoids GHCR 403/private image issues)."
-      podman build -t "$image_name" -f client/Dockerfile client
-    fi
-    ;;
-  *)
-    echo "Unsupported image source: $image_source"
-    echo "Please choose 'local' or 'github'."
-    exit 1
-    ;;
-esac
+mkdir -p "$CLIENT_APP_DIR"
+cp "$ROOT_DIR/client/agent.py" "$CLIENT_APP_DIR/agent.py"
+cp "$ROOT_DIR/client/requirements.txt" "$CLIENT_APP_DIR/requirements.txt"
 
-log_driver="none"
-if [[ "$log_enabled" == "yes" ]]; then
-  log_driver="k8s-file"
+if [[ ! -d "$CLIENT_VENV_DIR" ]]; then
+  python3 -m venv "$CLIENT_VENV_DIR"
 fi
 
-podman run -d --name "$CONTAINER_NAME" \
-  --restart=always \
-  --log-driver="$log_driver" \
-  --network host \
-  --pid host \
-  -v /run/podman/podman.sock:/run/podman/podman.sock \
-  -v /xfs_disk.img:/xfs_disk.img:ro \
-  -v /data:/data:ro \
-  -e PODMAN_SOCKET=/run/podman/podman.sock \
-  -e CONTAINER_HOST=unix:///run/podman/podman.sock \
-  -e PYTHONUNBUFFERED=1 \
-  --env-file "$CLIENT_ENV_FILE" \
-  "$image_name"
+"$CLIENT_VENV_DIR/bin/pip" install --upgrade pip >/dev/null
+"$CLIENT_VENV_DIR/bin/pip" install -r "$CLIENT_APP_DIR/requirements.txt"
 
-echo "Client started and reporting to $server_url"
+cat >"$SYSTEMD_SERVICE_FILE" <<EOF_SERVICE
+[Unit]
+Description=Narwhal Monitor Host Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$CLIENT_APP_DIR
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=$CLIENT_ENV_FILE
+ExecStart=$CLIENT_VENV_DIR/bin/python $CLIENT_APP_DIR/agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+
+systemctl daemon-reload
+systemctl enable --now narwhal-monitor-client.service
 
 cat <<EOF_SUM
 
 ===== Client Install Summary =====
 Mode: $MODE
-Container Name: $CONTAINER_NAME
-Client Logs Enabled: $log_enabled (podman log driver: $log_driver)
+Runtime: host agent (systemd)
+Service Name: narwhal-monitor-client.service
 Server URL: $server_url
 Shared Secret: $secret
 Host ID: $host_id
 Report Interval: $interval s
-Image Source: $image_source
 Watch Disk File: /xfs_disk.img
-Podman Socket: /run/podman/podman.sock
-Mounts: /xfs_disk.img (ro), /data (ro)
+Podman Socket: /run/podman/podman.sock (auto-detected by agent)
 Env File: $CLIENT_ENV_FILE
 Install Config: $CLIENT_INSTALL_ENV_FILE
-Container Image: $image_name
+Agent Directory: $CLIENT_APP_DIR
+Venv Directory: $CLIENT_VENV_DIR
 ==================================
 EOF_SUM

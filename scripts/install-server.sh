@@ -116,6 +116,9 @@ setup_tls_proxy() {
   local upstream_port="$2"
   local enable_tls="$3"
   local tls_email="$4"
+  local tls_cert_mode="$5"
+  local cloudflare_api_token="$6"
+  local caddy_image="$7"
 
   podman rm -f "$TLS_CONTAINER_NAME" >/dev/null 2>&1 || true
 
@@ -131,7 +134,7 @@ setup_tls_proxy() {
   fi
 
   local caddyfile="$TLS_DIR/Caddyfile"
-  if [[ "$host_is_ip" == "yes" ]]; then
+  if [[ "$tls_cert_mode" == "internal" || "$host_is_ip" == "yes" ]]; then
     cat >"$caddyfile" <<CADDY
 https://$host {
   tls internal
@@ -139,8 +142,25 @@ https://$host {
 }
 CADDY
   else
-    if [[ -n "$tls_email" ]]; then
+    if [[ "$tls_cert_mode" == "cloudflare_dns" ]]; then
+      if [[ -z "$cloudflare_api_token" ]]; then
+        echo "[ERROR] TLS cert mode 'cloudflare_dns' requires Cloudflare API token."
+        exit 1
+      fi
       cat >"$caddyfile" <<CADDY
+{
+$( [[ -n "$tls_email" ]] && echo "  email $tls_email" )
+}
+https://$host {
+  tls {
+    dns cloudflare {\$CLOUDFLARE_API_TOKEN}
+  }
+  reverse_proxy 127.0.0.1:${upstream_port}
+}
+CADDY
+    else
+      if [[ -n "$tls_email" ]]; then
+        cat >"$caddyfile" <<CADDY
 {
   email $tls_email
 }
@@ -148,22 +168,30 @@ https://$host {
   reverse_proxy 127.0.0.1:${upstream_port}
 }
 CADDY
-    else
-      cat >"$caddyfile" <<CADDY
+      else
+        cat >"$caddyfile" <<CADDY
 https://$host {
   reverse_proxy 127.0.0.1:${upstream_port}
 }
 CADDY
+      fi
     fi
   fi
 
-  podman run -d --name "$TLS_CONTAINER_NAME" \
-    --restart=always \
-    --network host \
-    -v "$TLS_DIR/Caddyfile:/etc/caddy/Caddyfile:ro" \
-    -v "$TLS_DIR/data:/data" \
-    -v "$TLS_DIR/config:/config" \
-    docker.io/library/caddy:2
+  local -a podman_args=(
+    run -d --name "$TLS_CONTAINER_NAME"
+    --restart=always
+    --network host
+    -v "$TLS_DIR/Caddyfile:/etc/caddy/Caddyfile:ro"
+    -v "$TLS_DIR/data:/data"
+    -v "$TLS_DIR/config:/config"
+  )
+  if [[ "$tls_cert_mode" == "cloudflare_dns" ]]; then
+    podman_args+=( -e "CLOUDFLARE_API_TOKEN=$cloudflare_api_token" )
+  fi
+  podman_args+=( "$caddy_image" )
+
+  podman "${podman_args[@]}"
 }
 
 main() {
@@ -177,6 +205,8 @@ main() {
   local default_tls_enable="yes"
   local default_tls_host="$(hostname -I | awk '{print $1}')"
   local default_tls_email=""
+  local default_tls_cert_mode="auto"
+  local default_cloudflare_api_token=""
 
   default_image_source="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" IMAGE_SOURCE "$default_image_source")"
   default_github_image="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" GITHUB_IMAGE "$default_github_image")"
@@ -184,6 +214,8 @@ main() {
   default_tls_enable="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" TLS_ENABLE "$default_tls_enable")"
   default_tls_host="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" TLS_HOST "$default_tls_host")"
   default_tls_email="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" TLS_EMAIL "$default_tls_email")"
+  default_tls_cert_mode="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" TLS_CERT_MODE "$default_tls_cert_mode")"
+  default_cloudflare_api_token="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" CLOUDFLARE_API_TOKEN "$default_cloudflare_api_token")"
 
   local env_secret env_th
   env_secret="$(load_kv_from_file "$SERVER_ENV_FILE" SHARED_SECRET || true)"
@@ -191,7 +223,7 @@ main() {
   default_secret="${env_secret:-$default_secret}"
   default_th="${env_th:-$default_th}"
 
-  local image_source github_image port secret th tls_enable tls_host tls_email
+  local image_source github_image port secret th tls_enable tls_host tls_email tls_cert_mode cloudflare_api_token caddy_image
 
   image_source="$(ask_with_default "Image source [local/github]" "$default_image_source")"
   image_source=$(echo "$image_source" | tr '[:upper:]' '[:lower:]')
@@ -205,9 +237,39 @@ main() {
   if [[ "$tls_enable" == "yes" ]]; then
     tls_host="$(ask_with_default "TLS host (domain or IP)" "$default_tls_host")"
     tls_email="$(ask_with_default "TLS email (domain cert optional)" "$default_tls_email")"
+    tls_cert_mode="$(ask_with_default "TLS cert mode [auto/internal/cloudflare_dns]" "$default_tls_cert_mode")"
+    tls_cert_mode=$(echo "$tls_cert_mode" | tr '[:upper:]' '[:lower:]')
+    case "$tls_cert_mode" in
+      auto|internal|cloudflare_dns) ;;
+      *)
+        echo "[WARN] Unknown TLS cert mode '$tls_cert_mode', fallback to auto."
+        tls_cert_mode="auto"
+        ;;
+    esac
+
+    if [[ "$tls_cert_mode" == "auto" ]]; then
+      if [[ "$tls_host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$tls_host" =~ : ]]; then
+        tls_cert_mode="internal"
+      else
+        tls_cert_mode="public_acme"
+      fi
+    elif [[ "$tls_cert_mode" == "internal" ]]; then
+      true
+    fi
+
+    if [[ "$tls_cert_mode" == "cloudflare_dns" ]]; then
+      cloudflare_api_token="$(ask_with_default "Cloudflare API token (Zone DNS Edit)" "$default_cloudflare_api_token")"
+      caddy_image="docker.io/caddy-dns/cloudflare:latest"
+    else
+      cloudflare_api_token=""
+      caddy_image="docker.io/library/caddy:2"
+    fi
   else
     tls_host=""
     tls_email=""
+    tls_cert_mode=""
+    cloudflare_api_token=""
+    caddy_image=""
   fi
 
   mkdir -p "$SERVER_DATA_DIR"
@@ -224,6 +286,8 @@ PORT=$port
 TLS_ENABLE=$tls_enable
 TLS_HOST=$tls_host
 TLS_EMAIL=$tls_email
+TLS_CERT_MODE=$tls_cert_mode
+CLOUDFLARE_API_TOKEN=$cloudflare_api_token
 ENV
 
   podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -256,7 +320,7 @@ ENV
     -v "$SERVER_DATA_DIR:/data" \
     "$image_name"
 
-  setup_tls_proxy "$tls_host" "$port" "$tls_enable" "$tls_email"
+  setup_tls_proxy "$tls_host" "$port" "$tls_enable" "$tls_email" "$tls_cert_mode" "$cloudflare_api_token" "$caddy_image"
 
   if [[ "$tls_enable" == "yes" ]]; then
     echo "Server started: https://${tls_host}"
@@ -280,6 +344,8 @@ Container Image: $image_name
 HTTPS Enabled: $tls_enable
 HTTPS Host: ${tls_host:-N/A}
 TLS Proxy Container: $TLS_CONTAINER_NAME
+TLS Cert Mode: ${tls_cert_mode:-N/A}
+Caddy Image: ${caddy_image:-N/A}
 ==================================
 EOF_SUM
 }

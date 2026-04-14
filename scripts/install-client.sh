@@ -146,6 +146,8 @@ podman run -d --name "$CONTAINER_NAME" \
   -v /run/podman/podman.sock:/run/podman/podman.sock \
   -v /xfs_disk.img:/xfs_disk.img:ro \
   -v /data:/data:ro \
+  -e PODMAN_SOCKET=/run/podman/podman.sock \
+  -e CONTAINER_HOST=unix:///run/podman/podman.sock \
   --env-file "$CLIENT_ENV_FILE" \
   "$image_name"
 

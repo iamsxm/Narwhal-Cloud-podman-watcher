@@ -12,8 +12,17 @@ from typing import Dict, List, Tuple
 import requests
 
 
+_warned_missing_bins = set()
+
+
 def run(cmd: List[str]) -> str:
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        if cmd and cmd[0] not in _warned_missing_bins:
+            _warned_missing_bins.add(cmd[0])
+            print(f"missing command: {cmd[0]}")
+        return ""
     if p.returncode != 0:
         return ""
     return p.stdout

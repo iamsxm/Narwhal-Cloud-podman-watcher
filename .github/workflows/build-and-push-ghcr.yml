@@ -24,9 +24,6 @@ jobs:
           - image_name: podman-watcher-server
             dockerfile: Dockerfile
             context: ./server
-          - image_name: podman-watcher-client
-            dockerfile: Dockerfile
-            context: ./client
 
     steps:
       - name: Checkout

@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 _warned_missing_bins = set()
 _podman_bin = None
+_container_bin = None
 _net_counters: Dict[str, Dict[str, float]] = {}
 
 
@@ -43,6 +44,28 @@ def get_podman_bin() -> str:
         _warned_missing_bins.add("podman")
         print("missing command: podman (or podman-remote)")
     return _podman_bin
+
+
+def get_container_bin() -> str:
+    global _container_bin
+    if _container_bin is not None:
+        return _container_bin
+
+    podman = get_podman_bin()
+    if podman:
+        _container_bin = podman
+        return _container_bin
+
+    docker_bin = shutil.which("docker")
+    if docker_bin:
+        _container_bin = "docker"
+        return _container_bin
+
+    _container_bin = ""
+    if "container_runtime" not in _warned_missing_bins:
+        _warned_missing_bins.add("container_runtime")
+        print("missing command: podman (or podman-remote) / docker")
+    return _container_bin
 
 
 def run(cmd: List[str]) -> str:
@@ -203,11 +226,14 @@ def _derive_net_bps(container_key: str, rx_total: int, tx_total: int) -> Tuple[f
 
 
 def collect_top_cpu_process(name: str) -> Dict[str, object]:
-    podman = get_podman_bin()
-    if not podman:
+    runtime = get_container_bin()
+    if not runtime:
         return {"pid": 0, "cpu_percent": 0.0, "command": ""}
 
-    out = run([podman, "top", name, "pcpu,pid,comm,args"])
+    top_cmd = [runtime, "top", name, "pcpu,pid,comm,args"]
+    if runtime == "docker":
+        top_cmd = [runtime, "top", name, "-eo", "pcpu,pid,comm,args"]
+    out = run(top_cmd)
     best = {"pid": 0, "cpu_percent": 0.0, "command": ""}
     for line in out.splitlines():
         text = line.strip()
@@ -238,15 +264,15 @@ def _image_matches(image: str, patterns: List[str]) -> bool:
 
 
 def podman_containers() -> List[Dict[str, str]]:
-    podman = get_podman_bin()
-    if not podman:
+    runtime = get_container_bin()
+    if not runtime:
         return []
     patterns_env = os.getenv(
         "MONITORED_IMAGE_PATTERNS",
         "docker.io/narwhalcloud/debian,docker.io/library/alpine,alpine",
     )
     patterns = [x.strip() for x in patterns_env.split(",") if x.strip()]
-    out = run([podman, "ps", "--format", "{{.ID}}|{{.Names}}|{{.Image}}"])
+    out = run([runtime, "ps", "--format", "{{.ID}}|{{.Names}}|{{.Image}}"])
     items: List[Dict[str, str]] = []
     for line in out.splitlines():
         line = line.strip()
@@ -281,8 +307,8 @@ def _parse_df_target(df_out: str, target: str) -> Dict[str, int]:
 
 
 def collect_container_disk_usage(name: str) -> Dict[str, Dict[str, int] | int]:
-    podman = get_podman_bin()
-    if not podman:
+    runtime = get_container_bin()
+    if not runtime:
         return {
             "rw_bytes": 0,
             "rootfs_bytes": 0,
@@ -291,7 +317,7 @@ def collect_container_disk_usage(name: str) -> Dict[str, Dict[str, int] | int]:
 
     rw_bytes = 0
     rootfs_bytes = 0
-    inspect = run([podman, "container", "inspect", "--size", name])
+    inspect = run([runtime, "container", "inspect", "--size", name])
     if inspect:
         try:
             item = json.loads(inspect)[0]
@@ -300,7 +326,7 @@ def collect_container_disk_usage(name: str) -> Dict[str, Dict[str, int] | int]:
         except Exception:
             pass
 
-    fs_df = run([podman, "exec", name, "sh", "-lc", "df -P / /data 2>/dev/null || true"])
+    fs_df = run([runtime, "exec", name, "sh", "-lc", "df -P / /data 2>/dev/null || true"])
     fs = {
         "root": _parse_df_target(fs_df, "/"),
         "data": _parse_df_target(fs_df, "/data"),
@@ -309,8 +335,8 @@ def collect_container_disk_usage(name: str) -> Dict[str, Dict[str, int] | int]:
 
 
 def collect_container(name: str, container_id: str = "") -> Dict:
-    podman = get_podman_bin()
-    if not podman:
+    runtime = get_container_bin()
+    if not runtime:
         return {
             "id": container_id,
             "name": name,
@@ -328,7 +354,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
     net_rx = 0.0
     net_tx = 0.0
 
-    stats_json = run([podman, "stats", "--no-stream", "--format", "json", name])
+    stats_json = run([runtime, "stats", "--no-stream", "--format", "json", name])
     parsed_stats = _parse_stats_json(stats_json)
     cpu_percent = float(parsed_stats["cpu_percent"])
     mem = int(parsed_stats["mem_bytes"])
@@ -338,7 +364,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
     net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
 
     if cpu_percent <= 0 and mem <= 0 and rx_total <= 0 and tx_total <= 0:
-        stats_tpl = run([podman, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}", name])
+        stats_tpl = run([runtime, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}", name])
         parsed_tpl = _parse_stats_template(stats_tpl)
         cpu_percent = float(parsed_tpl["cpu_percent"])
         mem = int(parsed_tpl["mem_bytes"])
@@ -346,7 +372,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
         tx_total = int(parsed_tpl["net_tx_total_bytes"])
         net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
 
-    inspect = run([podman, "inspect", name])
+    inspect = run([runtime, "inspect", name])
     conn_count = 0
     if inspect:
         try:
@@ -417,16 +443,20 @@ def collect_disk_alert() -> Dict:
 
 
 def network_health() -> Tuple[bool, bool]:
-    podman = get_podman_bin()
-    if not podman:
+    runtime = get_container_bin()
+    if not runtime:
         return False, False
+
+    network_probe_prefix = "echo ok"
+    if runtime != "docker":
+        network_probe_prefix = f"{runtime} network inspect fuckme >/dev/null 2>&1 && echo ok"
 
     v4 = bool(
         run(
             [
                 "sh",
                 "-lc",
-                f"{podman} network inspect fuckme >/dev/null 2>&1 && curl -4 -s --max-time 5 ip.sb >/dev/null && echo ok",
+                f"{network_probe_prefix} >/dev/null && curl -4 -s --max-time 5 ip.sb >/dev/null && echo ok",
             ]
         ).strip()
     )
@@ -435,7 +465,7 @@ def network_health() -> Tuple[bool, bool]:
             [
                 "sh",
                 "-lc",
-                f"{podman} network inspect fuckme >/dev/null 2>&1 && curl -6 -s --max-time 5 ip.sb >/dev/null && echo ok",
+                f"{network_probe_prefix} >/dev/null && curl -6 -s --max-time 5 ip.sb >/dev/null && echo ok",
             ]
         ).strip()
     )

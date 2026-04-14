@@ -377,6 +377,50 @@ def _collect_udp_remote_ips(pid: int) -> Dict[str, int]:
     return _collect_remote_ips_by_proto(pid, "udp")
 
 
+def _parse_remote_endpoint_ip(endpoint: str) -> str:
+    text = (endpoint or "").strip()
+    if not text or text in ("*", "*:*"):
+        return ""
+    if text.startswith("[") and "]" in text:
+        return text[1:text.find("]")]
+    if text.count(":") >= 2:
+        # IPv6 endpoint，可能是 "2001:db8::1:443" 或 "::ffff:1.2.3.4:443"
+        host, _, _ = text.rpartition(":")
+        return host.strip("[]")
+    if ":" in text:
+        return text.split(":", 1)[0]
+    return text
+
+
+def _is_public_ip(ip: str) -> bool:
+    if not ip:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
+        return False
+    return True
+
+
+def _collect_remote_ips_from_exec(runtime: str, name: str, proto: str) -> Dict[str, int]:
+    if not runtime or not name:
+        return {}
+    if proto == "udp":
+        cmd = "ss -Huan 2>/dev/null | awk '{print $5}' || (netstat -nu 2>/dev/null | awk 'NR>2{print $5}')"
+    else:
+        cmd = "ss -Htan state established 2>/dev/null | awk '{print $5}' || (netstat -nt 2>/dev/null | awk 'NR>2{print $5}')"
+    out = run([runtime, "exec", name, "sh", "-lc", cmd])
+    ip_counter: Dict[str, int] = {}
+    for line in out.splitlines():
+        ip = _parse_remote_endpoint_ip(line)
+        if not _is_public_ip(ip):
+            continue
+        ip_counter[ip] = ip_counter.get(ip, 0) + 1
+    return ip_counter
+
+
 def _collect_remote_ips_by_proto(pid: int, proto: str) -> Dict[str, int]:
     if pid <= 0:
         return {}
@@ -409,11 +453,7 @@ def _collect_remote_ips_by_proto(pid: int, proto: str) -> Dict[str, int]:
                 continue
             if ip in ("0.0.0.0", "::"):
                 continue
-            try:
-                ip_obj = ipaddress.ip_address(ip)
-            except ValueError:
-                continue
-            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
+            if not _is_public_ip(ip):
                 continue
             ip_counter[ip] = ip_counter.get(ip, 0) + 1
     return ip_counter
@@ -734,8 +774,14 @@ def collect_container(name: str, container_id: str = "") -> Dict:
             print(f"warn: '{runtime} stats' returned empty output; CPU/内存/网络将显示为 0。")
     if conn_count <= 0:
         conn_count = _count_connections_from_exec(runtime, name)
-    tcp_country_stats = _geoip_country_batch(_collect_tcp_remote_ips(pid))
-    udp_country_stats = _geoip_country_batch(_collect_udp_remote_ips(pid))
+    tcp_ip_counter = _collect_tcp_remote_ips(pid)
+    udp_ip_counter = _collect_udp_remote_ips(pid)
+    if not tcp_ip_counter:
+        tcp_ip_counter = _collect_remote_ips_from_exec(runtime, name, "tcp")
+    if not udp_ip_counter:
+        udp_ip_counter = _collect_remote_ips_from_exec(runtime, name, "udp")
+    tcp_country_stats = _geoip_country_batch(tcp_ip_counter)
+    udp_country_stats = _geoip_country_batch(udp_ip_counter)
 
     if (mem <= 0 or mem_percent <= 0) and pid > 0:
         pid_mem_bytes, pid_mem_percent = _read_mem_usage_from_pid(pid)

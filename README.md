@@ -3,9 +3,9 @@
 一个轻量级的 **CS 架构 Podman 监控工具**：
 
 - **Server 主控端**：汇总多机容器状态、网络状态与预警，提供 Web 页面。
-- **Client 客户端**：按固定间隔采集数据并上报。
+- **Client 宿主机 Agent**：以 systemd 服务方式运行在宿主机，按固定间隔采集数据并上报。
 - **通信安全**：`HMAC-SHA256` 共享密钥签名鉴权。
-- **部署方式**：Server/Client 均容器化，支持一键安装与一键更新。
+- **部署方式**：Server 容器化 + Client 宿主机 Agent，支持一键安装与一键更新。
 
 ## 新增能力（本次增强）
 
@@ -64,9 +64,6 @@ sudo bash /tmp/narwhal-bootstrap-install.sh
 
 ### Client
 
-- 镜像来源（`local` / `github`）
-- GitHub 镜像地址
-- 是否启用客户端日志输出到 `podman logs`（排障建议开启；正式环境可关闭）
 - Server URL（建议 `https://...`）
 - 共享密钥
 - Host ID
@@ -78,7 +75,7 @@ sudo bash /tmp/narwhal-bootstrap-install.sh
 - 自动读取并复用配置：
   - Server: `/opt/narwhal-monitor/server.env` + `/opt/narwhal-monitor/server-install.env`
   - Client: `/opt/narwhal-monitor/client.env` + `/opt/narwhal-monitor/client-install.env`
-- 自动重建/重启容器，无需重新输入历史参数。
+- 自动重建/重启服务（Server 容器 / Client systemd Agent），无需重新输入历史参数。
 - 默认自动清理无用资源（旧镜像、未使用容器/网络/卷、apt 缓存与无用依赖），缓解磁盘空间压力。
   - 如需跳过：运行前设置 `SKIP_CLEANUP_ON_UPDATE=1`。
 
@@ -142,12 +139,22 @@ sudo bash scripts/install-client.sh update
 
 ## 容器权限说明
 
-Client 为采集宿主信息，默认包含：
+Server 为容器化部署，Client 改为宿主机 Agent（systemd）部署。
 
-- `--network host`
-- `--pid host`
-- `/run/podman/podman.sock` 挂载
-- `/xfs_disk.img`、`/data` 只读挂载
+Client Agent 默认以 root 运行，直接读取宿主机 Podman 信息（无需 docker/podman in podman）。
+如需进一步收敛权限，可在 Agent 中改为最小权限用户 + sudoers 精细授权。
+
+## 架构选型建议（1G Server / <20 台设备）
+
+在你的规模下（服务端内存约 1G，设备不到 20 台），推荐：
+
+- **优先方案 A：HTTP 直传**
+  - 架构简单，部署维护成本最低
+  - 资源占用小，不需要额外维护 MQ 组件
+  - 按 20 台 * 300s 上报间隔，中心端压力很低
+- **方案 B：消息队列** 适合你未来明显扩容（例如 >100 台、需要削峰填谷、多消费者异步处理）时再引入
+
+结论：**当前阶段选择方案 A 更合适**，后续若规模增长可平滑演进到 B。
 
 ## 开发运行
 

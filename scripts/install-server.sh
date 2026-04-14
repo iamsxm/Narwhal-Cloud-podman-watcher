@@ -194,6 +194,41 @@ CADDY
   podman "${podman_args[@]}"
 }
 
+print_https_guide() {
+  cat <<'EOF_HTTPS_GUIDE'
+
+===== HTTPS 配置指引（两种公网证书方式）=====
+两种方式都会由 Caddy 自动续期证书，无需手工续期。
+
+方式 A：域名直连（ACME HTTP-01，最简单）
+适用：你使用 Cloudflare 托管 DNS，但可将该记录设置为 DNS only（灰云）。
+  1) 在 Cloudflare DNS 中新增 A/AAAA 记录（例如 monitor.example.com）指向服务器公网 IP。
+  2) 将该记录设置为 DNS only（灰云），不要走 Cloudflare 代理。
+  3) 服务器放通 80/443 端口。
+  4) 脚本填写建议：
+     - Enable HTTPS reverse proxy: yes
+     - TLS host: monitor.example.com
+     - TLS cert mode: auto
+     - TLS email: 建议填写
+  5) Client 端 SERVER_URL 使用：https://monitor.example.com
+
+方式 B：Cloudflare DNS Challenge（可橙云）
+适用：你希望保留 Cloudflare 代理（橙云）或不便开放 80 端口。
+  1) 在 Cloudflare 创建 API Token，权限至少包含：
+     - Zone:DNS:Edit
+     - Zone:Zone:Read
+  2) 脚本填写建议：
+     - Enable HTTPS reverse proxy: yes
+     - TLS host: monitor.example.com
+     - TLS cert mode: cloudflare_dns
+     - Cloudflare API token: 填入上一步 token
+  3) 脚本会自动使用带 Cloudflare DNS 模块的 Caddy 镜像并注入 token。
+  4) Client 端 SERVER_URL 使用：https://monitor.example.com
+==============================================
+
+EOF_HTTPS_GUIDE
+}
+
 main() {
   ensure_root_and_deps
 
@@ -235,6 +270,7 @@ main() {
   tls_enable=$(echo "$tls_enable" | tr '[:upper:]' '[:lower:]')
 
   if [[ "$tls_enable" == "yes" ]]; then
+    print_https_guide
     tls_host="$(ask_with_default "TLS host (domain or IP)" "$default_tls_host")"
     tls_email="$(ask_with_default "TLS email (domain cert optional)" "$default_tls_email")"
     tls_cert_mode="$(ask_with_default "TLS cert mode [auto/internal/cloudflare_dns]" "$default_tls_cert_mode")"
@@ -249,9 +285,8 @@ main() {
 
     if [[ "$tls_cert_mode" == "auto" ]]; then
       if [[ "$tls_host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$tls_host" =~ : ]]; then
+        echo "[INFO] TLS host 看起来是 IP，auto 将自动切换为 internal（自签证书）。"
         tls_cert_mode="internal"
-      else
-        tls_cert_mode="public_acme"
       fi
     elif [[ "$tls_cert_mode" == "internal" ]]; then
       true

@@ -1,6 +1,7 @@
 import argparse
 import hmac
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -19,6 +20,7 @@ _podman_bin = None
 _container_bin = None
 _net_counters: Dict[str, Dict[str, float]] = {}
 _warned_parse_paths = set()
+_geoip_country_cache: Dict[str, str] = {}
 
 
 def _is_containerized_runtime() -> bool:
@@ -148,6 +150,7 @@ def _pick_first(item: Dict[str, object], keys: List[str]) -> object:
 def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
     cpu_percent = 0.0
     mem_bytes = 0
+    mem_percent = 0.0
     net_rx_total_bytes = 0
     net_tx_total_bytes = 0
 
@@ -155,6 +158,7 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
         return {
             "cpu_percent": cpu_percent,
             "mem_bytes": mem_bytes,
+            "mem_percent": mem_percent,
             "net_rx_total_bytes": net_rx_total_bytes,
             "net_tx_total_bytes": net_tx_total_bytes,
         }
@@ -196,6 +200,16 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
                     or _pick_first(item, ["MemUsageBytes", "MemUsageBytesValue"])
                 )
             )
+        mem_percent = _normalize_stat_number(
+            _find_value_ci(item, ["MemPerc", "Mem%", "mem_percent", "memory_percent"])
+            or _pick_first(item, ["MemPerc", "Mem%"])
+        )
+        if mem_percent <= 0:
+            mem_limit = _normalize_stat_number(
+                _find_value_ci(item, ["MemLimit", "MemLimitBytes", "mem_limit", "memory_limit"])
+            )
+            if mem_limit > 0 and mem_bytes > 0:
+                mem_percent = (float(mem_bytes) / mem_limit) * 100.0
 
         net_io = _find_value_ci(item, ["NetIO", "Net I/O", "net_io"])
         if net_io is None:
@@ -237,6 +251,7 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
     return {
         "cpu_percent": cpu_percent,
         "mem_bytes": mem_bytes,
+        "mem_percent": mem_percent,
         "net_rx_total_bytes": net_rx_total_bytes,
         "net_tx_total_bytes": net_tx_total_bytes,
     }
@@ -245,6 +260,7 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
 def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
     cpu_percent = 0.0
     mem_bytes = 0
+    mem_percent = 0.0
     net_rx_total_bytes = 0
     net_tx_total_bytes = 0
 
@@ -252,6 +268,11 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
     if len(parts) >= 3:
         cpu_percent = _normalize_stat_number(parts[0])
         mem_bytes = parse_size(parts[1].split("/")[0].strip())
+        mem_usage_parts = parts[1].split("/")
+        if len(mem_usage_parts) == 2:
+            mem_total = parse_size(mem_usage_parts[1].strip())
+            if mem_total > 0 and mem_bytes > 0:
+                mem_percent = (float(mem_bytes) / mem_total) * 100.0
         net = parts[2].split("/")
         if len(net) == 2:
             net_rx_total_bytes = parse_size(net[0].strip())
@@ -264,6 +285,7 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
     return {
         "cpu_percent": cpu_percent,
         "mem_bytes": mem_bytes,
+        "mem_percent": mem_percent,
         "net_rx_total_bytes": net_rx_total_bytes,
         "net_tx_total_bytes": net_tx_total_bytes,
     }
@@ -272,10 +294,11 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
 def _parse_stats_compact(stats_text: str) -> Dict[str, float | int]:
     parts = (stats_text or "").strip().split("|")
     if len(parts) < 4:
-        return {"cpu_percent": 0.0, "mem_bytes": 0, "net_rx_total_bytes": 0, "net_tx_total_bytes": 0}
+        return {"cpu_percent": 0.0, "mem_bytes": 0, "mem_percent": 0.0, "net_rx_total_bytes": 0, "net_tx_total_bytes": 0}
     return {
         "cpu_percent": _normalize_stat_number(parts[0]),
         "mem_bytes": parse_size(parts[1]),
+        "mem_percent": 0.0,
         "net_rx_total_bytes": parse_size(parts[2]),
         "net_tx_total_bytes": parse_size(parts[3]),
     }
@@ -317,6 +340,83 @@ def _count_connections_from_pid(pid: int) -> int:
     for name in files:
         total += _count_proc_net_lines(f"{base}/{name}")
     return total
+
+
+def _decode_proc_addr(hex_ip: str, is_v6: bool = False) -> str:
+    try:
+        raw = bytes.fromhex(hex_ip)
+        if is_v6:
+            return str(ipaddress.IPv6Address(raw[::-1]))
+        return str(ipaddress.IPv4Address(raw[::-1]))
+    except Exception:
+        return ""
+
+
+def _collect_tcp_remote_ips(pid: int) -> Dict[str, int]:
+    if pid <= 0:
+        return {}
+    ip_counter: Dict[str, int] = {}
+    files = (("tcp", False), ("tcp6", True))
+    for name, is_v6 in files:
+        path = f"/proc/{pid}/net/{name}"
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.read().splitlines()[1:]
+        except Exception:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            rem = parts[2]
+            state = parts[3].upper()
+            if state != "01":  # ESTABLISHED
+                continue
+            if ":" not in rem:
+                continue
+            rem_ip_hex = rem.split(":", 1)[0]
+            ip = _decode_proc_addr(rem_ip_hex, is_v6=is_v6)
+            if not ip:
+                continue
+            try:
+                ip_obj = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
+                continue
+            ip_counter[ip] = ip_counter.get(ip, 0) + 1
+    return ip_counter
+
+
+def _geoip_country_batch(ip_counts: Dict[str, int]) -> List[Dict[str, int | str]]:
+    if not ip_counts:
+        return []
+    unresolved = [ip for ip in ip_counts.keys() if ip not in _geoip_country_cache]
+    if unresolved:
+        try:
+            payload = [{"query": ip} for ip in unresolved[:100]]
+            resp = requests.post("http://ip-api.com/batch?fields=status,query,countryCode", json=payload, timeout=8)
+            if resp.ok:
+                for item in resp.json():
+                    query = str(item.get("query") or "")
+                    if not query:
+                        continue
+                    if item.get("status") == "success":
+                        _geoip_country_cache[query] = str(item.get("countryCode") or "UN")
+                    else:
+                        _geoip_country_cache[query] = "UN"
+        except Exception:
+            for ip in unresolved:
+                _geoip_country_cache[ip] = "UN"
+
+    country_counter: Dict[str, Dict[str, int | str]] = {}
+    for ip, cnt in ip_counts.items():
+        country = _geoip_country_cache.get(ip, "UN")
+        if country not in country_counter:
+            country_counter[country] = {"country": country, "connections": 0, "ip_count": 0}
+        country_counter[country]["connections"] = int(country_counter[country]["connections"]) + int(cnt)
+        country_counter[country]["ip_count"] = int(country_counter[country]["ip_count"]) + 1
+    return sorted(country_counter.values(), key=lambda x: int(x["connections"]), reverse=True)
 
 
 def _read_net_bytes_from_pid(pid: int) -> Tuple[int, int]:
@@ -481,15 +581,18 @@ def collect_container(name: str, container_id: str = "") -> Dict:
             "name": name,
             "cpu_percent": 0.0,
             "mem_bytes": 0,
+            "mem_percent": 0.0,
             "net_rx_bps": 0.0,
             "net_tx_bps": 0.0,
             "conn_count": 0,
+            "tcp_country_stats": [],
             "disk": collect_disk_alert(),
             "container_disk": {"rw_bytes": 0, "rootfs_bytes": 0},
         }
 
     cpu_percent = 0.0
     mem = 0
+    mem_percent = 0.0
     rx_total = 0
     tx_total = 0
     net_rx = 0.0
@@ -504,6 +607,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
 
     cpu_candidates = [parsed_stats["cpu_percent"], parsed_tpl["cpu_percent"], parsed_compact["cpu_percent"]]
     mem_candidates = [parsed_stats["mem_bytes"], parsed_tpl["mem_bytes"], parsed_compact["mem_bytes"]]
+    mem_percent_candidates = [parsed_stats["mem_percent"], parsed_tpl["mem_percent"], parsed_compact["mem_percent"]]
     net_candidates = [
         (parsed_stats["net_rx_total_bytes"], parsed_stats["net_tx_total_bytes"]),
         (parsed_tpl["net_rx_total_bytes"], parsed_tpl["net_tx_total_bytes"]),
@@ -517,6 +621,10 @@ def collect_container(name: str, container_id: str = "") -> Dict:
     for m in mem_candidates:
         if int(m) > 0:
             mem = int(m)
+            break
+    for mp in mem_percent_candidates:
+        if float(mp) > 0:
+            mem_percent = float(mp)
             break
     for rx_c, tx_c in net_candidates:
         if int(rx_c) > 0 or int(tx_c) > 0:
@@ -555,6 +663,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
             print(f"warn: '{runtime} stats' returned empty output; CPU/内存/网络将显示为 0。")
     if conn_count <= 0:
         conn_count = _count_connections_from_exec(runtime, name)
+    tcp_country_stats = _geoip_country_batch(_collect_tcp_remote_ips(pid))
 
     disk = collect_disk_alert()
     container_disk = collect_container_disk_usage(name)
@@ -566,9 +675,11 @@ def collect_container(name: str, container_id: str = "") -> Dict:
         "name": name,
         "cpu_percent": cpu_percent,
         "mem_bytes": mem,
+        "mem_percent": mem_percent,
         "net_rx_bps": net_rx,
         "net_tx_bps": net_tx,
         "conn_count": conn_count,
+        "tcp_country_stats": tcp_country_stats,
         "disk": disk,
         "container_disk": container_disk,
         "top_cpu_process": top_cpu_process,

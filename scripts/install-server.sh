@@ -67,8 +67,34 @@ ask_with_default() {
 load_kv_from_file() {
   local f="$1"
   local key="$2"
-  if [[ -f "$f" ]]; then
-    awk -F= -v k="$key" '$1==k{print substr($0, index($0,$2)); exit}' "$f"
+  [[ -f "$f" ]] || return 1
+  awk -v k="$key" '
+    {
+      pos = index($0, "=")
+      if (pos > 0) {
+        current_key = substr($0, 1, pos - 1)
+        if (current_key == k) {
+          print substr($0, pos + 1)
+          found = 1
+          exit
+        }
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$f"
+}
+
+load_non_empty_or_default() {
+  local f="$1"
+  local key="$2"
+  local fallback="$3"
+  local value=""
+
+  value="$(load_kv_from_file "$f" "$key" || true)"
+  if [[ -n "$value" ]]; then
+    echo "$value"
+  else
+    echo "$fallback"
   fi
 }
 
@@ -152,12 +178,12 @@ main() {
   local default_tls_host="$(hostname -I | awk '{print $1}')"
   local default_tls_email=""
 
-  default_image_source="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" IMAGE_SOURCE || echo "$default_image_source")"
-  default_github_image="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" GITHUB_IMAGE || echo "$default_github_image")"
-  default_port="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" PORT || echo "$default_port")"
-  default_tls_enable="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" TLS_ENABLE || echo "$default_tls_enable")"
-  default_tls_host="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" TLS_HOST || echo "$default_tls_host")"
-  default_tls_email="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" TLS_EMAIL || echo "$default_tls_email")"
+  default_image_source="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" IMAGE_SOURCE "$default_image_source")"
+  default_github_image="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" GITHUB_IMAGE "$default_github_image")"
+  default_port="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" PORT "$default_port")"
+  default_tls_enable="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" TLS_ENABLE "$default_tls_enable")"
+  default_tls_host="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" TLS_HOST "$default_tls_host")"
+  default_tls_email="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" TLS_EMAIL "$default_tls_email")"
 
   local env_secret env_th
   env_secret="$(load_kv_from_file "$SERVER_ENV_FILE" SHARED_SECRET || true)"

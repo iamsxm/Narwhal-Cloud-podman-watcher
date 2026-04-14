@@ -230,25 +230,29 @@ def dashboard() -> str:
 <style>
 body{font-family:sans-serif;margin:1rem;background:#f7f8fa}
 table{border-collapse:collapse;width:100%;background:#fff}
-th,td{border:1px solid #ddd;padding:8px;vertical-align:middle}
+th,td{border:1px solid #ddd;padding:8px;vertical-align:middle;text-align:center}
 th{background:#f0f2f5}
 .bad{color:#b00020;font-weight:bold}
 .ok{color:#0a8f08}
 .btn{border:1px solid #888;padding:4px 8px;border-radius:6px;background:#fff;cursor:pointer}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center}
 #card{background:#fff;border-radius:12px;padding:16px;width:min(980px,95vw)}
-.mini{display:flex;gap:4px;height:30px;margin:8px 0}
-.mini div{width:10px;border-radius:3px;background:#3fc66f}
+.legend{display:flex;gap:14px;align-items:center;margin:8px 0 4px 0;font-size:14px}
+.legend-item{display:flex;align-items:center;gap:6px}
+.dot{width:10px;height:10px;border-radius:50%}
 svg{width:100%;height:200px;border-top:1px solid #ddd}
 </style>
 </head><body>
 <h2>Podman Monitor Dashboard</h2>
 <p>每 15 秒自动刷新。CPU/连接数/网速展示最近 5 分钟平均值。红色表示预警。</p>
-<table id='t'><thead><tr><th>主机</th><th>容器</th><th>CPU%</th><th>连接数</th><th>RX B/s</th><th>TX B/s</th><th>磁盘(主盘 & /data 可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
+<table id='t'><thead><tr><th>主机</th><th>容器</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>磁盘(主盘 & /data 可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
-  <div class='mini' id='bars'></div>
-  <div>响应时间(ms)</div>
+  <div class='legend'>
+    <span class='legend-item'><span class='dot' style='background:#4a90e2'></span>CPU%</span>
+    <span class='legend-item'><span class='dot' style='background:#7f8c8d'></span>连接数</span>
+    <span class='legend-item'><span class='dot' style='background:#2ecc71'></span>网速 Mbps (RX+TX)</span>
+  </div>
   <svg id='chart' viewBox='0 0 900 200' preserveAspectRatio='none'></svg>
   <p><button class='btn' onclick='closeDetail()'>关闭</button></p>
 </div></div>
@@ -258,6 +262,9 @@ function fmtBytes(n){
   const units=['B','KB','MB','GB','TB']; let i=0; let v=x;
   while(v>=1024 && i<units.length-1){v/=1024;i++;}
   return `${v.toFixed(v>=100?0:1)} ${units[i]}`;
+}
+function bpsToMbps(v){
+  return (Number(v||0) * 8) / 1000 / 1000;
 }
 function groupByHost(items){
   const m=new Map();
@@ -280,7 +287,7 @@ async function load(){
       if(idx===0){
         html += `<td rowspan='${rows.length}'>${host}</td>`;
       }
-      html += `<td>${x.container_name}</td><td class='${cls}'>${Number(x.cpu_percent||0).toFixed(2)}</td><td>${x.conn_count}</td><td>${Number(x.net_rx_bps||0).toFixed(0)}</td><td>${Number(x.net_tx_bps||0).toFixed(0)}</td>`;
+      html += `<td>${x.container_name}</td><td class='${cls}'>${Number(x.cpu_percent||0).toFixed(2)}</td><td>${x.conn_count}</td><td>${bpsToMbps(x.net_rx_bps).toFixed(2)}</td><td>${bpsToMbps(x.net_tx_bps).toFixed(2)}</td>`;
       if(idx===0){
         html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${diskText}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v4?'ok':'bad'}'>${x.podman_network_ok_v4?'✅️':'❌️'}</td>`;
@@ -299,18 +306,26 @@ async function openDetail(host, container){
   const data=await res.json();
   document.getElementById('detail-title').innerText=`${host} / ${container} 历史数据`;
   const pts=data.items||[];
-  const bars=document.getElementById('bars'); bars.innerHTML='';
   const recent=pts.slice(-80);
-  recent.forEach(p=>{
-    const d=document.createElement('div');
-    const h=Math.max(6,Math.min(28, Number(p.cpu_percent||0)*0.6+6));
-    d.style.height=`${h}px`; bars.appendChild(d);
-  });
   const svg=document.getElementById('chart');
-  const vals=recent.map(x=>Number(x.conn_count||0));
-  const max=Math.max(1,...vals);
-  const points=vals.map((v,i)=>`${i*(900/Math.max(1,vals.length-1))},${190-(v/max)*160}`).join(' ');
-  svg.innerHTML=`<polyline fill='none' stroke='#6f778f' stroke-width='3' points='${points}' />`;
+  if(!recent.length){
+    svg.innerHTML = '';
+    document.getElementById('modal').style.display='flex';
+    return;
+  }
+  const cpuVals=recent.map(x=>Number(x.cpu_percent||0));
+  const connVals=recent.map(x=>Number(x.conn_count||0));
+  const speedVals=recent.map(x=>bpsToMbps(Number(x.net_rx_bps||0)+Number(x.net_tx_bps||0)));
+
+  const buildPoints=(vals,maxv)=>vals.map((v,i)=>`${i*(900/Math.max(1,vals.length-1))},${190-(v/Math.max(1,maxv))*160}`).join(' ');
+  const cpuPoints=buildPoints(cpuVals, Math.max(100, ...cpuVals));
+  const connPoints=buildPoints(connVals, Math.max(1, ...connVals));
+  const speedPoints=buildPoints(speedVals, Math.max(1, ...speedVals));
+  svg.innerHTML=`
+    <polyline fill='none' stroke='#4a90e2' stroke-width='2.5' points='${cpuPoints}' />
+    <polyline fill='none' stroke='#7f8c8d' stroke-width='2.5' points='${connPoints}' />
+    <polyline fill='none' stroke='#2ecc71' stroke-width='2.5' points='${speedPoints}' />
+  `;
   document.getElementById('modal').style.display='flex';
 }
 load(); setInterval(load, 15000);

@@ -107,6 +107,19 @@ ensure_python_venv_ready() {
 
 ensure_python_venv_ready
 
+ensure_client_venv() {
+  if [[ -d "$CLIENT_VENV_DIR" && -x "$CLIENT_VENV_DIR/bin/python" && -x "$CLIENT_VENV_DIR/bin/pip" ]]; then
+    return 0
+  fi
+
+  if [[ -d "$CLIENT_VENV_DIR" ]]; then
+    echo "Existing virtualenv is incomplete, recreating: $CLIENT_VENV_DIR"
+    rm -rf "$CLIENT_VENV_DIR"
+  fi
+
+  python3 -m venv "$CLIENT_VENV_DIR"
+}
+
 default_server_url="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SERVER_URL "http://127.0.0.1:8080")"
 default_secret="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SHARED_SECRET "$(generate_secret)")"
 default_host_id="$(load_non_empty_or_default "$CLIENT_ENV_FILE" HOST_ID "$(hostname)")"
@@ -138,9 +151,7 @@ mkdir -p "$CLIENT_APP_DIR"
 cp "$ROOT_DIR/client/agent.py" "$CLIENT_APP_DIR/agent.py"
 cp "$ROOT_DIR/client/requirements.txt" "$CLIENT_APP_DIR/requirements.txt"
 
-if [[ ! -d "$CLIENT_VENV_DIR" ]]; then
-  python3 -m venv "$CLIENT_VENV_DIR"
-fi
+ensure_client_venv
 
 "$CLIENT_VENV_DIR/bin/pip" install --upgrade pip >/dev/null
 "$CLIENT_VENV_DIR/bin/pip" install -r "$CLIENT_APP_DIR/requirements.txt"

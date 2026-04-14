@@ -109,7 +109,7 @@ sudo bash /tmp/narwhal-bootstrap-install.sh
    - `TLS host`: `monitor.example.com`
    - `TLS cert mode`: `cloudflare_dns`
    - `Cloudflare API token`: 填入上一步 token
-3. 脚本会自动使用带 Cloudflare DNS 模块的 Caddy 镜像（优先 `ghcr.io/caddy-dns/cloudflare:latest`，并带回退策略），并注入 token。  
+3. 脚本会自动使用带 Cloudflare DNS 模块的 Caddy 镜像（优先 `ghcr.io/caddy-dns/cloudflare:latest`，并带回退策略），并注入 token。若你填了旧地址 `docker.io/caddy-dns/cloudflare`，安装脚本会自动改写到 `ghcr.io`。  
 4. Client 端 `SERVER_URL` 使用 `https://monitor.example.com`。
 
 > 安全建议：Cloudflare Token 请仅授予单一 Zone 的最小权限，避免使用全局 API Key。

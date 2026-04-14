@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  echo "Please run as root: sudo bash scripts/install-server.sh"
+  exit 1
+fi
+
 if ! command -v podman >/dev/null 2>&1; then
   echo "Installing podman..."
   apt-get update
@@ -33,3 +38,17 @@ podman run -d --name narwhal-monitor-server \
   narwhal-monitor-server:latest
 
 echo "Server started: http://$(hostname -I | awk '{print $1}'):${PORT}"
+
+cat <<EOF
+
+===== Server Install Summary =====
+Container Name: narwhal-monitor-server
+Listen Port: $PORT
+Shared Secret: $SECRET
+Disk Alert Threshold: $TH%
+Env File: /opt/narwhal-monitor/server.env
+Data Dir: /opt/narwhal-monitor/server-data
+Container Image: narwhal-monitor-server:latest
+Web URL: http://$(hostname -I | awk '{print $1}'):${PORT}
+==================================
+EOF

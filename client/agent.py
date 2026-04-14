@@ -392,14 +392,15 @@ def _parse_remote_endpoint_ip(endpoint: str) -> str:
     return text
 
 
-def _is_public_ip(ip: str) -> bool:
+def _is_trackable_ip(ip: str) -> bool:
     if not ip:
         return False
     try:
         ip_obj = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
+    # 私网地址也保留，GeoIP 失败时统一归为 UN，避免前端“国家 Top3”整列为空。
+    if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
         return False
     return True
 
@@ -415,7 +416,7 @@ def _collect_remote_ips_from_exec(runtime: str, name: str, proto: str) -> Dict[s
     ip_counter: Dict[str, int] = {}
     for line in out.splitlines():
         ip = _parse_remote_endpoint_ip(line)
-        if not _is_public_ip(ip):
+        if not _is_trackable_ip(ip):
             continue
         ip_counter[ip] = ip_counter.get(ip, 0) + 1
     return ip_counter
@@ -453,7 +454,7 @@ def _collect_remote_ips_by_proto(pid: int, proto: str) -> Dict[str, int]:
                 continue
             if ip in ("0.0.0.0", "::"):
                 continue
-            if not _is_public_ip(ip):
+            if not _is_trackable_ip(ip):
                 continue
             ip_counter[ip] = ip_counter.get(ip, 0) + 1
     return ip_counter
@@ -549,19 +550,21 @@ def _read_net_bytes_from_pid(pid: int) -> Tuple[int, int]:
 
 
 def _count_connections_from_exec(runtime: str, name: str) -> int:
-    if not runtime:
+    if not runtime or not name:
         return 0
-    out = run(
-        [
-            runtime,
-            "exec",
-            name,
-            "sh",
-            "-lc",
-            "ss -Hantup 2>/dev/null | wc -l || (netstat -antup 2>/dev/null | tail -n +3 | wc -l)",
-        ]
+    cmd = (
+        "if command -v ss >/dev/null 2>&1; then "
+        "  (ss -Htan 2>/dev/null; ss -Huan 2>/dev/null) | wc -l; "
+        "elif command -v netstat >/dev/null 2>&1; then "
+        "  tcp=$(netstat -nt 2>/dev/null | awk 'NR>2' | wc -l); "
+        "  udp=$(netstat -nu 2>/dev/null | awk 'NR>2' | wc -l); "
+        "  echo $((tcp + udp)); "
+        "else "
+        "  echo 0; "
+        "fi"
     )
-    return int(out.strip() or 0) if out.strip().isdigit() else 0
+    out = run([runtime, "exec", name, "sh", "-lc", cmd]).strip()
+    return int(out) if out.isdigit() else 0
 
 
 def collect_top_cpu_process(name: str) -> Dict[str, object]:

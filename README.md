@@ -22,7 +22,7 @@
 ### 1) 克隆仓库
 
 ```bash
-git clone <your-repo-url> narwhal-cloud-podman-watcher
+git clone podcctv/narwhal-cloud-podman-watcher
 cd narwhal-cloud-podman-watcher
 ```
 

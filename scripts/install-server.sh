@@ -2,6 +2,18 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SERVER_ENV_FILE="/opt/narwhal-monitor/server.env"
+SERVER_INSTALL_ENV_FILE="/opt/narwhal-monitor/server-install.env"
+SERVER_DATA_DIR="/opt/narwhal-monitor/server-data"
+TLS_DIR="/opt/narwhal-monitor/caddy"
+CONTAINER_NAME="narwhal-monitor-server"
+TLS_CONTAINER_NAME="narwhal-monitor-caddy"
+
+MODE="${1:-install}"
+if [[ "$MODE" != "install" && "$MODE" != "update" ]]; then
+  echo "[ERROR] 用法: bash scripts/install-server.sh [install|update]"
+  exit 1
+fi
 
 detect_ghcr_owner() {
   local owner="narwhal-cloud"
@@ -40,86 +52,210 @@ pick_random_port() {
   echo "$fallback"
 }
 
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  echo "Please run as root: sudo bash scripts/install-server.sh"
-  exit 1
-fi
+ask_with_default() {
+  local prompt="$1"
+  local current="$2"
+  local answer=""
+  if [[ "$MODE" == "update" && -n "$current" ]]; then
+    echo "$current"
+    return
+  fi
+  read -rp "$prompt [$current]: " answer
+  echo "${answer:-$current}"
+}
 
-if ! command -v podman >/dev/null 2>&1; then
-  echo "Installing podman..."
-  apt-get update
-  apt-get install -y podman
-fi
+load_kv_from_file() {
+  local f="$1"
+  local key="$2"
+  if [[ -f "$f" ]]; then
+    awk -F= -v k="$key" '$1==k{print substr($0, index($0,$2)); exit}' "$f"
+  fi
+}
 
-read -rp "Image source [local/github] (default github): " IMAGE_SOURCE
-IMAGE_SOURCE=${IMAGE_SOURCE:-github}
-IMAGE_SOURCE=$(echo "$IMAGE_SOURCE" | tr '[:upper:]' '[:lower:]')
-
-DEFAULT_GITHUB_IMAGE="ghcr.io/$(detect_ghcr_owner)/podman-watcher-server:latest"
-read -rp "GitHub image (for github source) [${DEFAULT_GITHUB_IMAGE}]: " GITHUB_IMAGE
-GITHUB_IMAGE=${GITHUB_IMAGE:-$DEFAULT_GITHUB_IMAGE}
-
-DEFAULT_PORT="$(pick_random_port)"
-read -rp "Server listen port [${DEFAULT_PORT}]: " PORT
-PORT=${PORT:-$DEFAULT_PORT}
-
-DEFAULT_SECRET="$(generate_secret)"
-read -rp "Shared secret (for client auth) [${DEFAULT_SECRET}]: " SECRET
-SECRET=${SECRET:-$DEFAULT_SECRET}
-
-read -rp "Disk alert threshold percent [80]: " TH
-TH=${TH:-80}
-
-mkdir -p /opt/narwhal-monitor/server-data
-cat >/opt/narwhal-monitor/server.env <<EOF
-SHARED_SECRET=$SECRET
-ALERT_DISK_THRESHOLD_PERCENT=$TH
-DB_PATH=/data/monitor.db
-EOF
-
-podman rm -f narwhal-monitor-server >/dev/null 2>&1 || true
-
-IMAGE_NAME="narwhal-monitor-server:latest"
-case "$IMAGE_SOURCE" in
-  local)
-    podman build -t "$IMAGE_NAME" -f server/Dockerfile server
-    ;;
-  github)
-    echo "Trying to pull $GITHUB_IMAGE..."
-    if podman pull "$GITHUB_IMAGE"; then
-      IMAGE_NAME="$GITHUB_IMAGE"
-    else
-      echo "[WARN] Pull github image failed. Falling back to local build (this avoids GHCR 403/private image issues)."
-      podman build -t "$IMAGE_NAME" -f server/Dockerfile server
-    fi
-    ;;
-  *)
-    echo "Unsupported image source: $IMAGE_SOURCE"
-    echo "Please choose 'local' or 'github'."
+ensure_root_and_deps() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    echo "Please run as root: sudo bash scripts/install-server.sh ${MODE}"
     exit 1
-    ;;
-esac
+  fi
 
-podman run -d --name narwhal-monitor-server \
-  --restart=always \
-  -p ${PORT}:8080 \
-  --env-file /opt/narwhal-monitor/server.env \
-  -v /opt/narwhal-monitor/server-data:/data \
-  "$IMAGE_NAME"
+  if ! command -v podman >/dev/null 2>&1; then
+    echo "Installing podman..."
+    apt-get update
+    apt-get install -y podman
+  fi
+}
 
-echo "Server started: http://$(hostname -I | awk '{print $1}'):${PORT}"
+setup_tls_proxy() {
+  local host="$1"
+  local upstream_port="$2"
+  local enable_tls="$3"
+  local tls_email="$4"
 
-cat <<EOF
+  podman rm -f "$TLS_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+  if [[ "$enable_tls" != "yes" ]]; then
+    return
+  fi
+
+  mkdir -p "$TLS_DIR/config" "$TLS_DIR/data"
+
+  local host_is_ip="no"
+  if [[ "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$host" =~ : ]]; then
+    host_is_ip="yes"
+  fi
+
+  local caddyfile="$TLS_DIR/Caddyfile"
+  if [[ "$host_is_ip" == "yes" ]]; then
+    cat >"$caddyfile" <<CADDY
+https://$host {
+  tls internal
+  reverse_proxy 127.0.0.1:${upstream_port}
+}
+CADDY
+  else
+    if [[ -n "$tls_email" ]]; then
+      cat >"$caddyfile" <<CADDY
+{
+  email $tls_email
+}
+https://$host {
+  reverse_proxy 127.0.0.1:${upstream_port}
+}
+CADDY
+    else
+      cat >"$caddyfile" <<CADDY
+https://$host {
+  reverse_proxy 127.0.0.1:${upstream_port}
+}
+CADDY
+    fi
+  fi
+
+  podman run -d --name "$TLS_CONTAINER_NAME" \
+    --restart=always \
+    --network host \
+    -v "$TLS_DIR/Caddyfile:/etc/caddy/Caddyfile:ro" \
+    -v "$TLS_DIR/data:/data" \
+    -v "$TLS_DIR/config:/config" \
+    docker.io/library/caddy:2
+}
+
+main() {
+  ensure_root_and_deps
+
+  local default_image_source="github"
+  local default_github_image="ghcr.io/$(detect_ghcr_owner)/podman-watcher-server:latest"
+  local default_port="$(pick_random_port)"
+  local default_secret="$(generate_secret)"
+  local default_th="80"
+  local default_tls_enable="yes"
+  local default_tls_host="$(hostname -I | awk '{print $1}')"
+  local default_tls_email=""
+
+  default_image_source="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" IMAGE_SOURCE || echo "$default_image_source")"
+  default_github_image="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" GITHUB_IMAGE || echo "$default_github_image")"
+  default_port="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" PORT || echo "$default_port")"
+  default_tls_enable="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" TLS_ENABLE || echo "$default_tls_enable")"
+  default_tls_host="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" TLS_HOST || echo "$default_tls_host")"
+  default_tls_email="$(load_kv_from_file "$SERVER_INSTALL_ENV_FILE" TLS_EMAIL || echo "$default_tls_email")"
+
+  local env_secret env_th
+  env_secret="$(load_kv_from_file "$SERVER_ENV_FILE" SHARED_SECRET || true)"
+  env_th="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_DISK_THRESHOLD_PERCENT || true)"
+  default_secret="${env_secret:-$default_secret}"
+  default_th="${env_th:-$default_th}"
+
+  local image_source github_image port secret th tls_enable tls_host tls_email
+
+  image_source="$(ask_with_default "Image source [local/github]" "$default_image_source")"
+  image_source=$(echo "$image_source" | tr '[:upper:]' '[:lower:]')
+  github_image="$(ask_with_default "GitHub image (for github source)" "$default_github_image")"
+  port="$(ask_with_default "Server listen port" "$default_port")"
+  secret="$(ask_with_default "Shared secret (for client auth)" "$default_secret")"
+  th="$(ask_with_default "Disk alert threshold percent" "$default_th")"
+  tls_enable="$(ask_with_default "Enable HTTPS reverse proxy [yes/no]" "$default_tls_enable")"
+  tls_enable=$(echo "$tls_enable" | tr '[:upper:]' '[:lower:]')
+
+  if [[ "$tls_enable" == "yes" ]]; then
+    tls_host="$(ask_with_default "TLS host (domain or IP)" "$default_tls_host")"
+    tls_email="$(ask_with_default "TLS email (domain cert optional)" "$default_tls_email")"
+  else
+    tls_host=""
+    tls_email=""
+  fi
+
+  mkdir -p "$SERVER_DATA_DIR"
+  cat >"$SERVER_ENV_FILE" <<ENV
+SHARED_SECRET=$secret
+ALERT_DISK_THRESHOLD_PERCENT=$th
+DB_PATH=/data/monitor.db
+ENV
+
+  cat >"$SERVER_INSTALL_ENV_FILE" <<ENV
+IMAGE_SOURCE=$image_source
+GITHUB_IMAGE=$github_image
+PORT=$port
+TLS_ENABLE=$tls_enable
+TLS_HOST=$tls_host
+TLS_EMAIL=$tls_email
+ENV
+
+  podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+  local image_name="narwhal-monitor-server:latest"
+  case "$image_source" in
+    local)
+      podman build -t "$image_name" -f server/Dockerfile server
+      ;;
+    github)
+      echo "Trying to pull $github_image..."
+      if podman pull "$github_image"; then
+        image_name="$github_image"
+      else
+        echo "[WARN] Pull github image failed. Falling back to local build (this avoids GHCR 403/private image issues)."
+        podman build -t "$image_name" -f server/Dockerfile server
+      fi
+      ;;
+    *)
+      echo "Unsupported image source: $image_source"
+      echo "Please choose 'local' or 'github'."
+      exit 1
+      ;;
+  esac
+
+  podman run -d --name "$CONTAINER_NAME" \
+    --restart=always \
+    -p ${port}:8080 \
+    --env-file "$SERVER_ENV_FILE" \
+    -v "$SERVER_DATA_DIR:/data" \
+    "$image_name"
+
+  setup_tls_proxy "$tls_host" "$port" "$tls_enable" "$tls_email"
+
+  if [[ "$tls_enable" == "yes" ]]; then
+    echo "Server started: https://${tls_host}"
+  else
+    echo "Server started: http://$(hostname -I | awk '{print $1}'):${port}"
+  fi
+
+  cat <<EOF_SUM
 
 ===== Server Install Summary =====
-Container Name: narwhal-monitor-server
-Listen Port: $PORT
-Shared Secret: $SECRET
-Disk Alert Threshold: $TH%
-Image Source: $IMAGE_SOURCE
-Env File: /opt/narwhal-monitor/server.env
-Data Dir: /opt/narwhal-monitor/server-data
-Container Image: $IMAGE_NAME
-Web URL: http://$(hostname -I | awk '{print $1}'):${PORT}
+Mode: $MODE
+Container Name: $CONTAINER_NAME
+Backend Port: $port
+Shared Secret: $secret
+Disk Alert Threshold: $th%
+Image Source: $image_source
+Env File: $SERVER_ENV_FILE
+Install Config: $SERVER_INSTALL_ENV_FILE
+Data Dir: $SERVER_DATA_DIR
+Container Image: $image_name
+HTTPS Enabled: $tls_enable
+HTTPS Host: ${tls_host:-N/A}
+TLS Proxy Container: $TLS_CONTAINER_NAME
 ==================================
-EOF
+EOF_SUM
+}
+
+main "$@"

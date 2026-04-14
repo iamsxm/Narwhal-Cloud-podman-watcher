@@ -2,37 +2,42 @@
 
 一个轻量级的 **CS 架构 Podman 监控工具**：
 
-- **Server 主控端**：汇总不同机器的容器状态、网络状态与预警，提供 Web 页面。
-- **Client 客户端**：每 5 分钟采集一次数据并上报，尽量降低资源占用。
-- **通信安全**：基于 `HMAC-SHA256` 的共享密钥签名鉴权。
-- **部署方式**：Server/Client 均在 Podman 容器中运行，支持交互式一键安装脚本。
+- **Server 主控端**：汇总多机容器状态、网络状态与预警，提供 Web 页面。
+- **Client 客户端**：按固定间隔采集数据并上报。
+- **通信安全**：`HMAC-SHA256` 共享密钥签名鉴权。
+- **部署方式**：Server/Client 均容器化，支持一键安装与一键更新。
 
-## 监控项
+## 新增能力（本次增强）
 
-- 容器 CPU 占用
-- 容器连接数（基于容器 PID 对应 socket 数量）
-- 网络速度（RX/TX，按采集周期换算）
-- 指定磁盘文件（默认 `/xfs_disk.img`）容量与挂载点使用率（默认 `/data`）
-- Podman 网络健康（IPv4 / IPv6）
+- **一键更新**：`install.sh` 支持 `update` 操作，会先 `git pull --ff-only` 更新仓库（包含 `sh` 脚本本身），再自动重建/重启服务。
+- **自动复用历史配置**：更新模式会自动读取已有 `/opt/narwhal-monitor/*.env` 配置，不再要求重复输入。
+- **Server HTTPS 自动化**：支持自动拉起 Caddy 反向代理：
+  - 域名场景：自动申请公网证书（ACME）。
+  - IP 场景：自动签发内部证书（`tls internal`）。
 
-## 快速安装（从 Git 到一键部署）
+> 注意：IP 场景下的内部证书不是公网 CA 证书，浏览器默认可能提示不受信任；如需“绿锁”建议使用域名。
 
-> 适用环境：Debian / Ubuntu（安装脚本使用 `apt-get` 自动补齐依赖）
+## 快速安装
 
-### 1) 克隆仓库（修复）
+> 适用环境：Debian / Ubuntu（脚本使用 `apt-get` 自动补齐依赖）
 
-> 你之前执行的 `git clone podcctv/narwhal-cloud-podman-watcher` 会失败，因为这不是合法的 Git URL。
+### 1) 克隆仓库
 
 ```bash
 git clone https://github.com/podcctv/Narwhal-Cloud-podman-watcher.git
 cd Narwhal-Cloud-podman-watcher
 ```
 
-### 2) 一键安装（推荐）
+### 2) 运行一键安装/更新器
 
 ```bash
 sudo bash scripts/install.sh
 ```
+
+脚本会自动：
+- 检查并安装依赖：`podman` / `git` / `curl`
+- 选择操作：`install` 或 `update`
+- 选择目标：`server` / `client` / `both`
 
 ### 3) 真·单命令安装（无需手动 clone）
 
@@ -41,76 +46,66 @@ curl -fsSL https://raw.githubusercontent.com/podcctv/Narwhal-Cloud-podman-watche
 sudo bash /tmp/narwhal-bootstrap-install.sh
 ```
 
-`install.sh` 会自动：
-- 检查并安装依赖：`podman` / `git` / `curl`
-- 进入交互式安装流程
-- 让你选择安装 `server`、`client` 或 `both`
+## 交互式参数（首次 install）
 
-### 4) 交互式安装项说明
+### Server
 
-#### Server 安装会询问
-- 镜像来源（`local` 本地 build / `github` 直接拉取 GHCR 镜像）
-- GitHub 镜像地址（仅在选择 `github` 时使用，默认 `ghcr.io/narwhal-cloud/podman-watcher-server:latest`）
-- Web 端口（默认 `8080`）
-- 共享密钥（用于 Client 鉴权）
-- 磁盘告警阈值（默认 `80`）
-
-#### Client 安装会询问
-- 镜像来源（`local` 本地 build / `github` 直接拉取 GHCR 镜像）
-- GitHub 镜像地址（仅在选择 `github` 时使用，默认 `ghcr.io/narwhal-cloud/podman-watcher-client:latest`）
-- Server URL（例如 `http://1.2.3.4:8080`）
-- 共享密钥（需要和 Server 一致）
-- Host ID（默认当前机器 hostname）
-- 上报间隔（默认 `300` 秒）
-
-### 5) 安装完成后会打印完整配置清单
-
-Server/Client 安装脚本结束时都会输出：
-- 容器名
-- 端口 / Server URL
+- 镜像来源（`local` / `github`）
+- GitHub 镜像地址
+- 后端监听端口（Server 容器内部服务绑定到宿主机端口）
 - 共享密钥
-- Host ID / 上报间隔
-- Env 文件路径
-- 镜像名
-- 挂载目录与关键路径
+- 磁盘告警阈值
+- 是否启用 HTTPS 反代（Caddy）
+- TLS Host（域名或 IP）
+- TLS Email（域名证书可选）
 
-便于你直接核对部署参数，避免“装完忘了填了什么”。
+### Client
 
-### 6) 仅安装单端（可选）
+- 镜像来源（`local` / `github`）
+- GitHub 镜像地址
+- Server URL（建议 `https://...`）
+- 共享密钥
+- Host ID
+- 上报间隔
+
+## update 模式行为
+
+- 自动执行仓库更新（`git fetch` + `git pull --ff-only`）。
+- 自动读取并复用配置：
+  - Server: `/opt/narwhal-monitor/server.env` + `/opt/narwhal-monitor/server-install.env`
+  - Client: `/opt/narwhal-monitor/client.env` + `/opt/narwhal-monitor/client-install.env`
+- 自动重建/重启容器，无需重新输入历史参数。
+
+## 监控项
+
+- 容器 CPU 占用
+- 容器连接数（按容器 PID 统计 socket）
+- 网络速度（RX/TX）
+- 指定磁盘文件容量与挂载点使用率
+- Podman 网络健康（IPv4 / IPv6）
+
+## 仅安装单端（可选）
 
 ```bash
-sudo bash scripts/install-server.sh
-sudo bash scripts/install-client.sh
+sudo bash scripts/install-server.sh install
+sudo bash scripts/install-client.sh install
 ```
 
-安装完成后，访问 `http://<server-ip>:<port>/`。
+仅更新单端（复用已有配置）：
 
-## 容器权限说明（是否 OK）
+```bash
+sudo bash scripts/install-server.sh update
+sudo bash scripts/install-client.sh update
+```
 
-Client 需要读取宿主 Podman 与网络状态，因此容器运行参数已包含：
+## 容器权限说明
 
-- `--network host`：用于真实网络探测（IPv4/IPv6）
-- `--pid host`：用于按容器 PID 统计连接数
-- `-v /run/podman/podman.sock:/run/podman/podman.sock`：访问 Podman 信息
-- 只读挂载 `/xfs_disk.img`、`/data`：做磁盘容量检测
+Client 为采集宿主信息，默认包含：
 
-在大多数 Debian/Ubuntu + Podman 环境下，这组权限可以满足监控需求；如遇 SELinux/AppArmor 限制，可按发行版策略补充标签或策略。
-
-
-## GitHub 镜像自动构建
-
-项目已包含 GitHub Actions 工作流：`.github/workflows/build-and-push-ghcr.yml`。
-
-- 触发条件：
-  - 推送到 `main` 分支
-  - 推送 `v*` 标签（例如 `v1.0.0`）
-  - 手动触发（`workflow_dispatch`）
-- 构建并推送镜像：
-  - `ghcr.io/<owner>/podman-watcher-server`
-  - `ghcr.io/<owner>/podman-watcher-client`
-- 默认会为默认分支生成 `latest` 标签，并附加 Git SHA 标签；发布标签时会同步生成同名 tag。
-
-> 说明：安装脚本中默认镜像名使用 `narwhal-cloud` 作为 owner。若你的仓库 owner 不同，请在安装时填写对应的 GHCR 镜像地址。
+- `--network host`
+- `--pid host`
+- `/run/podman/podman.sock` 挂载
+- `/xfs_disk.img`、`/data` 只读挂载
 
 ## 开发运行
 

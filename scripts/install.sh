@@ -31,19 +31,31 @@ install_deps() {
   ensure_cmd curl curl
 }
 
+update_repo_self() {
+  if [[ ! -d "$ROOT_DIR/.git" ]]; then
+    echo "[WARN] 当前目录不是 git 仓库，跳过脚本自更新。"
+    return
+  fi
+
+  echo "[INFO] 更新安装脚本与仓库代码（git pull --ff-only）..."
+  git -C "$ROOT_DIR" fetch --all --prune
+  git -C "$ROOT_DIR" pull --ff-only
+}
+
 run_installer() {
   local target="$1"
+  local mode="$2"
   case "$target" in
     server)
-      bash "$ROOT_DIR/scripts/install-server.sh"
+      bash "$ROOT_DIR/scripts/install-server.sh" "$mode"
       ;;
     client)
-      bash "$ROOT_DIR/scripts/install-client.sh"
+      bash "$ROOT_DIR/scripts/install-client.sh" "$mode"
       ;;
     both)
-      echo "[INFO] 先安装 Server，再安装 Client。"
-      bash "$ROOT_DIR/scripts/install-server.sh"
-      bash "$ROOT_DIR/scripts/install-client.sh"
+      echo "[INFO] 先处理 Server，再处理 Client。"
+      bash "$ROOT_DIR/scripts/install-server.sh" "$mode"
+      bash "$ROOT_DIR/scripts/install-client.sh" "$mode"
       ;;
     *)
       echo "[ERROR] 不支持的安装目标: $target"
@@ -55,18 +67,34 @@ run_installer() {
 main() {
   require_root
 
-  echo "=== Narwhal Monitor 一键安装器 ==="
-  echo "该脚本会自动补齐依赖，并启动交互式安装。"
+  echo "=== Narwhal Monitor 一键安装/更新器 ==="
+  echo "该脚本会自动补齐依赖，并启动交互式安装或无感更新。"
 
   install_deps
 
+  local action
+  read -rp "请选择操作 [install/update] (默认 install): " action
+  action=${action:-install}
+
   local mode
-  read -rp "请选择安装模式 [server/client/both] (默认 client): " mode
+  read -rp "请选择目标 [server/client/both] (默认 client): " mode
   mode=${mode:-client}
 
-  run_installer "$mode"
+  case "$action" in
+    install)
+      run_installer "$mode" install
+      ;;
+    update)
+      update_repo_self
+      run_installer "$mode" update
+      ;;
+    *)
+      echo "[ERROR] 不支持的操作: $action"
+      exit 1
+      ;;
+  esac
 
-  echo "[OK] 安装流程执行完成。"
+  echo "[OK] $action 流程执行完成。"
 }
 
 main "$@"

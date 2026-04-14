@@ -268,6 +268,129 @@ def history(host_id: str, container_name: str, minutes: int = 720) -> JSONRespon
     )
 
 
+@app.get("/api/v1/stats")
+def stats(minutes: int = 720) -> JSONResponse:
+    minutes = max(5, min(minutes, 10080))
+    start_ts = int(time.time()) - (minutes * 60)
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT host_id, container_name, ts, cpu_percent, mem_bytes, net_rx_bps, net_tx_bps, conn_count
+        FROM reports
+        WHERE ts>=?
+        ORDER BY host_id, container_name, ts ASC
+        """,
+        (start_ts,),
+    ).fetchall()
+    conn.close()
+
+    grouped: Dict[tuple[str, str], List[sqlite3.Row]] = {}
+    for row in rows:
+        key = (str(row["host_id"]), str(row["container_name"]))
+        grouped.setdefault(key, []).append(row)
+
+    items: List[Dict[str, Any]] = []
+    host_totals: Dict[str, Dict[str, float]] = {}
+    total_samples = 0
+    for (host_id, container_name), series in grouped.items():
+        if not series:
+            continue
+        cpu_values = [float(x["cpu_percent"] or 0) for x in series]
+        mem_values = [int(x["mem_bytes"] or 0) for x in series]
+        conn_values = [int(x["conn_count"] or 0) for x in series]
+        rx_values = [float(x["net_rx_bps"] or 0) for x in series]
+        tx_values = [float(x["net_tx_bps"] or 0) for x in series]
+        timestamps = [int(x["ts"]) for x in series]
+        intervals = [max(1, timestamps[i] - timestamps[i - 1]) for i in range(1, len(timestamps))]
+        estimated_interval = round(sum(intervals) / len(intervals), 2) if intervals else 0
+
+        rx_bytes = 0.0
+        tx_bytes = 0.0
+        for i, row in enumerate(series):
+            step = 0
+            if i > 0:
+                step = max(1, int(row["ts"]) - int(series[i - 1]["ts"]))
+            elif estimated_interval > 0:
+                step = max(1, int(round(estimated_interval)))
+            rx_bytes += float(row["net_rx_bps"] or 0) * step
+            tx_bytes += float(row["net_tx_bps"] or 0) * step
+
+        latest = series[-1]
+        item = {
+            "host_id": host_id,
+            "container_name": container_name,
+            "samples": len(series),
+            "estimated_interval_seconds": estimated_interval,
+            "latest": {
+                "timestamp": int(latest["ts"]),
+                "cpu_percent": float(latest["cpu_percent"] or 0),
+                "mem_bytes": int(latest["mem_bytes"] or 0),
+                "net_rx_bps": float(latest["net_rx_bps"] or 0),
+                "net_tx_bps": float(latest["net_tx_bps"] or 0),
+                "conn_count": int(latest["conn_count"] or 0),
+            },
+            "avg": {
+                "cpu_percent": round(sum(cpu_values) / len(cpu_values), 4),
+                "mem_bytes": int(sum(mem_values) / len(mem_values)),
+                "net_rx_bps": round(sum(rx_values) / len(rx_values), 4),
+                "net_tx_bps": round(sum(tx_values) / len(tx_values), 4),
+                "conn_count": round(sum(conn_values) / len(conn_values), 2),
+            },
+            "max": {
+                "cpu_percent": max(cpu_values),
+                "mem_bytes": max(mem_values),
+                "net_rx_bps": max(rx_values),
+                "net_tx_bps": max(tx_values),
+                "conn_count": max(conn_values),
+            },
+            "traffic_bytes": {
+                "rx": int(rx_bytes),
+                "tx": int(tx_bytes),
+                "total": int(rx_bytes + tx_bytes),
+            },
+        }
+        items.append(item)
+
+        host_total = host_totals.setdefault(host_id, {"rx": 0.0, "tx": 0.0, "samples": 0.0})
+        host_total["rx"] += rx_bytes
+        host_total["tx"] += tx_bytes
+        host_total["samples"] += len(series)
+        total_samples += len(series)
+
+    rank_cpu = sorted(items, key=lambda x: x["avg"]["cpu_percent"], reverse=True)[:10]
+    rank_conn = sorted(items, key=lambda x: x["avg"]["conn_count"], reverse=True)[:10]
+    rank_traffic = sorted(items, key=lambda x: x["traffic_bytes"]["total"], reverse=True)[:10]
+    host_summary = [
+        {
+            "host_id": host,
+            "traffic_rx_bytes": int(vals["rx"]),
+            "traffic_tx_bytes": int(vals["tx"]),
+            "traffic_total_bytes": int(vals["rx"] + vals["tx"]),
+            "samples": int(vals["samples"]),
+        }
+        for host, vals in host_totals.items()
+    ]
+    host_summary.sort(key=lambda x: x["traffic_total_bytes"], reverse=True)
+    return JSONResponse(
+        content={
+            "window_minutes": minutes,
+            "container_count": len(items),
+            "samples": total_samples,
+            "containers": items,
+            "ranks": {
+                "avg_cpu_top10": rank_cpu,
+                "avg_conn_top10": rank_conn,
+                "traffic_top10": rank_traffic,
+            },
+            "hosts": host_summary,
+            "recommendation": {
+                "suggested_interval_seconds": 60,
+                "reason": "当前容器 CPU 使用率整体低，建议从 300 秒降低到 60 秒，兼顾实时性与开销。",
+            },
+        }
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     return """
@@ -294,7 +417,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 </style>
 </head><body>
 <h2>Podman Monitor Dashboard</h2>
-<p>每 15 秒自动刷新。CPU/连接数/网速展示采集到的原始上报值，服务端不再做 5 分钟平均。红色表示预警。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。</p>
+<p>每 15 秒自动刷新。CPU/连接数/网速展示采集到的原始上报值，服务端不再做 5 分钟平均。红色表示预警。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。<a href='/stats' style='color:#8cc7ff'>查看统计页</a></p>
 <table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>总容量/可用</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
@@ -389,6 +512,14 @@ function drawAxes(svg,w,h){
   }
   svg.innerHTML=lines.join('');
 }
+function estimateStepSeconds(points){
+  if(!points || points.length < 2) return 0;
+  const intervals=[];
+  for(let i=1;i<points.length;i++){
+    intervals.push(Math.max(1, Number(points[i].timestamp||0)-Number(points[i-1].timestamp||0)));
+  }
+  return intervals.reduce((a,b)=>a+b,0)/intervals.length;
+}
 async function openDetail(host, container){
   const res=await fetch(`/api/v1/history?host_id=${encodeURIComponent(host)}&container_name=${encodeURIComponent(container)}`);
   const data=await res.json();
@@ -410,9 +541,18 @@ async function openDetail(host, container){
   const rxMbpsVals=recent.map(x=>bpsToMbps(Number(x.net_rx_bps||0)));
   const txMbpsVals=recent.map(x=>bpsToMbps(Number(x.net_tx_bps||0)));
   const speedVals=rxMbpsVals.map((v,i)=>v+txMbpsVals[i]);
+  const step=estimateStepSeconds(recent) || 300;
   let rxTotal=0; let txTotal=0;
-  const rxBytesCum=recent.map(x=>{rxTotal+=Number(x.net_rx_bps||0)*300; return rxTotal;});
-  const txBytesCum=recent.map(x=>{txTotal+=Number(x.net_tx_bps||0)*300; return txTotal;});
+  const rxBytesCum=recent.map((x,i)=>{
+    const currentStep=i===0?step:Math.max(1, Number(recent[i].timestamp||0)-Number(recent[i-1].timestamp||0));
+    rxTotal+=Number(x.net_rx_bps||0)*currentStep;
+    return rxTotal;
+  });
+  const txBytesCum=recent.map((x,i)=>{
+    const currentStep=i===0?step:Math.max(1, Number(recent[i].timestamp||0)-Number(recent[i-1].timestamp||0));
+    txTotal+=Number(x.net_tx_bps||0)*currentStep;
+    return txTotal;
+  });
 
   drawAxes(svg,900,220);
   const cpuPoints=buildPolyline(cpuVals, Math.max(100, ...cpuVals), 900, 220, 20);
@@ -442,6 +582,105 @@ async function openDetail(host, container){
   document.getElementById('modal').style.display='flex';
 }
 load(); setInterval(load, 15000);
+</script>
+</body></html>
+"""
+
+
+@app.get("/stats", response_class=HTMLResponse)
+def stats_page() -> str:
+    return """
+<!doctype html>
+<html><head><meta charset='utf-8'><title>Podman Stats</title>
+<style>
+body{font-family:sans-serif;margin:1rem;background:#0f1a2e;color:#dbe7ff}
+.topbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+.card-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-bottom:12px}
+.card{background:#13213b;border:1px solid #233b61;border-radius:10px;padding:10px}
+.value{font-size:22px;font-weight:700;margin-top:6px}
+table{border-collapse:collapse;width:100%;background:#13213b;color:#dbe7ff;margin-top:10px}
+th,td{border:1px solid #233b61;padding:8px;text-align:center}
+th{background:#1a2c4e}
+a{color:#8cc7ff}
+</style>
+</head><body>
+<h2>数据统计页</h2>
+<div class='topbar'>
+  <label>统计窗口(分钟)：<input id='minutes' type='number' value='720' min='5' max='10080' /></label>
+  <button onclick='loadStats()'>刷新</button>
+  <a href='/'>返回总览</a>
+</div>
+<div class='card-grid'>
+  <div class='card'><div>容器数</div><div class='value' id='kpi-containers'>0</div></div>
+  <div class='card'><div>样本数</div><div class='value' id='kpi-samples'>0</div></div>
+  <div class='card'><div>建议采样间隔</div><div class='value' id='kpi-interval'>--</div></div>
+  <div class='card'><div>窗口</div><div class='value' id='kpi-window'>--</div></div>
+</div>
+
+<h3>Top10：平均 CPU</h3>
+<table id='cpu-top'><thead><tr><th>主机</th><th>容器</th><th>平均 CPU%</th><th>峰值 CPU%</th><th>估算间隔(秒)</th></tr></thead><tbody></tbody></table>
+
+<h3>Top10：平均连接数</h3>
+<table id='conn-top'><thead><tr><th>主机</th><th>容器</th><th>平均连接</th><th>峰值连接</th><th>样本数</th></tr></thead><tbody></tbody></table>
+
+<h3>Top10：累计流量</h3>
+<table id='traffic-top'><thead><tr><th>主机</th><th>容器</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th></tr></thead><tbody></tbody></table>
+
+<h3>Host 汇总</h3>
+<table id='host-summary'><thead><tr><th>主机</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th><th>样本数</th></tr></thead><tbody></tbody></table>
+
+<script>
+function fmtBytes(n){
+  const x = Number(n||0); if (x<=0) return '0 B';
+  const units=['B','KB','MB','GB','TB']; let i=0; let v=x;
+  while(v>=1024 && i<units.length-1){v/=1024;i++;}
+  return `${v.toFixed(v>=100?0:1)} ${units[i]}`;
+}
+function renderRows(id, rows, mapper){
+  const tb=document.querySelector(`#${id} tbody`);
+  tb.innerHTML='';
+  for(const row of rows){
+    const tr=document.createElement('tr');
+    tr.innerHTML=mapper(row);
+    tb.appendChild(tr);
+  }
+}
+async function loadStats(){
+  const minutes=Math.max(5, Math.min(10080, Number(document.getElementById('minutes').value||720)));
+  const res=await fetch(`/api/v1/stats?minutes=${minutes}`);
+  const data=await res.json();
+  document.getElementById('kpi-containers').innerText=data.container_count||0;
+  document.getElementById('kpi-samples').innerText=data.samples||0;
+  document.getElementById('kpi-interval').innerText=(data.recommendation?.suggested_interval_seconds||'--') + 's';
+  document.getElementById('kpi-window').innerText=(data.window_minutes||minutes)+'m';
+
+  renderRows('cpu-top', data.ranks?.avg_cpu_top10||[], x=>`
+    <td>${x.host_id}</td><td>${x.container_name}</td>
+    <td>${Number(x.avg.cpu_percent||0).toFixed(2)}</td>
+    <td>${Number(x.max.cpu_percent||0).toFixed(2)}</td>
+    <td>${Number(x.estimated_interval_seconds||0).toFixed(2)}</td>
+  `);
+  renderRows('conn-top', data.ranks?.avg_conn_top10||[], x=>`
+    <td>${x.host_id}</td><td>${x.container_name}</td>
+    <td>${Number(x.avg.conn_count||0).toFixed(2)}</td>
+    <td>${Number(x.max.conn_count||0)}</td>
+    <td>${x.samples||0}</td>
+  `);
+  renderRows('traffic-top', data.ranks?.traffic_top10||[], x=>`
+    <td>${x.host_id}</td><td>${x.container_name}</td>
+    <td>${fmtBytes(x.traffic_bytes.rx)}</td>
+    <td>${fmtBytes(x.traffic_bytes.tx)}</td>
+    <td>${fmtBytes(x.traffic_bytes.total)}</td>
+  `);
+  renderRows('host-summary', data.hosts||[], x=>`
+    <td>${x.host_id}</td>
+    <td>${fmtBytes(x.traffic_rx_bytes)}</td>
+    <td>${fmtBytes(x.traffic_tx_bytes)}</td>
+    <td>${fmtBytes(x.traffic_total_bytes)}</td>
+    <td>${x.samples}</td>
+  `);
+}
+loadStats();
 </script>
 </body></html>
 """

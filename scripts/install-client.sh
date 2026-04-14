@@ -89,6 +89,7 @@ fi
 
 default_image_source="$(load_non_empty_or_default "$CLIENT_INSTALL_ENV_FILE" IMAGE_SOURCE "github")"
 default_github_image="$(load_non_empty_or_default "$CLIENT_INSTALL_ENV_FILE" GITHUB_IMAGE "ghcr.io/$(detect_ghcr_owner)/podman-watcher-client:latest")"
+default_log_enabled="$(load_non_empty_or_default "$CLIENT_INSTALL_ENV_FILE" LOG_ENABLED "yes")"
 default_server_url="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SERVER_URL "http://127.0.0.1:8080")"
 default_secret="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SHARED_SECRET "$(generate_secret)")"
 default_host_id="$(load_non_empty_or_default "$CLIENT_ENV_FILE" HOST_ID "$(hostname)")"
@@ -97,10 +98,26 @@ default_interval="$(load_non_empty_or_default "$CLIENT_ENV_FILE" REPORT_INTERVAL
 image_source="$(ask_with_default "Image source [local/github]" "$default_image_source")"
 image_source=$(echo "$image_source" | tr '[:upper:]' '[:lower:]')
 github_image="$(ask_with_default "GitHub image (for github source)" "$default_github_image")"
+log_enabled="$(ask_with_default "Enable client logs in 'podman logs' [yes/no]" "$default_log_enabled")"
+log_enabled=$(echo "$log_enabled" | tr '[:upper:]' '[:lower:]')
 server_url="$(ask_with_default "Server URL (e.g. https://server.example.com or https://1.2.3.4)" "$default_server_url")"
 secret="$(ask_with_default "Shared secret" "$default_secret")"
 host_id="$(ask_with_default "Host ID" "$default_host_id")"
 interval="$(ask_with_default "Collect interval seconds" "$default_interval")"
+
+case "$log_enabled" in
+  yes|y|true|1)
+    log_enabled="yes"
+    ;;
+  no|n|false|0)
+    log_enabled="no"
+    ;;
+  *)
+    echo "Unsupported log option: $log_enabled"
+    echo "Please choose 'yes' or 'no'."
+    exit 1
+    ;;
+esac
 
 mkdir -p /opt/narwhal-monitor
 cat >"$CLIENT_ENV_FILE" <<ENV
@@ -114,6 +131,7 @@ ENV
 cat >"$CLIENT_INSTALL_ENV_FILE" <<ENV
 IMAGE_SOURCE=$image_source
 GITHUB_IMAGE=$github_image
+LOG_ENABLED=$log_enabled
 ENV
 
 podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -139,8 +157,14 @@ case "$image_source" in
     ;;
 esac
 
+log_driver="none"
+if [[ "$log_enabled" == "yes" ]]; then
+  log_driver="k8s-file"
+fi
+
 podman run -d --name "$CONTAINER_NAME" \
   --restart=always \
+  --log-driver="$log_driver" \
   --network host \
   --pid host \
   -v /run/podman/podman.sock:/run/podman/podman.sock \
@@ -158,6 +182,7 @@ cat <<EOF_SUM
 ===== Client Install Summary =====
 Mode: $MODE
 Container Name: $CONTAINER_NAME
+Client Logs Enabled: $log_enabled (podman log driver: $log_driver)
 Server URL: $server_url
 Shared Secret: $secret
 Host ID: $host_id

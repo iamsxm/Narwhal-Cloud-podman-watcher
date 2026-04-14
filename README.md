@@ -66,6 +66,7 @@ sudo bash /tmp/narwhal-bootstrap-install.sh
 
 - 镜像来源（`local` / `github`）
 - GitHub 镜像地址
+- 是否启用客户端日志输出到 `podman logs`（排障建议开启；正式环境可关闭）
 - Server URL（建议 `https://...`）
 - 共享密钥
 - Host ID

@@ -202,6 +202,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
         if hidden_offline and not include_stale:
             continue
         container_disk = payload.get("container_disk", {})
+        top_cpu_process = payload.get("top_cpu_process", {})
         offline_hours = stale_seconds // 3600
         out.append({
             "host_id": r["host_id"],
@@ -225,6 +226,9 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "container_fs_root_avail_bytes": container_disk.get("fs", {}).get("root", {}).get("avail_bytes", 0),
             "container_fs_data_total_bytes": container_disk.get("fs", {}).get("data", {}).get("total_bytes", 0),
             "container_fs_data_avail_bytes": container_disk.get("fs", {}).get("data", {}).get("avail_bytes", 0),
+            "top_cpu_process_pid": int(top_cpu_process.get("pid") or 0),
+            "top_cpu_process_cpu_percent": float(top_cpu_process.get("cpu_percent") or 0),
+            "top_cpu_process_command": str(top_cpu_process.get("command") or ""),
             "podman_network_ok_v4": bool(r["podman_network_ok_v4"]),
             "podman_network_ok_v6": bool(r["podman_network_ok_v6"]),
             "timestamp": r["ts"],

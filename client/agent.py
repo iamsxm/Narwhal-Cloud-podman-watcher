@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 _warned_missing_bins = set()
 _podman_bin = None
+_net_counters: Dict[str, Dict[str, float]] = {}
 
 
 def get_podman_bin() -> str:
@@ -91,18 +92,25 @@ def _normalize_stat_number(raw: object) -> float:
         return 0.0
 
 
+def _pick_first(item: Dict[str, object], keys: List[str]) -> object:
+    for key in keys:
+        if key in item and item.get(key) is not None:
+            return item.get(key)
+    return None
+
+
 def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
     cpu_percent = 0.0
     mem_bytes = 0
-    net_rx_bps = 0.0
-    net_tx_bps = 0.0
+    net_rx_total_bytes = 0
+    net_tx_total_bytes = 0
 
     if not stats_text:
         return {
             "cpu_percent": cpu_percent,
             "mem_bytes": mem_bytes,
-            "net_rx_bps": net_rx_bps,
-            "net_tx_bps": net_tx_bps,
+            "net_rx_total_bytes": net_rx_total_bytes,
+            "net_tx_total_bytes": net_tx_total_bytes,
         }
 
     try:
@@ -117,39 +125,39 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
         item = payload
 
     if isinstance(item, dict):
-        cpu_percent = _normalize_stat_number(item.get("CPU"))
+        cpu_percent = _normalize_stat_number(_pick_first(item, ["CPU", "CPUPerc", "CPU%"]))
 
-        mem_usage = item.get("MemUsage")
+        mem_usage = _pick_first(item, ["MemUsage", "Mem Usage"])
         if mem_usage is not None:
             mem_bytes = parse_size(str(mem_usage).split("/")[0].strip())
         else:
-            mem_bytes = int(_normalize_stat_number(item.get("MemUsageBytes")))
+            mem_bytes = int(_normalize_stat_number(_pick_first(item, ["MemUsageBytes", "MemUsageBytesValue"])))
 
-        net_io = item.get("NetIO")
+        net_io = _pick_first(item, ["NetIO", "Net I/O"])
         if net_io is not None:
             net = str(net_io).split("/")
             if len(net) == 2:
-                net_rx_bps = parse_size(net[0].strip()) / 300.0
-                net_tx_bps = parse_size(net[1].strip()) / 300.0
+                net_rx_total_bytes = parse_size(net[0].strip())
+                net_tx_total_bytes = parse_size(net[1].strip())
         else:
-            net_in = _normalize_stat_number(item.get("NetInput"))
-            net_out = _normalize_stat_number(item.get("NetOutput"))
-            net_rx_bps = net_in / 300.0
-            net_tx_bps = net_out / 300.0
+            net_in = _normalize_stat_number(_pick_first(item, ["NetInput", "Net In"]))
+            net_out = _normalize_stat_number(_pick_first(item, ["NetOutput", "Net Out"]))
+            net_rx_total_bytes = int(net_in)
+            net_tx_total_bytes = int(net_out)
 
     return {
         "cpu_percent": cpu_percent,
         "mem_bytes": mem_bytes,
-        "net_rx_bps": net_rx_bps,
-        "net_tx_bps": net_tx_bps,
+        "net_rx_total_bytes": net_rx_total_bytes,
+        "net_tx_total_bytes": net_tx_total_bytes,
     }
 
 
 def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
     cpu_percent = 0.0
     mem_bytes = 0
-    net_rx_bps = 0.0
-    net_tx_bps = 0.0
+    net_rx_total_bytes = 0
+    net_tx_total_bytes = 0
 
     parts = (stats_text or "").strip().split("|")
     if len(parts) >= 4:
@@ -157,19 +165,57 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
         mem_bytes = parse_size(parts[1].split("/")[0].strip())
         net = parts[2].split("/")
         if len(net) == 2:
-            net_rx_bps = parse_size(net[0].strip()) / 300.0
-            net_tx_bps = parse_size(net[1].strip()) / 300.0
-        if net_rx_bps <= 0:
-            net_rx_bps = parse_size(parts[2].strip()) / 300.0
-        if net_tx_bps <= 0:
-            net_tx_bps = parse_size(parts[3].strip()) / 300.0
+            net_rx_total_bytes = parse_size(net[0].strip())
+            net_tx_total_bytes = parse_size(net[1].strip())
+        if net_rx_total_bytes <= 0:
+            net_rx_total_bytes = parse_size(parts[2].strip())
+        if net_tx_total_bytes <= 0:
+            net_tx_total_bytes = parse_size(parts[3].strip())
 
     return {
         "cpu_percent": cpu_percent,
         "mem_bytes": mem_bytes,
-        "net_rx_bps": net_rx_bps,
-        "net_tx_bps": net_tx_bps,
+        "net_rx_total_bytes": net_rx_total_bytes,
+        "net_tx_total_bytes": net_tx_total_bytes,
     }
+
+
+def _derive_net_bps(container_key: str, rx_total: int, tx_total: int) -> Tuple[float, float]:
+    now = float(time.time())
+    prev = _net_counters.get(container_key)
+    _net_counters[container_key] = {"ts": now, "rx": float(rx_total), "tx": float(tx_total)}
+    if not prev:
+        return 0.0, 0.0
+
+    dt = now - float(prev.get("ts", 0.0))
+    if dt <= 0:
+        return 0.0, 0.0
+
+    rx_delta = max(0.0, float(rx_total) - float(prev.get("rx", 0.0)))
+    tx_delta = max(0.0, float(tx_total) - float(prev.get("tx", 0.0)))
+    return rx_delta / dt, tx_delta / dt
+
+
+def collect_top_cpu_process(name: str) -> Dict[str, object]:
+    podman = get_podman_bin()
+    if not podman:
+        return {"pid": 0, "cpu_percent": 0.0, "command": ""}
+
+    out = run([podman, "top", name, "pcpu,pid,comm,args"])
+    best = {"pid": 0, "cpu_percent": 0.0, "command": ""}
+    for line in out.splitlines():
+        text = line.strip()
+        if not text or text.lower().startswith("pcpu"):
+            continue
+        parts = text.split(None, 3)
+        if len(parts) < 3:
+            continue
+        cpu = _normalize_stat_number(parts[0])
+        pid = int(parts[1]) if parts[1].isdigit() else 0
+        cmd = parts[3] if len(parts) >= 4 else parts[2]
+        if cpu >= float(best["cpu_percent"]):
+            best = {"pid": pid, "cpu_percent": cpu, "command": cmd}
+    return best
 
 
 def _image_matches(image: str, patterns: List[str]) -> bool:
@@ -280,16 +326,19 @@ def collect_container(name: str, container_id: str = "") -> Dict:
     parsed_stats = _parse_stats_json(stats_json)
     cpu_percent = float(parsed_stats["cpu_percent"])
     mem = int(parsed_stats["mem_bytes"])
-    net_rx = float(parsed_stats["net_rx_bps"])
-    net_tx = float(parsed_stats["net_tx_bps"])
+    rx_total = int(parsed_stats["net_rx_total_bytes"])
+    tx_total = int(parsed_stats["net_tx_total_bytes"])
+    container_key = container_id or name
+    net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
 
-    if cpu_percent <= 0 and mem <= 0 and net_rx <= 0 and net_tx <= 0:
+    if cpu_percent <= 0 and mem <= 0 and rx_total <= 0 and tx_total <= 0:
         stats_tpl = run([podman, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}", name])
         parsed_tpl = _parse_stats_template(stats_tpl)
         cpu_percent = float(parsed_tpl["cpu_percent"])
         mem = int(parsed_tpl["mem_bytes"])
-        net_rx = float(parsed_tpl["net_rx_bps"])
-        net_tx = float(parsed_tpl["net_tx_bps"])
+        rx_total = int(parsed_tpl["net_rx_total_bytes"])
+        tx_total = int(parsed_tpl["net_tx_total_bytes"])
+        net_rx, net_tx = _derive_net_bps(container_key, rx_total, tx_total)
 
     inspect = run([podman, "inspect", name])
     conn_count = 0
@@ -305,6 +354,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
 
     disk = collect_disk_alert()
     container_disk = collect_container_disk_usage(name)
+    top_cpu_process = collect_top_cpu_process(name)
     return {
         "id": container_id,
         "name": name,
@@ -315,6 +365,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
         "conn_count": conn_count,
         "disk": disk,
         "container_disk": container_disk,
+        "top_cpu_process": top_cpu_process,
     }
 
 

@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALL_BASE_DIR="/opt/narwhal-monitor"
+UNINSTALL_IMAGES_TO_REMOVE=()
 
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -103,32 +105,106 @@ remove_image_if_exists() {
   fi
 }
 
+detect_ghcr_owner() {
+  local owner="narwhal-cloud"
+  if command -v git >/dev/null 2>&1; then
+    local remote_url=""
+    remote_url="$(git -C "$ROOT_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    if [[ -n "$remote_url" && "$remote_url" =~ github\.com[:/]([^/]+)/[^/]+(\.git)?$ ]]; then
+      owner="${BASH_REMATCH[1]}"
+    fi
+  fi
+  echo "$owner"
+}
+
+append_unique_image() {
+  local image="$1"
+  [[ -n "$image" ]] || return 0
+  case "$image" in
+    IMAGE_SOURCE=*|GITHUB_IMAGE=*|PORT=*|TLS_ENABLE=*|TLS_HOST=*|TLS_EMAIL=*|TLS_CERT_MODE=*|CLOUDFLARE_API_TOKEN=*|*=*)
+      return 0
+      ;;
+  esac
+
+  local existing=""
+  for existing in "${UNINSTALL_IMAGES_TO_REMOVE[@]-}"; do
+    if [[ "$existing" == "$image" ]]; then
+      return 0
+    fi
+  done
+  UNINSTALL_IMAGES_TO_REMOVE+=("$image")
+}
+
+collect_images_from_saved_configs() {
+  local client_install_env="$INSTALL_BASE_DIR/client-install.env"
+  local server_install_env="$INSTALL_BASE_DIR/server-install.env"
+
+  if [[ -f "$client_install_env" ]]; then
+    local client_image=""
+    client_image="$(awk -F= '$1=="GITHUB_IMAGE"{print substr($0, index($0, "=") + 1); exit}' "$client_install_env" 2>/dev/null || true)"
+    append_unique_image "$client_image"
+  fi
+
+  if [[ -f "$server_install_env" ]]; then
+    local server_image=""
+    server_image="$(awk -F= '$1=="GITHUB_IMAGE"{print substr($0, index($0, "=") + 1); exit}' "$server_install_env" 2>/dev/null || true)"
+    append_unique_image "$server_image"
+  fi
+}
+
+remove_images_by_repository_pattern() {
+  local pattern="$1"
+  [[ -n "$pattern" ]] || return 0
+
+  local image_id=""
+  while IFS= read -r image_id; do
+    [[ -z "$image_id" ]] && continue
+    echo "[INFO] 删除镜像ID: $image_id (匹配: $pattern)"
+    podman rmi -f "$image_id" >/dev/null 2>&1 || true
+  done < <(podman images --format '{{.ID}} {{.Repository}}:{{.Tag}}' | awk -v p="$pattern" '$2 ~ p {print $1}')
+}
+
 uninstall_narwhal_related() {
   echo "[INFO] 开始卸载 Narwhal-Cloud-podman-watcher 相关 Podman 资源..."
   echo "[INFO] 仅清理本项目相关资源，不会删除其他已有 Podman 容器。"
 
   if command -v podman >/dev/null 2>&1; then
+    local owner=""
+    owner="$(detect_ghcr_owner)"
+
     remove_container_if_exists "narwhal-monitor-client"
     remove_container_if_exists "narwhal-monitor-server"
     remove_container_if_exists "narwhal-monitor-caddy"
 
-    local images_to_remove=(
+    UNINSTALL_IMAGES_TO_REMOVE=(
       "narwhal-monitor-client:latest"
       "narwhal-monitor-server:latest"
       "ghcr.io/narwhal-cloud/podman-watcher-client:latest"
       "ghcr.io/narwhal-cloud/podman-watcher-server:latest"
+      "ghcr.io/${owner}/podman-watcher-client:latest"
+      "ghcr.io/${owner}/podman-watcher-server:latest"
+      "docker.io/library/caddy:2"
+      "ghcr.io/caddy-dns/cloudflare:latest"
+      "ghcr.io/caddy-dns/cloudflare:2"
     )
+
+    collect_images_from_saved_configs
+
     local image=""
-    for image in "${images_to_remove[@]}"; do
+    for image in "${UNINSTALL_IMAGES_TO_REMOVE[@]}"; do
       remove_image_if_exists "$image"
     done
+
+    # 清理同仓库下可能存在的非 latest 标签镜像（例如手动指定了版本标签）。
+    remove_images_by_repository_pattern '^ghcr\.io/(narwhal-cloud|'"$owner"')/podman-watcher-(client|server)$'
+    remove_images_by_repository_pattern '^ghcr\.io/caddy-dns/cloudflare$'
   else
     echo "[WARN] 未检测到 podman，跳过容器/镜像删除，仅清理本项目配置目录。"
   fi
 
-  if [[ -d "/opt/narwhal-monitor" ]]; then
-    echo "[INFO] 删除配置与数据目录: /opt/narwhal-monitor"
-    rm -rf /opt/narwhal-monitor
+  if [[ -d "$INSTALL_BASE_DIR" ]]; then
+    echo "[INFO] 删除配置与数据目录: $INSTALL_BASE_DIR"
+    rm -rf "$INSTALL_BASE_DIR"
   fi
 
   echo "[OK] 卸载完成：Narwhal-Cloud-podman-watcher 相关资源已清理。"

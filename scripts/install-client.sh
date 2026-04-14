@@ -124,11 +124,13 @@ default_server_url="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SERVER_URL "h
 default_secret="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SHARED_SECRET "$(generate_secret)")"
 default_host_id="$(load_non_empty_or_default "$CLIENT_ENV_FILE" HOST_ID "$(hostname)")"
 default_interval="$(load_non_empty_or_default "$CLIENT_ENV_FILE" REPORT_INTERVAL "300")"
+default_monitored_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" MONITORED_IMAGE_PATTERNS "docker.io/narwhalcloud/debian,docker.io/library/alpine,alpine,sing-box,vpn")"
 
 server_url="$(ask_with_default "Server URL (e.g. https://server.example.com or https://1.2.3.4)" "$default_server_url")"
 secret="$(ask_with_default "Shared secret" "$default_secret")"
 host_id="$(ask_with_default "Host ID" "$default_host_id")"
 interval="$(ask_with_default "Collect interval seconds" "$default_interval")"
+monitored_patterns="$(ask_with_default "Monitored image patterns (comma-separated substring match)" "$default_monitored_patterns")"
 
 mkdir -p /opt/narwhal-monitor
 cat >"$CLIENT_ENV_FILE" <<ENV
@@ -137,6 +139,7 @@ SHARED_SECRET=$secret
 HOST_ID=$host_id
 REPORT_INTERVAL=$interval
 WATCH_DISK_FILE=/xfs_disk.img
+MONITORED_IMAGE_PATTERNS=$monitored_patterns
 ENV
 
 cat >"$CLIENT_INSTALL_ENV_FILE" <<ENV
@@ -190,6 +193,7 @@ Shared Secret: $secret
 Host ID: $host_id
 Report Interval: $interval s
 Watch Disk File: /xfs_disk.img
+Monitored Image Patterns: $monitored_patterns
 Podman Socket: /run/podman/podman.sock (auto-detected by agent)
 Env File: $CLIENT_ENV_FILE
 Install Config: $CLIENT_INSTALL_ENV_FILE

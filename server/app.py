@@ -14,6 +14,8 @@ DB_PATH = os.getenv("DB_PATH", "/data/monitor.db")
 SHARED_SECRET = os.getenv("SHARED_SECRET", "change-me")
 ALERT_DISK_THRESHOLD_PERCENT = int(os.getenv("ALERT_DISK_THRESHOLD_PERCENT", "80"))
 STALE_SECONDS = int(os.getenv("STALE_SECONDS", "900"))
+OFFLINE_HIDE_SECONDS = int(os.getenv("OFFLINE_HIDE_SECONDS", str(24 * 3600)))
+PURGE_SECONDS = int(os.getenv("PURGE_SECONDS", str(30 * 24 * 3600)))
 UTC8 = timezone(timedelta(hours=8))
 
 app = FastAPI(title="Narwhal Podman Monitor")
@@ -58,6 +60,18 @@ def init_db() -> None:
 def startup() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     init_db()
+    cleanup_old_reports()
+
+
+def cleanup_old_reports(now_ts: int | None = None) -> int:
+    now = now_ts or int(time.time())
+    cutoff = now - PURGE_SECONDS
+    conn = db()
+    cur = conn.execute("DELETE FROM reports WHERE ts < ?", (cutoff,))
+    conn.commit()
+    deleted = int(cur.rowcount or 0)
+    conn.close()
+    return deleted
 
 
 def verify_signature(body: bytes, x_timestamp: str, x_signature: str) -> None:
@@ -82,6 +96,7 @@ async def report(
     x_timestamp: str = Header(default=""),
     x_signature: str = Header(default=""),
 ) -> Dict[str, Any]:
+    cleanup_old_reports()
     body = await request.body()
     verify_signature(body, x_timestamp, x_signature)
     data = json.loads(body)
@@ -126,6 +141,7 @@ async def report(
 
 @app.get("/api/v1/latest")
 def latest(include_stale: bool = False) -> JSONResponse:
+    cleanup_old_reports()
     conn = db()
     rows = conn.execute(
         """
@@ -180,10 +196,13 @@ def latest(include_stale: bool = False) -> JSONResponse:
         host_disk = host_disk_map.get(r["host_id"], {})
         avg = avg_map.get((r["host_id"], r["container_name"]))
         alert_disk = (r["disk_used_percent"] or 0) >= ALERT_DISK_THRESHOLD_PERCENT
-        stale = (now - r["ts"]) > STALE_SECONDS
-        if stale and not include_stale:
+        stale_seconds = max(0, now - r["ts"])
+        stale = stale_seconds > STALE_SECONDS
+        hidden_offline = stale_seconds > OFFLINE_HIDE_SECONDS
+        if hidden_offline and not include_stale:
             continue
         container_disk = payload.get("container_disk", {})
+        offline_hours = stale_seconds // 3600
         out.append({
             "host_id": r["host_id"],
             "container_id": payload.get("id", ""),
@@ -211,9 +230,12 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "timestamp": r["ts"],
             "timestamp_iso": datetime.fromtimestamp(r["ts"], tz=timezone.utc).isoformat(),
             "timestamp_iso_utc8": datetime.fromtimestamp(r["ts"], tz=UTC8).isoformat(),
+            "offline_seconds": stale_seconds,
+            "offline_hours": offline_hours,
             "alerts": {
                 "disk": alert_disk,
                 "stale": stale,
+                "hidden_offline": hidden_offline,
                 "network": (not r["podman_network_ok_v4"]) or (not r["podman_network_ok_v6"]),
             },
         })
@@ -278,7 +300,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 </style>
 </head><body>
 <h2>Podman Monitor Dashboard</h2>
-<p>每 15 秒自动刷新。CPU/连接数/网速展示最近 5 分钟平均值。红色表示预警。默认隐藏超时未上报容器（疑似历史数据）。</p>
+<p>每 15 秒自动刷新。CPU/连接数/网速展示最近 5 分钟平均值。红色表示预警。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。</p>
 <table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>Agent磁盘(容器内)</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
@@ -339,7 +361,8 @@ async function load(){
       if(idx===0){
         html += `<td rowspan='${rows.length}'>${host}</td>`;
       }
-      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}</td><td class='${cls}'>${Number(x.cpu_percent||0).toFixed(2)}</td><td>${x.conn_count}</td><td>${bpsToMbps(x.net_rx_bps).toFixed(2)}</td><td>${bpsToMbps(x.net_tx_bps).toFixed(2)}</td><td>${containerDiskText}</td>`;
+      const offlineTag = x.alerts.stale ? ` <span class='bad'>(离线 ${x.offline_hours} 小时)</span>` : '';
+      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cls}'>${Number(x.cpu_percent||0).toFixed(2)}</td><td>${x.conn_count}</td><td>${bpsToMbps(x.net_rx_bps).toFixed(2)}</td><td>${bpsToMbps(x.net_tx_bps).toFixed(2)}</td><td>${containerDiskText}</td>`;
       if(idx===0){
         html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${hostDiskText}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v4?'ok':'bad'}'>${x.podman_network_ok_v4?'✅️':'❌️'}</td>`;

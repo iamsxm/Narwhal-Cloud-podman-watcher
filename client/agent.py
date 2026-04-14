@@ -22,7 +22,10 @@ def get_podman_bin() -> str:
     if _podman_bin is not None:
         return _podman_bin
 
-    for name in ("podman", "podman-remote"):
+    # In containerized deployments we usually mount the host Podman socket.
+    # Prefer podman-remote first so we can see host containers instead of an
+    # empty in-container local Podman store.
+    for name in ("podman-remote", "podman"):
         if shutil.which(name):
             _podman_bin = name
             return _podman_bin
@@ -35,8 +38,14 @@ def get_podman_bin() -> str:
 
 
 def run(cmd: List[str]) -> str:
+    env = None
+    if cmd and cmd[0] == "podman-remote":
+        socket_path = os.getenv("PODMAN_SOCKET", "/run/podman/podman.sock")
+        if "CONTAINER_HOST" not in os.environ and os.path.exists(socket_path):
+            env = os.environ.copy()
+            env["CONTAINER_HOST"] = f"unix://{socket_path}"
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env)
     except FileNotFoundError:
         if cmd and cmd[0] not in _warned_missing_bins:
             _warned_missing_bins.add(cmd[0])

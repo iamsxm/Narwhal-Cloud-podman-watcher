@@ -74,49 +74,95 @@ def parse_size(s: str) -> int:
     return int(n * mult)
 
 
+def _image_matches(image: str, patterns: List[str]) -> bool:
+    if not patterns:
+        return False
+    val = image.strip().lower()
+    for p in patterns:
+        token = p.strip().lower()
+        if not token:
+            continue
+        if token in val:
+            return True
+    return False
+
+
 def podman_containers() -> List[Dict[str, str]]:
     podman = get_podman_bin()
     if not podman:
         return []
-    out = run([podman, "ps", "--format", "{{.Names}}|{{.Image}}"])
+    patterns_env = os.getenv(
+        "MONITORED_IMAGE_PATTERNS",
+        "docker.io/narwhalcloud/debian,docker.io/library/alpine,alpine",
+    )
+    patterns = [x.strip() for x in patterns_env.split(",") if x.strip()]
+    out = run([podman, "ps", "--format", "{{.ID}}|{{.Names}}|{{.Image}}"])
     items: List[Dict[str, str]] = []
     for line in out.splitlines():
         line = line.strip()
         if not line:
             continue
-        name, _, image = line.partition("|")
-        image = image.strip()
-        if not image.startswith("docker.io/narwhalcloud/agent"):
+        parts = line.split("|", 2)
+        if len(parts) != 3:
             continue
-        items.append({"name": name.strip(), "image": image})
+        container_id, name, image = parts
+        image = image.strip()
+        if not _image_matches(image, patterns):
+            continue
+        items.append({"id": container_id.strip(), "name": name.strip(), "image": image})
     return items
 
 
 
 
-def collect_container_disk_usage(name: str) -> Dict[str, int]:
+def _parse_df_target(df_out: str, target: str) -> Dict[str, int]:
+    for line in df_out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        mountpoint = parts[5]
+        if mountpoint != target:
+            continue
+        return {
+            "total_bytes": int(parts[1]) * 1024,
+            "avail_bytes": int(parts[3]) * 1024,
+        }
+    return {"total_bytes": 0, "avail_bytes": 0}
+
+
+def collect_container_disk_usage(name: str) -> Dict[str, Dict[str, int] | int]:
     podman = get_podman_bin()
     if not podman:
-        return {"rw_bytes": 0, "rootfs_bytes": 0}
+        return {
+            "rw_bytes": 0,
+            "rootfs_bytes": 0,
+            "fs": {"root": {"total_bytes": 0, "avail_bytes": 0}, "data": {"total_bytes": 0, "avail_bytes": 0}},
+        }
 
+    rw_bytes = 0
+    rootfs_bytes = 0
     inspect = run([podman, "container", "inspect", "--size", name])
     if inspect:
         try:
             item = json.loads(inspect)[0]
-            return {
-                "rw_bytes": int(item.get("SizeRw") or 0),
-                "rootfs_bytes": int(item.get("SizeRootFs") or 0),
-            }
+            rw_bytes = int(item.get("SizeRw") or 0)
+            rootfs_bytes = int(item.get("SizeRootFs") or 0)
         except Exception:
             pass
 
-    return {"rw_bytes": 0, "rootfs_bytes": 0}
+    fs_df = run([podman, "exec", name, "sh", "-lc", "df -P / /data 2>/dev/null || true"])
+    fs = {
+        "root": _parse_df_target(fs_df, "/"),
+        "data": _parse_df_target(fs_df, "/data"),
+    }
+    return {"rw_bytes": rw_bytes, "rootfs_bytes": rootfs_bytes, "fs": fs}
 
 
-def collect_container(name: str) -> Dict:
+def collect_container(name: str, container_id: str = "") -> Dict:
     podman = get_podman_bin()
     if not podman:
         return {
+            "id": container_id,
             "name": name,
             "cpu_percent": 0.0,
             "mem_bytes": 0,
@@ -161,6 +207,7 @@ def collect_container(name: str) -> Dict:
     disk = collect_disk_alert()
     container_disk = collect_container_disk_usage(name)
     return {
+        "id": container_id,
         "name": name,
         "cpu_percent": cpu_percent,
         "mem_bytes": mem,
@@ -178,6 +225,7 @@ def collect_disk_alert() -> Dict:
 
     root_device = ""
     root_avail_bytes = 0
+    root_total_bytes = 0
     df_root = run(["df", "-P", "/"])
     if df_root:
         lines = df_root.splitlines()
@@ -185,9 +233,11 @@ def collect_disk_alert() -> Dict:
             parts = lines[1].split()
             if len(parts) >= 6:
                 root_device = parts[0]
+                root_total_bytes = int(parts[1]) * 1024
                 root_avail_bytes = int(parts[3]) * 1024
 
     data_avail_bytes = 0
+    data_total_bytes = 0
     df = run(["df", "-P", "/data"])
     used = 0.0
     if df:
@@ -196,13 +246,16 @@ def collect_disk_alert() -> Dict:
             parts = lines[1].split()
             if len(parts) >= 6:
                 used = float(parts[4].rstrip("%"))
+                data_total_bytes = int(parts[1]) * 1024
                 data_avail_bytes = int(parts[3]) * 1024
     return {
         "file": file_path,
         "size_bytes": image_size,
         "used_percent": used,
         "root_device": root_device,
+        "root_total_bytes": root_total_bytes,
         "root_avail_bytes": root_avail_bytes,
+        "data_total_bytes": data_total_bytes,
         "data_avail_bytes": data_avail_bytes,
     }
 
@@ -265,7 +318,7 @@ def main() -> None:
             "host_id": args.host_id,
             "timestamp": int(time.time()),
             "podman_network": {"ipv4_ok": v4, "ipv6_ok": v6},
-            "containers": [collect_container(c["name"]) for c in containers],
+            "containers": [collect_container(c["name"], c.get("id", "")) for c in containers],
         }
         try:
             push(args.server, args.secret, payload)

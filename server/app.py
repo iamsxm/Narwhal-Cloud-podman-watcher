@@ -186,6 +186,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
         container_disk = payload.get("container_disk", {})
         out.append({
             "host_id": r["host_id"],
+            "container_id": payload.get("id", ""),
             "container_name": r["container_name"],
             "cpu_percent": (avg["cpu_avg"] if avg else r["cpu_percent"]),
             "mem_bytes": r["mem_bytes"],
@@ -195,10 +196,16 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "disk_file": r["disk_file"],
             "disk_used_percent": r["disk_used_percent"],
             "disk_root_device": host_disk.get("root_device") or disk.get("root_device", ""),
+            "disk_root_total_bytes": host_disk.get("root_total_bytes") or disk.get("root_total_bytes", 0),
             "disk_root_avail_bytes": host_disk.get("root_avail_bytes") or disk.get("root_avail_bytes", 0),
+            "disk_data_total_bytes": host_disk.get("data_total_bytes") or disk.get("data_total_bytes", 0),
             "disk_data_avail_bytes": host_disk.get("data_avail_bytes") or disk.get("data_avail_bytes", 0),
             "container_disk_rw_bytes": container_disk.get("rw_bytes", 0),
             "container_disk_rootfs_bytes": container_disk.get("rootfs_bytes", 0),
+            "container_fs_root_total_bytes": container_disk.get("fs", {}).get("root", {}).get("total_bytes", 0),
+            "container_fs_root_avail_bytes": container_disk.get("fs", {}).get("root", {}).get("avail_bytes", 0),
+            "container_fs_data_total_bytes": container_disk.get("fs", {}).get("data", {}).get("total_bytes", 0),
+            "container_fs_data_avail_bytes": container_disk.get("fs", {}).get("data", {}).get("avail_bytes", 0),
             "podman_network_ok_v4": bool(r["podman_network_ok_v4"]),
             "podman_network_ok_v6": bool(r["podman_network_ok_v6"]),
             "timestamp": r["ts"],
@@ -251,32 +258,53 @@ def dashboard() -> str:
 <!doctype html>
 <html><head><meta charset='utf-8'><title>Podman Monitor</title>
 <style>
-body{font-family:sans-serif;margin:1rem;background:#f7f8fa}
-table{border-collapse:collapse;width:100%;background:#fff}
-th,td{border:1px solid #ddd;padding:8px;vertical-align:middle;text-align:center}
-th{background:#f0f2f5}
+body{font-family:sans-serif;margin:1rem;background:#0f1a2e;color:#dbe7ff}
+table{border-collapse:collapse;width:100%;background:#13213b;color:#dbe7ff}
+th,td{border:1px solid #233b61;padding:8px;vertical-align:middle;text-align:center}
+th{background:#1a2c4e}
 .bad{color:#b00020;font-weight:bold}
 .ok{color:#0a8f08}
-.btn{border:1px solid #888;padding:4px 8px;border-radius:6px;background:#fff;cursor:pointer}
+.btn{border:1px solid #4b6fa8;padding:4px 8px;border-radius:6px;background:#1a2c4e;color:#dbe7ff;cursor:pointer}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center}
-#card{background:#fff;border-radius:12px;padding:16px;width:min(980px,95vw)}
+#card{background:#0d1730;border-radius:12px;padding:16px;width:min(1380px,96vw)}
 .legend{display:flex;gap:14px;align-items:center;margin:8px 0 4px 0;font-size:14px}
 .legend-item{display:flex;align-items:center;gap:6px}
 .dot{width:10px;height:10px;border-radius:50%}
-svg{width:100%;height:200px;border-top:1px solid #ddd}
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.panel{background:#13213b;border:1px solid #233b61;border-radius:10px;padding:10px}
+.panel h4{margin:0 0 6px 0}
+svg{width:100%;height:220px;border-top:1px solid #28436c}
+#traffic{height:280px}
 </style>
 </head><body>
 <h2>Podman Monitor Dashboard</h2>
 <p>每 15 秒自动刷新。CPU/连接数/网速展示最近 5 分钟平均值。红色表示预警。默认隐藏超时未上报容器（疑似历史数据）。</p>
-<table id='t'><thead><tr><th>主机</th><th>容器</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>容器磁盘(RW/RootFS)</th><th>磁盘(主盘 & /data 可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
+<table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>Agent磁盘(容器内)</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
-  <div class='legend'>
-    <span class='legend-item'><span class='dot' style='background:#4a90e2'></span>CPU%</span>
-    <span class='legend-item'><span class='dot' style='background:#7f8c8d'></span>连接数</span>
-    <span class='legend-item'><span class='dot' style='background:#2ecc71'></span>网速 Mbps (RX+TX)</span>
+  <div class='detail-grid'>
+    <div class='panel'>
+      <h4>负载详情</h4>
+      <div class='legend'>
+        <span class='legend-item'><span class='dot' style='background:#4a90e2'></span>CPU%</span>
+        <span class='legend-item'><span class='dot' style='background:#9b59b6'></span>连接数</span>
+        <span class='legend-item'><span class='dot' style='background:#f39c12'></span>总网速 Mbps</span>
+      </div>
+      <svg id='chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg>
+    </div>
+    <div class='panel'>
+      <h4>带宽监控</h4>
+      <div class='legend'>
+        <span class='legend-item'><span class='dot' style='background:#2ecc71'></span>下行 RX Mbps</span>
+        <span class='legend-item'><span class='dot' style='background:#4a90e2'></span>上行 TX Mbps</span>
+      </div>
+      <svg id='bandwidth' viewBox='0 0 900 220' preserveAspectRatio='none'></svg>
+    </div>
   </div>
-  <svg id='chart' viewBox='0 0 900 200' preserveAspectRatio='none'></svg>
+  <div class='panel' style='margin-top:12px'>
+    <h4>流量统计（累计字节）</h4>
+    <svg id='traffic' viewBox='0 0 1200 280' preserveAspectRatio='none'></svg>
+  </div>
   <p><button class='btn' onclick='closeDetail()'>关闭</button></p>
 </div></div>
 <script>
@@ -305,15 +333,15 @@ async function load(){
     rows.forEach((x,idx)=>{
       const tr=document.createElement('tr');
       const cls=(x.alerts.disk||x.alerts.stale||x.alerts.network)?'bad':'';
-      const diskText = `${x.disk_root_device||'/'}: ${fmtBytes(x.disk_root_avail_bytes)} /data: ${fmtBytes(x.disk_data_avail_bytes)}`;
+      const hostDiskText = `/data: ${fmtBytes(x.disk_data_total_bytes)} / ${fmtBytes(x.disk_data_avail_bytes)}`;
+      const containerDiskText = `/: ${fmtBytes(x.container_fs_root_total_bytes)} / ${fmtBytes(x.container_fs_root_avail_bytes)}<br>/data: ${fmtBytes(x.container_fs_data_total_bytes)} / ${fmtBytes(x.container_fs_data_avail_bytes)}`;
       let html='';
       if(idx===0){
         html += `<td rowspan='${rows.length}'>${host}</td>`;
       }
-      const containerDiskText = `${fmtBytes(x.container_disk_rw_bytes)} / ${fmtBytes(x.container_disk_rootfs_bytes)}`;
-      html += `<td>${x.container_name}</td><td class='${cls}'>${Number(x.cpu_percent||0).toFixed(2)}</td><td>${x.conn_count}</td><td>${bpsToMbps(x.net_rx_bps).toFixed(2)}</td><td>${bpsToMbps(x.net_tx_bps).toFixed(2)}</td><td>${containerDiskText}</td>`;
+      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}</td><td class='${cls}'>${Number(x.cpu_percent||0).toFixed(2)}</td><td>${x.conn_count}</td><td>${bpsToMbps(x.net_rx_bps).toFixed(2)}</td><td>${bpsToMbps(x.net_tx_bps).toFixed(2)}</td><td>${containerDiskText}</td>`;
       if(idx===0){
-        html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${diskText}</td>`;
+        html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${hostDiskText}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v4?'ok':'bad'}'>${x.podman_network_ok_v4?'✅️':'❌️'}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v6?'ok':'bad'}'>${x.podman_network_ok_v6?'✅️':'❌️'}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.alerts.stale?'bad':''}'>${x.timestamp_iso_utc8}</td>`;
@@ -325,6 +353,18 @@ async function load(){
   }
 }
 function closeDetail(){ document.getElementById('modal').style.display='none'; }
+function buildPolyline(vals,maxv,w,h,pad){
+  const useMax=Math.max(1,maxv);
+  return vals.map((v,i)=>`${i*(w/Math.max(1,vals.length-1))},${(h-pad)-((v/useMax)*(h-pad*2))}`).join(' ');
+}
+function drawAxes(svg,w,h){
+  const lines=[];
+  for(let i=0;i<=5;i++){
+    const y=(h-20)-(i*((h-40)/5));
+    lines.push(`<line x1='0' y1='${y}' x2='${w}' y2='${y}' stroke='#29466f' stroke-width='1' />`);
+  }
+  svg.innerHTML=lines.join('');
+}
 async function openDetail(host, container){
   const res=await fetch(`/api/v1/history?host_id=${encodeURIComponent(host)}&container_name=${encodeURIComponent(container)}`);
   const data=await res.json();
@@ -332,23 +372,48 @@ async function openDetail(host, container){
   const pts=data.items||[];
   const recent=pts.slice(-80);
   const svg=document.getElementById('chart');
+  const bandwidthSvg=document.getElementById('bandwidth');
+  const trafficSvg=document.getElementById('traffic');
   if(!recent.length){
     svg.innerHTML = '';
+    bandwidthSvg.innerHTML = '';
+    trafficSvg.innerHTML = '';
     document.getElementById('modal').style.display='flex';
     return;
   }
   const cpuVals=recent.map(x=>Number(x.cpu_percent||0));
   const connVals=recent.map(x=>Number(x.conn_count||0));
-  const speedVals=recent.map(x=>bpsToMbps(Number(x.net_rx_bps||0)+Number(x.net_tx_bps||0)));
+  const rxMbpsVals=recent.map(x=>bpsToMbps(Number(x.net_rx_bps||0)));
+  const txMbpsVals=recent.map(x=>bpsToMbps(Number(x.net_tx_bps||0)));
+  const speedVals=rxMbpsVals.map((v,i)=>v+txMbpsVals[i]);
+  let rxTotal=0; let txTotal=0;
+  const rxBytesCum=recent.map(x=>{rxTotal+=Number(x.net_rx_bps||0)*300; return rxTotal;});
+  const txBytesCum=recent.map(x=>{txTotal+=Number(x.net_tx_bps||0)*300; return txTotal;});
 
-  const buildPoints=(vals,maxv)=>vals.map((v,i)=>`${i*(900/Math.max(1,vals.length-1))},${190-(v/Math.max(1,maxv))*160}`).join(' ');
-  const cpuPoints=buildPoints(cpuVals, Math.max(100, ...cpuVals));
-  const connPoints=buildPoints(connVals, Math.max(1, ...connVals));
-  const speedPoints=buildPoints(speedVals, Math.max(1, ...speedVals));
-  svg.innerHTML=`
+  drawAxes(svg,900,220);
+  const cpuPoints=buildPolyline(cpuVals, Math.max(100, ...cpuVals), 900, 220, 20);
+  const connPoints=buildPolyline(connVals, Math.max(1, ...connVals), 900, 220, 20);
+  const speedPoints=buildPolyline(speedVals, Math.max(1, ...speedVals), 900, 220, 20);
+  svg.innerHTML += `
     <polyline fill='none' stroke='#4a90e2' stroke-width='2.5' points='${cpuPoints}' />
-    <polyline fill='none' stroke='#7f8c8d' stroke-width='2.5' points='${connPoints}' />
-    <polyline fill='none' stroke='#2ecc71' stroke-width='2.5' points='${speedPoints}' />
+    <polyline fill='none' stroke='#9b59b6' stroke-width='2.5' points='${connPoints}' />
+    <polyline fill='none' stroke='#f39c12' stroke-width='2.5' points='${speedPoints}' />
+  `;
+
+  drawAxes(bandwidthSvg,900,220);
+  const rxPoints=buildPolyline(rxMbpsVals, Math.max(1, ...rxMbpsVals, ...txMbpsVals), 900, 220, 20);
+  const txPoints=buildPolyline(txMbpsVals, Math.max(1, ...rxMbpsVals, ...txMbpsVals), 900, 220, 20);
+  bandwidthSvg.innerHTML += `
+    <polyline fill='none' stroke='#2ecc71' stroke-width='2.5' points='${rxPoints}' />
+    <polyline fill='none' stroke='#4a90e2' stroke-width='2.5' points='${txPoints}' />
+  `;
+
+  drawAxes(trafficSvg,1200,280);
+  const rxCumPoints=buildPolyline(rxBytesCum, Math.max(1, ...rxBytesCum, ...txBytesCum), 1200, 280, 20);
+  const txCumPoints=buildPolyline(txBytesCum, Math.max(1, ...rxBytesCum, ...txBytesCum), 1200, 280, 20);
+  trafficSvg.innerHTML += `
+    <polyline fill='none' stroke='#2ecc71' stroke-width='2.5' points='${rxCumPoints}' />
+    <polyline fill='none' stroke='#4a90e2' stroke-width='2.5' points='${txCumPoints}' />
   `;
   document.getElementById('modal').style.display='flex';
 }

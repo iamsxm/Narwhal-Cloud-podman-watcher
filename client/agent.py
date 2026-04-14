@@ -621,29 +621,82 @@ def network_health() -> Tuple[bool, bool]:
     if not runtime:
         return False, False
 
-    network_probe_prefix = "echo ok"
-    if runtime != "docker":
-        network_probe_prefix = f"{runtime} network inspect fuckme >/dev/null 2>&1 && echo ok"
+    containers = podman_containers()
+    if not containers:
+        return False, False
 
-    v4 = bool(
-        run(
-            [
-                "sh",
-                "-lc",
-                f"{network_probe_prefix} >/dev/null && curl -4 -s --max-time 5 ip.sb >/dev/null && echo ok",
-            ]
-        ).strip()
-    )
-    v6 = bool(
-        run(
-            [
-                "sh",
-                "-lc",
-                f"{network_probe_prefix} >/dev/null && curl -6 -s --max-time 5 ip.sb >/dev/null && echo ok",
-            ]
-        ).strip()
-    )
-    return v4, v6
+    v4_ok = False
+    v6_ok = False
+    for item in containers:
+        name = item.get("name", "")
+        if not name:
+            continue
+        inspect = run([runtime, "inspect", name])
+        if not inspect:
+            continue
+        pid = 0
+        networks: List[str] = []
+        try:
+            detail = json.loads(inspect)[0]
+            pid = int(detail.get("State", {}).get("Pid", 0) or 0)
+            net_map = detail.get("NetworkSettings", {}).get("Networks", {}) or {}
+            if isinstance(net_map, dict):
+                networks = [str(n) for n in net_map.keys() if str(n).strip()]
+        except Exception:
+            pid = 0
+
+        if pid > 0:
+            if not v4_ok:
+                v4_ok = bool(
+                    run(
+                        [
+                            "sh",
+                            "-lc",
+                            f"nsenter -t {pid} -n sh -lc 'curl -4 -s --max-time 5 ip.sb >/dev/null && echo ok'",
+                        ]
+                    ).strip()
+                )
+            if not v6_ok:
+                v6_ok = bool(
+                    run(
+                        [
+                            "sh",
+                            "-lc",
+                            f"nsenter -t {pid} -n sh -lc 'curl -6 -s --max-time 5 ip.sb >/dev/null && echo ok'",
+                        ]
+                    ).strip()
+                )
+        else:
+            if not v4_ok:
+                v4_ok = bool(
+                    run(
+                        [
+                            runtime,
+                            "exec",
+                            name,
+                            "sh",
+                            "-lc",
+                            "curl -4 -s --max-time 5 ip.sb >/dev/null && echo ok",
+                        ]
+                    ).strip()
+                )
+            if not v6_ok:
+                v6_ok = bool(
+                    run(
+                        [
+                            runtime,
+                            "exec",
+                            name,
+                            "sh",
+                            "-lc",
+                            "curl -6 -s --max-time 5 ip.sb >/dev/null && echo ok",
+                        ]
+                    ).strip()
+                )
+
+        if v4_ok and v6_ok:
+            break
+    return v4_ok, v6_ok
 
 
 def sign(body: bytes, secret: str, ts: int) -> str:

@@ -13,6 +13,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 DB_PATH = os.getenv("DB_PATH", "/data/monitor.db")
 SHARED_SECRET = os.getenv("SHARED_SECRET", "change-me")
 ALERT_DISK_THRESHOLD_PERCENT = int(os.getenv("ALERT_DISK_THRESHOLD_PERCENT", "80"))
+ALERT_CPU_THRESHOLD_PERCENT = float(os.getenv("ALERT_CPU_THRESHOLD_PERCENT", "80"))
+ALERT_CONN_THRESHOLD = int(os.getenv("ALERT_CONN_THRESHOLD", "500"))
 STALE_SECONDS = int(os.getenv("STALE_SECONDS", "900"))
 OFFLINE_HIDE_SECONDS = int(os.getenv("OFFLINE_HIDE_SECONDS", str(24 * 3600)))
 PURGE_SECONDS = int(os.getenv("PURGE_SECONDS", str(30 * 24 * 3600)))
@@ -186,6 +188,8 @@ def latest(include_stale: bool = False) -> JSONResponse:
         disk = payload.get("disk", {})
         host_disk = host_disk_map.get(r["host_id"], {})
         alert_disk = (r["disk_used_percent"] or 0) >= ALERT_DISK_THRESHOLD_PERCENT
+        alert_cpu = float(r["cpu_percent"] or 0) >= ALERT_CPU_THRESHOLD_PERCENT
+        alert_conn = int(r["conn_count"] or 0) >= ALERT_CONN_THRESHOLD
         stale_seconds = max(0, now - r["ts"])
         stale = stale_seconds > STALE_SECONDS
         hidden_offline = stale_seconds > OFFLINE_HIDE_SECONDS
@@ -228,6 +232,8 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "offline_hours": offline_hours,
             "alerts": {
                 "disk": alert_disk,
+                "cpu": alert_cpu,
+                "conn": alert_conn,
                 "stale": stale,
                 "hidden_offline": hidden_offline,
                 "network": (not r["podman_network_ok_v4"]) or (not r["podman_network_ok_v6"]),
@@ -417,7 +423,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 </style>
 </head><body>
 <h2>Podman Monitor Dashboard</h2>
-<p>每 15 秒自动刷新。CPU/连接数/网速展示采集到的原始上报值，服务端不再做 5 分钟平均。红色表示预警。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。<a href='/stats' style='color:#8cc7ff'>查看统计页</a></p>
+<p>每 15 秒自动刷新。CPU/连接数/网速展示采集到的原始上报值，服务端不再做 5 分钟平均。红色表示预警（CPU ≥ {ALERT_CPU_THRESHOLD_PERCENT:.2f}% 或连接数 ≥ {ALERT_CONN_THRESHOLD}）。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。<a href='/stats' style='color:#8cc7ff'>查看统计页</a></p>
 <table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>总容量/可用</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
@@ -478,7 +484,8 @@ async function load(){
     rows.sort((a,b)=>a.container_name.localeCompare(b.container_name));
     rows.forEach((x,idx)=>{
       const tr=document.createElement('tr');
-      const cls=(x.alerts.disk||x.alerts.stale||x.alerts.network)?'bad':'';
+      const cpuCls=x.alerts.cpu?'bad':'';
+      const connCls=x.alerts.conn?'bad':'';
       const hostDiskText = `/data: ${fmtBytes(x.disk_data_total_bytes)} / ${fmtBytes(x.disk_data_avail_bytes)}`;
       const containerDiskText = `${fmtBytes(x.container_fs_root_total_bytes)} / ${fmtBytes(x.container_fs_root_avail_bytes)}`;
       let html='';
@@ -486,7 +493,7 @@ async function load(){
         html += `<td rowspan='${rows.length}'>${host}</td>`;
       }
       const offlineTag = x.alerts.stale ? ` <span class='bad'>(离线 ${x.offline_hours} 小时)</span>` : '';
-      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cls}'>${formatSmallNumber(x.cpu_percent, 2)}</td><td>${x.conn_count}</td><td>${formatSmallNumber(bpsToMbps(x.net_rx_bps), 2)}</td><td>${formatSmallNumber(bpsToMbps(x.net_tx_bps), 2)}</td><td>${containerDiskText}</td>`;
+      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cpuCls}'>${formatSmallNumber(x.cpu_percent, 2)}</td><td class='${connCls}'>${x.conn_count}</td><td>${formatSmallNumber(bpsToMbps(x.net_rx_bps), 2)}</td><td>${formatSmallNumber(bpsToMbps(x.net_tx_bps), 2)}</td><td>${containerDiskText}</td>`;
       if(idx===0){
         html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${hostDiskText}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v4?'ok':'bad'}'>${x.podman_network_ok_v4?'✅️':'❌️'}</td>`;

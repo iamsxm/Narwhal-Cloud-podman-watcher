@@ -249,16 +249,16 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
     net_tx_total_bytes = 0
 
     parts = (stats_text or "").strip().split("|")
-    if len(parts) >= 4:
+    if len(parts) >= 3:
         cpu_percent = _normalize_stat_number(parts[0])
         mem_bytes = parse_size(parts[1].split("/")[0].strip())
         net = parts[2].split("/")
         if len(net) == 2:
             net_rx_total_bytes = parse_size(net[0].strip())
             net_tx_total_bytes = parse_size(net[1].strip())
-        if net_rx_total_bytes <= 0:
+        if len(parts) >= 4 and net_rx_total_bytes <= 0:
             net_rx_total_bytes = parse_size(parts[2].strip())
-        if net_tx_total_bytes <= 0:
+        if len(parts) >= 5 and net_tx_total_bytes <= 0:
             net_tx_total_bytes = parse_size(parts[3].strip())
 
     return {

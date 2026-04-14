@@ -90,6 +90,14 @@ def run(cmd: List[str]) -> str:
     return p.stdout
 
 
+def run_first_success(commands: List[List[str]]) -> str:
+    for cmd in commands:
+        out = run(cmd)
+        if out.strip():
+            return out
+    return ""
+
+
 def parse_size(s: str) -> int:
     m = re.match(r"([0-9.]+)([kKmMgGtTpP]?[bB]?)?", s.strip())
     if not m:
@@ -293,14 +301,23 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
 
 def _parse_stats_compact(stats_text: str) -> Dict[str, float | int]:
     parts = (stats_text or "").strip().split("|")
-    if len(parts) < 4:
+    if len(parts) < 3:
         return {"cpu_percent": 0.0, "mem_bytes": 0, "mem_percent": 0.0, "net_rx_total_bytes": 0, "net_tx_total_bytes": 0}
+    net_rx_total_bytes = 0
+    net_tx_total_bytes = 0
+    net = parts[2].split("/")
+    if len(net) == 2:
+        net_rx_total_bytes = parse_size(net[0].strip())
+        net_tx_total_bytes = parse_size(net[1].strip())
+    elif len(parts) >= 4:
+        net_rx_total_bytes = parse_size(parts[2])
+        net_tx_total_bytes = parse_size(parts[3])
     return {
         "cpu_percent": _normalize_stat_number(parts[0]),
         "mem_bytes": parse_size(parts[1]),
         "mem_percent": 0.0,
-        "net_rx_total_bytes": parse_size(parts[2]),
-        "net_tx_total_bytes": parse_size(parts[3]),
+        "net_rx_total_bytes": net_rx_total_bytes,
+        "net_tx_total_bytes": net_tx_total_bytes,
     }
 
 
@@ -353,10 +370,21 @@ def _decode_proc_addr(hex_ip: str, is_v6: bool = False) -> str:
 
 
 def _collect_tcp_remote_ips(pid: int) -> Dict[str, int]:
+    return _collect_remote_ips_by_proto(pid, "tcp")
+
+
+def _collect_udp_remote_ips(pid: int) -> Dict[str, int]:
+    return _collect_remote_ips_by_proto(pid, "udp")
+
+
+def _collect_remote_ips_by_proto(pid: int, proto: str) -> Dict[str, int]:
     if pid <= 0:
         return {}
     ip_counter: Dict[str, int] = {}
-    files = (("tcp", False), ("tcp6", True))
+    if proto == "udp":
+        files = (("udp", False), ("udp6", True))
+    else:
+        files = (("tcp", False), ("tcp6", True))
     for name, is_v6 in files:
         path = f"/proc/{pid}/net/{name}"
         try:
@@ -370,13 +398,16 @@ def _collect_tcp_remote_ips(pid: int) -> Dict[str, int]:
                 continue
             rem = parts[2]
             state = parts[3].upper()
-            if state != "01":  # ESTABLISHED
+            # TCP 仅统计 ESTABLISHED；UDP 无连接状态语义，统计所有有效远端。
+            if proto == "tcp" and state != "01":
                 continue
             if ":" not in rem:
                 continue
             rem_ip_hex = rem.split(":", 1)[0]
             ip = _decode_proc_addr(rem_ip_hex, is_v6=is_v6)
             if not ip:
+                continue
+            if ip in ("0.0.0.0", "::"):
                 continue
             try:
                 ip_obj = ipaddress.ip_address(ip)
@@ -417,6 +448,35 @@ def _geoip_country_batch(ip_counts: Dict[str, int]) -> List[Dict[str, int | str]
         country_counter[country]["connections"] = int(country_counter[country]["connections"]) + int(cnt)
         country_counter[country]["ip_count"] = int(country_counter[country]["ip_count"]) + 1
     return sorted(country_counter.values(), key=lambda x: int(x["connections"]), reverse=True)
+
+
+def _read_mem_usage_from_pid(pid: int) -> Tuple[int, float]:
+    if pid <= 0:
+        return 0, 0.0
+    base = f"/proc/{pid}/root/sys/fs/cgroup"
+    candidates = (
+        (f"{base}/memory.current", f"{base}/memory.max"),  # cgroup v2
+        (f"{base}/memory/memory.usage_in_bytes", f"{base}/memory/memory.limit_in_bytes"),  # cgroup v1
+    )
+    for usage_path, limit_path in candidates:
+        try:
+            with open(usage_path, "r", encoding="utf-8", errors="ignore") as f:
+                usage_raw = f.read().strip()
+            with open(limit_path, "r", encoding="utf-8", errors="ignore") as f:
+                limit_raw = f.read().strip()
+        except Exception:
+            continue
+        if not usage_raw.isdigit():
+            continue
+        usage = int(usage_raw)
+        if usage <= 0:
+            continue
+        if limit_raw.isdigit():
+            limit = int(limit_raw)
+            if limit > 0 and limit < (1 << 60):
+                return usage, (float(usage) / float(limit)) * 100.0
+        return usage, 0.0
+    return 0, 0.0
 
 
 def _read_net_bytes_from_pid(pid: int) -> Tuple[int, int]:
@@ -586,6 +646,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
             "net_tx_bps": 0.0,
             "conn_count": 0,
             "tcp_country_stats": [],
+            "udp_country_stats": [],
             "disk": collect_disk_alert(),
             "container_disk": {"rw_bytes": 0, "rootfs_bytes": 0},
         }
@@ -600,9 +661,19 @@ def collect_container(name: str, container_id: str = "") -> Dict:
 
     stats_json = run([runtime, "stats", "--no-stream", "--format", "json", name])
     parsed_stats = _parse_stats_json(stats_json)
-    stats_tpl = run([runtime, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}", name])
+    stats_tpl = run_first_success(
+        [
+            [runtime, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}", name],
+            [runtime, "stats", "--no-stream", "--format", "{{.CPU}}|{{.MemUsage}}|{{.NetIO}}", name],
+        ]
+    )
     parsed_tpl = _parse_stats_template(stats_tpl)
-    stats_compact = run([runtime, "stats", "--no-stream", "--format", "{{.CPU}}|{{.MemUsageBytes}}|{{.NetInput}}|{{.NetOutput}}", name])
+    stats_compact = run_first_success(
+        [
+            [runtime, "stats", "--no-stream", "--format", "{{.CPU}}|{{.MemUsageBytes}}|{{.NetIO}}", name],
+            [runtime, "stats", "--no-stream", "--format", "{{.CPU}}|{{.MemUsage}}|{{.NetIO}}", name],
+        ]
+    )
     parsed_compact = _parse_stats_compact(stats_compact)
 
     cpu_candidates = [parsed_stats["cpu_percent"], parsed_tpl["cpu_percent"], parsed_compact["cpu_percent"]]
@@ -664,6 +735,14 @@ def collect_container(name: str, container_id: str = "") -> Dict:
     if conn_count <= 0:
         conn_count = _count_connections_from_exec(runtime, name)
     tcp_country_stats = _geoip_country_batch(_collect_tcp_remote_ips(pid))
+    udp_country_stats = _geoip_country_batch(_collect_udp_remote_ips(pid))
+
+    if (mem <= 0 or mem_percent <= 0) and pid > 0:
+        pid_mem_bytes, pid_mem_percent = _read_mem_usage_from_pid(pid)
+        if mem <= 0 and pid_mem_bytes > 0:
+            mem = pid_mem_bytes
+        if mem_percent <= 0 and pid_mem_percent > 0:
+            mem_percent = pid_mem_percent
 
     disk = collect_disk_alert()
     container_disk = collect_container_disk_usage(name)
@@ -680,6 +759,7 @@ def collect_container(name: str, container_id: str = "") -> Dict:
         "net_tx_bps": net_tx,
         "conn_count": conn_count,
         "tcp_country_stats": tcp_country_stats,
+        "udp_country_stats": udp_country_stats,
         "disk": disk,
         "container_disk": container_disk,
         "top_cpu_process": top_cpu_process,

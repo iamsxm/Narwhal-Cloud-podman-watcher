@@ -10,8 +10,14 @@ CONTAINER_NAME="narwhal-monitor-server"
 TLS_CONTAINER_NAME="narwhal-monitor-caddy"
 
 MODE="${1:-install}"
+RESET_DATA_ARG="${2:-}"
 if [[ "$MODE" != "install" && "$MODE" != "update" ]]; then
-  echo "[ERROR] 用法: bash scripts/install-server.sh [install|update]"
+  echo "[ERROR] 用法: bash scripts/install-server.sh [install|update] [--reset-data]"
+  exit 1
+fi
+if [[ -n "$RESET_DATA_ARG" && "$RESET_DATA_ARG" != "--reset-data" ]]; then
+  echo "[ERROR] 未知参数: $RESET_DATA_ARG"
+  echo "[ERROR] 用法: bash scripts/install-server.sh [install|update] [--reset-data]"
   exit 1
 fi
 
@@ -96,6 +102,19 @@ load_non_empty_or_default() {
   else
     echo "$fallback"
   fi
+}
+
+is_truthy() {
+  local value="${1:-}"
+  value="$(echo "$value" | tr '[:upper:]' '[:lower:]')"
+  [[ "$value" == "1" || "$value" == "true" || "$value" == "yes" || "$value" == "y" ]]
+}
+
+wipe_server_data() {
+  if [[ -d "$SERVER_DATA_DIR" ]]; then
+    rm -rf "${SERVER_DATA_DIR:?}/"* "${SERVER_DATA_DIR:?}"/.[!.]* "${SERVER_DATA_DIR:?}"/..?* 2>/dev/null || true
+  fi
+  mkdir -p "$SERVER_DATA_DIR"
 }
 
 ensure_root_and_deps() {
@@ -261,6 +280,10 @@ EOF_HTTPS_GUIDE
 
 main() {
   ensure_root_and_deps
+  local reset_data="no"
+  if [[ "$RESET_DATA_ARG" == "--reset-data" ]] || is_truthy "${RESET_SERVER_DATA:-}"; then
+    reset_data="yes"
+  fi
 
   local default_image_source="github"
   local default_github_image="ghcr.io/$(detect_ghcr_owner)/podman-watcher-server:latest"
@@ -357,6 +380,11 @@ ENV
 
   podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
+  if [[ "$reset_data" == "yes" ]]; then
+    echo "[INFO] 检测到 reset-data，请求清空历史采集数据（初始化数据库）..."
+    wipe_server_data
+  fi
+
   local image_name="narwhal-monitor-server:latest"
   case "$image_source" in
     local)
@@ -405,6 +433,7 @@ Image Source: $image_source
 Env File: $SERVER_ENV_FILE
 Install Config: $SERVER_INSTALL_ENV_FILE
 Data Dir: $SERVER_DATA_DIR
+Data Reset: $reset_data
 Container Image: $image_name
 HTTPS Enabled: $tls_enable
 HTTPS Host: ${tls_host:-N/A}

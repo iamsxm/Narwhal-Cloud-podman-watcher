@@ -61,8 +61,8 @@ main() {
   install_deps
 
   local mode
-  read -rp "请选择安装模式 [server/client/both] (默认 server): " mode
-  mode=${mode:-server}
+  read -rp "请选择安装模式 [server/client/both] (默认 client): " mode
+  mode=${mode:-client}
 
   run_installer "$mode"
 

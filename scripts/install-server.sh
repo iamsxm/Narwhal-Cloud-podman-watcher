@@ -1,6 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+detect_ghcr_owner() {
+  local owner="narwhal-cloud"
+  if command -v git >/dev/null 2>&1; then
+    local remote_url
+    remote_url="$(git -C "$ROOT_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    if [[ -n "$remote_url" ]]; then
+      if [[ "$remote_url" =~ github\.com[:/]([^/]+)/[^/]+(\.git)?$ ]]; then
+        owner="${BASH_REMATCH[1]}"
+      fi
+    fi
+  fi
+  echo "$owner"
+}
+
+generate_secret() {
+  tr -d '-' </proc/sys/kernel/random/uuid | cut -c 1-25
+}
+
+pick_random_port() {
+  local fallback=49152
+  if ! command -v ss >/dev/null 2>&1; then
+    echo "$fallback"
+    return
+  fi
+
+  local candidate
+  for _ in $(seq 1 120); do
+    candidate="$(shuf -i 40000-65000 -n 1)"
+    if ! ss -ltnH "( sport = :${candidate} )" | grep -q .; then
+      echo "$candidate"
+      return
+    fi
+  done
+
+  echo "$fallback"
+}
+
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "Please run as root: sudo bash scripts/install-server.sh"
   exit 1
@@ -12,19 +51,22 @@ if ! command -v podman >/dev/null 2>&1; then
   apt-get install -y podman
 fi
 
-read -rp "Image source [local/github] (default local): " IMAGE_SOURCE
-IMAGE_SOURCE=${IMAGE_SOURCE:-local}
+read -rp "Image source [local/github] (default github): " IMAGE_SOURCE
+IMAGE_SOURCE=${IMAGE_SOURCE:-github}
 IMAGE_SOURCE=$(echo "$IMAGE_SOURCE" | tr '[:upper:]' '[:lower:]')
 
-read -rp "GitHub image (for github source) [ghcr.io/narwhal-cloud/podman-watcher-server:latest]: " GITHUB_IMAGE
-GITHUB_IMAGE=${GITHUB_IMAGE:-ghcr.io/narwhal-cloud/podman-watcher-server:latest}
+DEFAULT_GITHUB_IMAGE="ghcr.io/$(detect_ghcr_owner)/podman-watcher-server:latest"
+read -rp "GitHub image (for github source) [${DEFAULT_GITHUB_IMAGE}]: " GITHUB_IMAGE
+GITHUB_IMAGE=${GITHUB_IMAGE:-$DEFAULT_GITHUB_IMAGE}
 
-read -rp "Server listen port [8080]: " PORT
-PORT=${PORT:-8080}
-read -rp "Shared secret (for client auth): " SECRET
-if [[ -z "$SECRET" ]]; then
-  echo "Shared secret cannot be empty"; exit 1
-fi
+DEFAULT_PORT="$(pick_random_port)"
+read -rp "Server listen port [${DEFAULT_PORT}]: " PORT
+PORT=${PORT:-$DEFAULT_PORT}
+
+DEFAULT_SECRET="$(generate_secret)"
+read -rp "Shared secret (for client auth) [${DEFAULT_SECRET}]: " SECRET
+SECRET=${SECRET:-$DEFAULT_SECRET}
+
 read -rp "Disk alert threshold percent [80]: " TH
 TH=${TH:-80}
 
@@ -43,8 +85,13 @@ case "$IMAGE_SOURCE" in
     podman build -t "$IMAGE_NAME" -f server/Dockerfile server
     ;;
   github)
-    podman pull "$GITHUB_IMAGE"
-    IMAGE_NAME="$GITHUB_IMAGE"
+    echo "Trying to pull $GITHUB_IMAGE..."
+    if podman pull "$GITHUB_IMAGE"; then
+      IMAGE_NAME="$GITHUB_IMAGE"
+    else
+      echo "[WARN] Pull github image failed. Falling back to local build (this avoids GHCR 403/private image issues)."
+      podman build -t "$IMAGE_NAME" -f server/Dockerfile server
+    fi
     ;;
   *)
     echo "Unsupported image source: $IMAGE_SOURCE"

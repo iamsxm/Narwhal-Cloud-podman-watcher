@@ -192,11 +192,8 @@ uninstall_narwhal_related() {
     remove_container_if_exists "narwhal-monitor-caddy"
 
     UNINSTALL_IMAGES_TO_REMOVE=(
-      "narwhal-monitor-client:latest"
       "narwhal-monitor-server:latest"
-      "ghcr.io/narwhal-cloud/podman-watcher-client:latest"
       "ghcr.io/narwhal-cloud/podman-watcher-server:latest"
-      "ghcr.io/${owner}/podman-watcher-client:latest"
       "ghcr.io/${owner}/podman-watcher-server:latest"
       "docker.io/library/caddy:2"
       "ghcr.io/caddy-dns/cloudflare:latest"
@@ -211,7 +208,7 @@ uninstall_narwhal_related() {
     done
 
     # 清理同仓库下可能存在的非 latest 标签镜像（例如手动指定了版本标签）。
-    remove_images_by_repository_pattern '^ghcr\.io/(narwhal-cloud|'"$owner"')/podman-watcher-(client|server)$'
+    remove_images_by_repository_pattern '^ghcr\.io/(narwhal-cloud|'"$owner"')/podman-watcher-server$'
     remove_images_by_repository_pattern '^ghcr\.io/caddy-dns/cloudflare$'
   else
     echo "[WARN] 未检测到 podman，跳过容器/镜像删除，仅清理本项目配置目录。"

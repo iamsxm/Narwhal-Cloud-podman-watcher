@@ -215,6 +215,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "net_tx_bps": r["net_tx_bps"],
             "conn_count": int(r["conn_count"]),
             "tcp_country_stats": payload.get("tcp_country_stats", []),
+            "udp_country_stats": payload.get("udp_country_stats", []),
             "disk_file": r["disk_file"],
             "disk_used_percent": r["disk_used_percent"],
             "disk_root_device": host_disk.get("root_device") or disk.get("root_device", ""),
@@ -437,7 +438,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 </head><body>
 <h2>Podman Monitor Dashboard</h2>
 <p>每 15 秒自动刷新。CPU/内存使用率/连接数/网速展示采集到的原始上报值，服务端不再做 5 分钟平均。红色表示预警（CPU ≥ {ALERT_CPU_THRESHOLD_PERCENT:.2f}% 或连接数 ≥ {ALERT_CONN_THRESHOLD}）。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。<a href='/stats' style='color:#8cc7ff'>查看统计页</a></p>
-<table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>内存%</th><th>连接数</th><th>TCP国家Top3</th><th>RX Mbps</th><th>TX Mbps</th><th>总容量/可用</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
+<table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>内存%</th><th>连接数</th><th>国家Top3(TCP/UDP)</th><th>RX Mbps</th><th>TX Mbps</th><th>总容量/可用</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
   <div class='detail-grid'>
@@ -483,10 +484,14 @@ function formatSmallNumber(v, digits=2){
   if (n > 0 && n < threshold) return `<${threshold.toFixed(digits)}`;
   return n.toFixed(digits);
 }
-function formatCountryStats(stats){
+function formatCountryLine(protocol, stats){
   const arr = Array.isArray(stats) ? stats : [];
-  if(!arr.length) return '-';
-  return arr.slice(0,3).map(x=>`${x.country||'未知'}:${Number(x.connections||0)}`).join('<br/>');
+  if(!arr.length) return `${protocol} - -`;
+  const top3 = arr.slice(0,3).map(x=>`${x.country||'UN'} (${Number(x.connections||0)})`).join('  ');
+  return `${protocol} - ${top3}`;
+}
+function formatCountryStats(tcpStats, udpStats){
+  return `${formatCountryLine('TCP', tcpStats)}<br/>${formatCountryLine('UDP', udpStats)}`;
 }
 function groupByHost(items){
   const m=new Map();
@@ -512,7 +517,7 @@ async function load(){
         html += `<td rowspan='${rows.length}'>${host}</td>`;
       }
       const offlineTag = x.alerts.stale ? ` <span class='bad'>(离线 ${x.offline_hours} 小时)</span>` : '';
-      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cpuCls}'>${formatSmallNumber(x.cpu_percent, 2)}</td><td>${formatSmallNumber(x.mem_percent, 2)}</td><td class='${connCls}'>${x.conn_count}</td><td>${formatCountryStats(x.tcp_country_stats)}</td><td>${formatSmallNumber(bpsToMbps(x.net_rx_bps), 2)}</td><td>${formatSmallNumber(bpsToMbps(x.net_tx_bps), 2)}</td><td>${containerDiskText}</td>`;
+      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cpuCls}'>${formatSmallNumber(x.cpu_percent, 2)}</td><td>${formatSmallNumber(x.mem_percent, 2)}</td><td class='${connCls}'>${x.conn_count}</td><td>${formatCountryStats(x.tcp_country_stats, x.udp_country_stats)}</td><td>${formatSmallNumber(bpsToMbps(x.net_rx_bps), 2)}</td><td>${formatSmallNumber(bpsToMbps(x.net_tx_bps), 2)}</td><td>${containerDiskText}</td>`;
       if(idx===0){
         html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${hostDiskText}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v4?'ok':'bad'}'>${x.podman_network_ok_v4?'✅️':'❌️'}</td>`;
@@ -550,7 +555,7 @@ async function openDetail(host, container){
   const latestRes=await fetch('/api/v1/latest');
   const latestData=await latestRes.json();
   const target=(latestData.items||[]).find(x=>x.host_id===host&&x.container_name===container);
-  const countryTop=formatCountryStats(target?.tcp_country_stats||[]);
+  const countryTop=formatCountryStats(target?.tcp_country_stats||[], target?.udp_country_stats||[]);
   const res=await fetch(`/api/v1/history?host_id=${encodeURIComponent(host)}&container_name=${encodeURIComponent(container)}`);
   const data=await res.json();
   document.getElementById('detail-title').innerText=`${host} / ${container} 历史数据（TCP国家：${countryTop.replaceAll('<br/>', ', ')}）`;

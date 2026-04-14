@@ -343,6 +343,13 @@ function fmtBytes(n){
 function bpsToMbps(v){
   return (Number(v||0) * 8) / 1000 / 1000;
 }
+function formatSmallNumber(v, digits=2){
+  const n = Number(v||0);
+  if (!Number.isFinite(n)) return '0.00';
+  const threshold = 1 / Math.pow(10, digits);
+  if (n > 0 && n < threshold) return `<${threshold.toFixed(digits)}`;
+  return n.toFixed(digits);
+}
 function groupByHost(items){
   const m=new Map();
   for(const x of items){
@@ -366,7 +373,7 @@ async function load(){
         html += `<td rowspan='${rows.length}'>${host}</td>`;
       }
       const offlineTag = x.alerts.stale ? ` <span class='bad'>(离线 ${x.offline_hours} 小时)</span>` : '';
-      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cls}'>${Number(x.cpu_percent||0).toFixed(2)}</td><td>${x.conn_count}</td><td>${bpsToMbps(x.net_rx_bps).toFixed(2)}</td><td>${bpsToMbps(x.net_tx_bps).toFixed(2)}</td><td>${containerDiskText}</td>`;
+      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cls}'>${formatSmallNumber(x.cpu_percent, 2)}</td><td>${x.conn_count}</td><td>${formatSmallNumber(bpsToMbps(x.net_rx_bps), 2)}</td><td>${formatSmallNumber(bpsToMbps(x.net_tx_bps), 2)}</td><td>${containerDiskText}</td>`;
       if(idx===0){
         html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${hostDiskText}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v4?'ok':'bad'}'>${x.podman_network_ok_v4?'✅️':'❌️'}</td>`;

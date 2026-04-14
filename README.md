@@ -12,7 +12,8 @@
 - **一键更新**：`install.sh` 支持 `update` 操作，会先 `git pull --ff-only` 更新仓库（包含 `sh` 脚本本身），再自动重建/重启服务。
 - **自动复用历史配置**：更新模式会自动读取已有 `/opt/narwhal-monitor/*.env` 配置，不再要求重复输入。
 - **Server HTTPS 自动化**：支持自动拉起 Caddy 反向代理：
-  - 域名场景：自动申请公网证书（ACME）。
+  - 域名场景：自动申请公网证书（ACME HTTP-01）。
+  - Cloudflare 域名场景：支持 DNS Challenge（可橙云），自动签发并续期公网证书。
   - IP 场景：自动签发内部证书（`tls internal`）。
 
 > 注意：IP 场景下的内部证书不是公网 CA 证书，浏览器默认可能提示不受信任；如需“绿锁”建议使用域名。
@@ -58,6 +59,8 @@ sudo bash /tmp/narwhal-bootstrap-install.sh
 - 是否启用 HTTPS 反代（Caddy）
 - TLS Host（域名或 IP）
 - TLS Email（域名证书可选）
+- TLS 证书模式（`auto` / `internal` / `cloudflare_dns`）
+- Cloudflare API Token（当选择 `cloudflare_dns` 时必填，需具备 Zone DNS Edit 权限）
 
 ### Client
 
@@ -75,6 +78,41 @@ sudo bash /tmp/narwhal-bootstrap-install.sh
   - Server: `/opt/narwhal-monitor/server.env` + `/opt/narwhal-monitor/server-install.env`
   - Client: `/opt/narwhal-monitor/client.env` + `/opt/narwhal-monitor/client-install.env`
 - 自动重建/重启容器，无需重新输入历史参数。
+
+## HTTPS 配置指引（两种公网证书方式）
+
+> 两种方式都会由 Caddy 自动续期证书，无需手工续期。
+
+### 方式 A：域名直连（ACME HTTP-01，最简单）
+
+适用：你使用 Cloudflare 托管 DNS，但可将该记录设置为 **DNS only（灰云）**。
+
+1. 在 Cloudflare DNS 中为你的主机新增 `A/AAAA` 记录（例如 `monitor.example.com`）指向服务器公网 IP。  
+2. 将该记录设置为 **DNS only（灰云）**，不要走 Cloudflare 代理。  
+3. 服务器放通 `80/443` 端口。  
+4. 运行安装脚本时填写：
+   - `Enable HTTPS reverse proxy`: `yes`
+   - `TLS host`: `monitor.example.com`
+   - `TLS cert mode`: `auto`（域名下会自动走公网 ACME）
+   - `TLS email`: 建议填写
+5. Client 端 `SERVER_URL` 使用 `https://monitor.example.com`。
+
+### 方式 B：Cloudflare DNS Challenge（可橙云）
+
+适用：你希望保留 Cloudflare 代理（橙云）或不便开放 80 端口。
+
+1. 在 Cloudflare 创建 API Token，权限至少包含：
+   - `Zone:DNS:Edit`
+   - `Zone:Zone:Read`
+2. 运行安装脚本时填写：
+   - `Enable HTTPS reverse proxy`: `yes`
+   - `TLS host`: `monitor.example.com`
+   - `TLS cert mode`: `cloudflare_dns`
+   - `Cloudflare API token`: 填入上一步 token
+3. 脚本会自动使用带 Cloudflare DNS 模块的 Caddy 镜像，并注入 token。  
+4. Client 端 `SERVER_URL` 使用 `https://monitor.example.com`。
+
+> 安全建议：Cloudflare Token 请仅授予单一 Zone 的最小权限，避免使用全局 API Key。
 
 ## 监控项
 

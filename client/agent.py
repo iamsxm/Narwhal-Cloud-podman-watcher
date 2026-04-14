@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -13,6 +14,24 @@ import requests
 
 
 _warned_missing_bins = set()
+_podman_bin = None
+
+
+def get_podman_bin() -> str:
+    global _podman_bin
+    if _podman_bin is not None:
+        return _podman_bin
+
+    for name in ("podman", "podman-remote"):
+        if shutil.which(name):
+            _podman_bin = name
+            return _podman_bin
+
+    _podman_bin = ""
+    if "podman" not in _warned_missing_bins:
+        _warned_missing_bins.add("podman")
+        print("missing command: podman (or podman-remote)")
+    return _podman_bin
 
 
 def run(cmd: List[str]) -> str:
@@ -47,12 +66,27 @@ def parse_size(s: str) -> int:
 
 
 def podman_containers() -> List[str]:
-    out = run(["podman", "ps", "--format", "{{.Names}}"])
+    podman = get_podman_bin()
+    if not podman:
+        return []
+    out = run([podman, "ps", "--format", "{{.Names}}"])
     return [x.strip() for x in out.splitlines() if x.strip()]
 
 
 def collect_container(name: str) -> Dict:
-    stats = run(["podman", "stats", "--no-stream", "--format", "json", name])
+    podman = get_podman_bin()
+    if not podman:
+        return {
+            "name": name,
+            "cpu_percent": 0.0,
+            "mem_bytes": 0,
+            "net_rx_bps": 0.0,
+            "net_tx_bps": 0.0,
+            "conn_count": 0,
+            "disk": collect_disk_alert(),
+        }
+
+    stats = run([podman, "stats", "--no-stream", "--format", "json", name])
     cpu_percent = 0.0
     mem = 0
     net_rx = 0.0
@@ -71,7 +105,7 @@ def collect_container(name: str) -> Dict:
         except Exception:
             pass
 
-    inspect = run(["podman", "inspect", name])
+    inspect = run([podman, "inspect", name])
     conn_count = 0
     if inspect:
         try:
@@ -113,8 +147,28 @@ def collect_disk_alert() -> Dict:
 
 
 def network_health() -> Tuple[bool, bool]:
-    v4 = bool(run(["sh", "-lc", "podman network inspect fuckme >/dev/null 2>&1 && curl -4 -s --max-time 5 ip.sb >/dev/null && echo ok"]).strip())
-    v6 = bool(run(["sh", "-lc", "podman network inspect fuckme >/dev/null 2>&1 && curl -6 -s --max-time 5 ip.sb >/dev/null && echo ok"]).strip())
+    podman = get_podman_bin()
+    if not podman:
+        return False, False
+
+    v4 = bool(
+        run(
+            [
+                "sh",
+                "-lc",
+                f"{podman} network inspect fuckme >/dev/null 2>&1 && curl -4 -s --max-time 5 ip.sb >/dev/null && echo ok",
+            ]
+        ).strip()
+    )
+    v6 = bool(
+        run(
+            [
+                "sh",
+                "-lc",
+                f"{podman} network inspect fuckme >/dev/null 2>&1 && curl -6 -s --max-time 5 ip.sb >/dev/null && echo ok",
+            ]
+        ).strip()
+    )
     return v4, v6
 
 

@@ -18,6 +18,11 @@ OFFLINE_HIDE_SECONDS = int(os.getenv("OFFLINE_HIDE_SECONDS", str(24 * 3600)))
 PURGE_SECONDS = int(os.getenv("PURGE_SECONDS", str(30 * 24 * 3600)))
 UTC8 = timezone(timedelta(hours=8))
 
+
+def format_utc8(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=UTC8).strftime("%Y-%m-%d %H:%M:%S")
+
+
 app = FastAPI(title="Narwhal Podman Monitor")
 
 
@@ -167,21 +172,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
         """
     ).fetchall()
 
-    avg_rows = conn.execute(
-        """
-        SELECT host_id, container_name,
-               AVG(cpu_percent) AS cpu_avg,
-               AVG(net_rx_bps) AS rx_avg,
-               AVG(net_tx_bps) AS tx_avg,
-               AVG(conn_count) AS conn_avg
-        FROM reports
-        WHERE ts >= ?
-        GROUP BY host_id, container_name
-        """,
-        (int(time.time()) - 300,),
-    ).fetchall()
     conn.close()
-    avg_map = {(x["host_id"], x["container_name"]): x for x in avg_rows}
 
     host_disk_map: Dict[str, Dict[str, Any]] = {}
     for h in host_rows:
@@ -194,7 +185,6 @@ def latest(include_stale: bool = False) -> JSONResponse:
         payload = json.loads(r["payload_json"]) if r["payload_json"] else {}
         disk = payload.get("disk", {})
         host_disk = host_disk_map.get(r["host_id"], {})
-        avg = avg_map.get((r["host_id"], r["container_name"]))
         alert_disk = (r["disk_used_percent"] or 0) >= ALERT_DISK_THRESHOLD_PERCENT
         stale_seconds = max(0, now - r["ts"])
         stale = stale_seconds > STALE_SECONDS
@@ -208,11 +198,11 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "host_id": r["host_id"],
             "container_id": payload.get("id", ""),
             "container_name": r["container_name"],
-            "cpu_percent": (avg["cpu_avg"] if avg else r["cpu_percent"]),
+            "cpu_percent": r["cpu_percent"],
             "mem_bytes": r["mem_bytes"],
-            "net_rx_bps": (avg["rx_avg"] if avg else r["net_rx_bps"]),
-            "net_tx_bps": (avg["tx_avg"] if avg else r["net_tx_bps"]),
-            "conn_count": int(avg["conn_avg"] if avg else r["conn_count"]),
+            "net_rx_bps": r["net_rx_bps"],
+            "net_tx_bps": r["net_tx_bps"],
+            "conn_count": int(r["conn_count"]),
             "disk_file": r["disk_file"],
             "disk_used_percent": r["disk_used_percent"],
             "disk_root_device": host_disk.get("root_device") or disk.get("root_device", ""),
@@ -233,7 +223,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "podman_network_ok_v6": bool(r["podman_network_ok_v6"]),
             "timestamp": r["ts"],
             "timestamp_iso": datetime.fromtimestamp(r["ts"], tz=timezone.utc).isoformat(),
-            "timestamp_iso_utc8": datetime.fromtimestamp(r["ts"], tz=UTC8).isoformat(),
+            "timestamp_iso_utc8": format_utc8(r["ts"]),
             "offline_seconds": stale_seconds,
             "offline_hours": offline_hours,
             "alerts": {
@@ -266,7 +256,7 @@ def history(host_id: str, container_name: str, minutes: int = 720) -> JSONRespon
             "items": [
                 {
                     "timestamp": r["ts"],
-                    "timestamp_iso_utc8": datetime.fromtimestamp(r["ts"], tz=UTC8).isoformat(),
+                    "timestamp_iso_utc8": format_utc8(r["ts"]),
                     "cpu_percent": r["cpu_percent"],
                     "net_rx_bps": r["net_rx_bps"],
                     "net_tx_bps": r["net_tx_bps"],
@@ -304,7 +294,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 </style>
 </head><body>
 <h2>Podman Monitor Dashboard</h2>
-<p>每 15 秒自动刷新。CPU/连接数/网速展示最近 5 分钟平均值。红色表示预警。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。</p>
+<p>每 15 秒自动刷新。CPU/连接数/网速展示采集到的原始上报值，服务端不再做 5 分钟平均。红色表示预警。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。</p>
 <table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>总容量/可用</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>

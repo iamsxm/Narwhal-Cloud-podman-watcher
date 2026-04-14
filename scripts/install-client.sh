@@ -87,6 +87,26 @@ if ! python3 -m venv -h >/dev/null 2>&1; then
   apt-get install -y python3-venv
 fi
 
+ensure_python_venv_ready() {
+  local tmp_venv
+  tmp_venv="$(mktemp -d /tmp/narwhal-venv-check-XXXXXX)"
+
+  if python3 -m venv "$tmp_venv" >/dev/null 2>&1; then
+    rm -rf "$tmp_venv"
+    return 0
+  fi
+
+  rm -rf "$tmp_venv"
+  local py_minor
+  py_minor="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+
+  echo "Detected missing ensurepip for python${py_minor}, installing venv packages..."
+  apt-get update
+  apt-get install -y "python${py_minor}-venv" python3-venv
+}
+
+ensure_python_venv_ready
+
 default_server_url="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SERVER_URL "http://127.0.0.1:8080")"
 default_secret="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SHARED_SECRET "$(generate_secret)")"
 default_host_id="$(load_non_empty_or_default "$CLIENT_ENV_FILE" HOST_ID "$(hostname)")"

@@ -301,7 +301,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 </head><body>
 <h2>Podman Monitor Dashboard</h2>
 <p>每 15 秒自动刷新。CPU/连接数/网速展示最近 5 分钟平均值。红色表示预警。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。</p>
-<table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>Agent磁盘(容器内)</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
+<table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>连接数</th><th>RX Mbps</th><th>TX Mbps</th><th>总容量/可用</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
   <div class='detail-grid'>
@@ -334,7 +334,7 @@ function fmtBytes(n){
   const x = Number(n||0); if (x<=0) return '0 B';
   const units=['B','KB','MB','GB','TB']; let i=0; let v=x;
   while(v>=1024 && i<units.length-1){v/=1024;i++;}
-  return `${v.toFixed(v>=100?0:1)} ${units[i]}`;
+  return `${v.toFixed(v>=100?0:1)}${units[i]}`;
 }
 function bpsToMbps(v){
   return (Number(v||0) * 8) / 1000 / 1000;
@@ -356,7 +356,7 @@ async function load(){
       const tr=document.createElement('tr');
       const cls=(x.alerts.disk||x.alerts.stale||x.alerts.network)?'bad':'';
       const hostDiskText = `/data: ${fmtBytes(x.disk_data_total_bytes)} / ${fmtBytes(x.disk_data_avail_bytes)}`;
-      const containerDiskText = `/: ${fmtBytes(x.container_fs_root_total_bytes)} / ${fmtBytes(x.container_fs_root_avail_bytes)}<br>/data: ${fmtBytes(x.container_fs_data_total_bytes)} / ${fmtBytes(x.container_fs_data_avail_bytes)}`;
+      const containerDiskText = `${fmtBytes(x.container_fs_root_total_bytes)} / ${fmtBytes(x.container_fs_root_avail_bytes)}`;
       let html='';
       if(idx===0){
         html += `<td rowspan='${rows.length}'>${host}</td>`;

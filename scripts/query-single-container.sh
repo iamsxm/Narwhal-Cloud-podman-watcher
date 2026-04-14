@@ -32,7 +32,24 @@ echo "\n===== 2) stats(json) ====="
 "${RUNTIME}" stats --no-stream --format json "${TARGET}" || true
 
 echo "\n===== 3) stats(兼容格式) ====="
-"${RUNTIME}" stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}' "${TARGET}" || true
+stats_templates=(
+  '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}'
+  '{{.CPU}}|{{.MemUsage}}|{{.NetIO}}'
+  '{{.CPU}}|{{.MemUsageBytes}}|{{.NetIO}}'
+)
+stats_rendered=""
+for tpl in "${stats_templates[@]}"; do
+  if stats_rendered="$("${RUNTIME}" stats --no-stream --format "${tpl}" "${TARGET}" 2>/dev/null)"; then
+    if [[ -n "${stats_rendered}" ]]; then
+      echo "${stats_rendered}"
+      break
+    fi
+  fi
+done
+
+if [[ -z "${stats_rendered}" ]]; then
+  echo "未获取到兼容格式输出（不同 Podman 版本模板字段可能不同）"
+fi
 
 echo "\n===== 4) inspect 关键字段 ====="
 "${RUNTIME}" inspect "${TARGET}" --format 'name={{.Name}} pid={{.State.Pid}} running={{.State.Running}} status={{.State.Status}} started={{.State.StartedAt}}'
@@ -48,4 +65,3 @@ if [[ -n "${PID}" && "${PID}" != "0" && -r "/proc/${PID}/net/dev" ]]; then
 else
   echo "无法读取 /proc/<pid>/net/dev（可能容器未运行或权限限制）"
 fi
-

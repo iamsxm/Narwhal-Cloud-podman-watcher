@@ -92,6 +92,27 @@ def podman_containers() -> List[Dict[str, str]]:
     return items
 
 
+
+
+def collect_container_disk_usage(name: str) -> Dict[str, int]:
+    podman = get_podman_bin()
+    if not podman:
+        return {"rw_bytes": 0, "rootfs_bytes": 0}
+
+    inspect = run([podman, "container", "inspect", "--size", name])
+    if inspect:
+        try:
+            item = json.loads(inspect)[0]
+            return {
+                "rw_bytes": int(item.get("SizeRw") or 0),
+                "rootfs_bytes": int(item.get("SizeRootFs") or 0),
+            }
+        except Exception:
+            pass
+
+    return {"rw_bytes": 0, "rootfs_bytes": 0}
+
+
 def collect_container(name: str) -> Dict:
     podman = get_podman_bin()
     if not podman:
@@ -103,6 +124,7 @@ def collect_container(name: str) -> Dict:
             "net_tx_bps": 0.0,
             "conn_count": 0,
             "disk": collect_disk_alert(),
+            "container_disk": {"rw_bytes": 0, "rootfs_bytes": 0},
         }
 
     stats = run([podman, "stats", "--no-stream", "--format", "json", name])
@@ -137,6 +159,7 @@ def collect_container(name: str) -> Dict:
             pass
 
     disk = collect_disk_alert()
+    container_disk = collect_container_disk_usage(name)
     return {
         "name": name,
         "cpu_percent": cpu_percent,
@@ -145,6 +168,7 @@ def collect_container(name: str) -> Dict:
         "net_tx_bps": net_tx,
         "conn_count": conn_count,
         "disk": disk,
+        "container_disk": container_disk,
     }
 
 

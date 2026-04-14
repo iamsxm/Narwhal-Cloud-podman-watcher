@@ -179,10 +179,16 @@ CADDY
   fi
 
   if [[ "$tls_cert_mode" == "cloudflare_dns" ]]; then
+    if [[ "$caddy_image" =~ ^docker\.io/caddy-dns/cloudflare(:.*)?$ ]]; then
+      local normalized_tag="${BASH_REMATCH[1]}"
+      [[ -z "$normalized_tag" ]] && normalized_tag=":latest"
+      caddy_image="ghcr.io/caddy-dns/cloudflare${normalized_tag}"
+      echo "[INFO] Remapped docker.io/caddy-dns/cloudflare to $caddy_image"
+    fi
     local -a cf_caddy_candidates=(
       "$caddy_image"
       "ghcr.io/caddy-dns/cloudflare:latest"
-      "docker.io/caddy-dns/cloudflare:2"
+      "ghcr.io/caddy-dns/cloudflare:2"
     )
     local selected_image=""
     local img=""

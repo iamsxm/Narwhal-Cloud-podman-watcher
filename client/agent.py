@@ -75,6 +75,103 @@ def parse_size(s: str) -> int:
     return int(n * mult)
 
 
+def _normalize_stat_number(raw: object) -> float:
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    text = str(raw).strip()
+    if not text:
+        return 0.0
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
+    cpu_percent = 0.0
+    mem_bytes = 0
+    net_rx_bps = 0.0
+    net_tx_bps = 0.0
+
+    if not stats_text:
+        return {
+            "cpu_percent": cpu_percent,
+            "mem_bytes": mem_bytes,
+            "net_rx_bps": net_rx_bps,
+            "net_tx_bps": net_tx_bps,
+        }
+
+    try:
+        payload = json.loads(stats_text)
+    except Exception:
+        payload = None
+
+    item = None
+    if isinstance(payload, list) and payload:
+        item = payload[0]
+    elif isinstance(payload, dict):
+        item = payload
+
+    if isinstance(item, dict):
+        cpu_percent = _normalize_stat_number(item.get("CPU"))
+
+        mem_usage = item.get("MemUsage")
+        if mem_usage is not None:
+            mem_bytes = parse_size(str(mem_usage).split("/")[0].strip())
+        else:
+            mem_bytes = int(_normalize_stat_number(item.get("MemUsageBytes")))
+
+        net_io = item.get("NetIO")
+        if net_io is not None:
+            net = str(net_io).split("/")
+            if len(net) == 2:
+                net_rx_bps = parse_size(net[0].strip()) / 300.0
+                net_tx_bps = parse_size(net[1].strip()) / 300.0
+        else:
+            net_in = _normalize_stat_number(item.get("NetInput"))
+            net_out = _normalize_stat_number(item.get("NetOutput"))
+            net_rx_bps = net_in / 300.0
+            net_tx_bps = net_out / 300.0
+
+    return {
+        "cpu_percent": cpu_percent,
+        "mem_bytes": mem_bytes,
+        "net_rx_bps": net_rx_bps,
+        "net_tx_bps": net_tx_bps,
+    }
+
+
+def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
+    cpu_percent = 0.0
+    mem_bytes = 0
+    net_rx_bps = 0.0
+    net_tx_bps = 0.0
+
+    parts = (stats_text or "").strip().split("|")
+    if len(parts) >= 4:
+        cpu_percent = _normalize_stat_number(parts[0])
+        mem_bytes = parse_size(parts[1].split("/")[0].strip())
+        net = parts[2].split("/")
+        if len(net) == 2:
+            net_rx_bps = parse_size(net[0].strip()) / 300.0
+            net_tx_bps = parse_size(net[1].strip()) / 300.0
+        if net_rx_bps <= 0:
+            net_rx_bps = parse_size(parts[2].strip()) / 300.0
+        if net_tx_bps <= 0:
+            net_tx_bps = parse_size(parts[3].strip()) / 300.0
+
+    return {
+        "cpu_percent": cpu_percent,
+        "mem_bytes": mem_bytes,
+        "net_rx_bps": net_rx_bps,
+        "net_tx_bps": net_tx_bps,
+    }
+
+
 def _image_matches(image: str, patterns: List[str]) -> bool:
     if not patterns:
         return False
@@ -174,24 +271,25 @@ def collect_container(name: str, container_id: str = "") -> Dict:
             "container_disk": {"rw_bytes": 0, "rootfs_bytes": 0},
         }
 
-    stats = run([podman, "stats", "--no-stream", "--format", "json", name])
     cpu_percent = 0.0
     mem = 0
     net_rx = 0.0
     net_tx = 0.0
-    if stats:
-        try:
-            arr = json.loads(stats)
-            if arr:
-                s = arr[0]
-                cpu_percent = float(str(s.get("CPU", "0")).replace("%", "") or 0)
-                mem = parse_size(str(s.get("MemUsage", "0")).split("/")[0].strip())
-                net = str(s.get("NetIO", "0 / 0")).split("/")
-                if len(net) == 2:
-                    net_rx = parse_size(net[0].strip()) / 300.0
-                    net_tx = parse_size(net[1].strip()) / 300.0
-        except Exception:
-            pass
+
+    stats_json = run([podman, "stats", "--no-stream", "--format", "json", name])
+    parsed_stats = _parse_stats_json(stats_json)
+    cpu_percent = float(parsed_stats["cpu_percent"])
+    mem = int(parsed_stats["mem_bytes"])
+    net_rx = float(parsed_stats["net_rx_bps"])
+    net_tx = float(parsed_stats["net_tx_bps"])
+
+    if cpu_percent <= 0 and mem <= 0 and net_rx <= 0 and net_tx <= 0:
+        stats_tpl = run([podman, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.NetInput}}|{{.NetOutput}}", name])
+        parsed_tpl = _parse_stats_template(stats_tpl)
+        cpu_percent = float(parsed_tpl["cpu_percent"])
+        mem = int(parsed_tpl["mem_bytes"])
+        net_rx = float(parsed_tpl["net_rx_bps"])
+        net_tx = float(parsed_tpl["net_tx_bps"])
 
     inspect = run([podman, "inspect", name])
     conn_count = 0

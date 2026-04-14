@@ -87,6 +87,22 @@ Client 需要读取宿主 Podman 与网络状态，因此容器运行参数已�
 
 在大多数 Debian/Ubuntu + Podman 环境下，这组权限可以满足监控需求；如遇 SELinux/AppArmor 限制，可按发行版策略补充标签或策略。
 
+
+## GitHub 镜像自动构建
+
+项目已包含 GitHub Actions 工作流：`.github/workflows/build-and-push-ghcr.yml`。
+
+- 触发条件：
+  - 推送到 `main` 分支
+  - 推送 `v*` 标签（例如 `v1.0.0`）
+  - 手动触发（`workflow_dispatch`）
+- 构建并推送镜像：
+  - `ghcr.io/<owner>/podman-watcher-server`
+  - `ghcr.io/<owner>/podman-watcher-client`
+- 默认会为默认分支生成 `latest` 标签，并附加 Git SHA 标签；发布标签时会同步生成同名 tag。
+
+> 说明：安装脚本中默认镜像名使用 `narwhal-cloud` 作为 owner。若你的仓库 owner 不同，请在安装时填写对应的 GHCR 镜像地址。
+
 ## 开发运行
 
 ### Server

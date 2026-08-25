@@ -1,3 +1,5 @@
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -22,6 +24,8 @@ PURGE_SECONDS = int(os.getenv("PURGE_SECONDS", str(30 * 24 * 3600)))
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 ALERT_WEBHOOK_MIN_SEVERITY = os.getenv("ALERT_WEBHOOK_MIN_SEVERITY", "warning").strip().lower()
 TLS_CA_CERT_PATH = os.getenv("TLS_CA_CERT_PATH", "/tls-ca/root.crt")
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "").strip()
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 UTC8 = timezone(timedelta(hours=8))
 
 
@@ -30,6 +34,41 @@ def format_utc8(ts: int) -> str:
 
 
 app = FastAPI(title="Narwhal Container Monitor")
+
+_AGENT_ONLY_PATHS = {
+    "/api/v1/report",
+    "/api/v1/tls/ca",
+    "/api/v1/actions/poll",
+    "/api/v1/actions/result",
+}
+
+
+def dashboard_user_from_authorization(authorization: str) -> str | None:
+    if not DASHBOARD_USERNAME or not DASHBOARD_PASSWORD or not authorization.startswith("Basic "):
+        return None
+    try:
+        decoded = base64.b64decode(authorization[6:].strip(), validate=True).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None
+    user_ok = hmac.compare_digest(username, DASHBOARD_USERNAME)
+    password_ok = hmac.compare_digest(password, DASHBOARD_PASSWORD)
+    return username if user_ok and password_ok else None
+
+
+@app.middleware("http")
+async def dashboard_basic_auth(request: Request, call_next):
+    if request.url.path in _AGENT_ONLY_PATHS:
+        return await call_next(request)
+    username = dashboard_user_from_authorization(request.headers.get("authorization", ""))
+    if username is None:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "dashboard authentication required"},
+            headers={"WWW-Authenticate": 'Basic realm="Narwhal Monitor", charset="UTF-8"'},
+        )
+    request.state.dashboard_user = username
+    return await call_next(request)
 
 
 def db() -> sqlite3.Connection:
@@ -94,6 +133,26 @@ def init_db() -> None:
             payload_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_host_security_host_ts ON host_security(host_id, ts);
+        CREATE TABLE IF NOT EXISTS security_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id INTEGER NOT NULL,
+            host_id TEXT NOT NULL,
+            runtime TEXT NOT NULL,
+            project TEXT NOT NULL DEFAULT '',
+            container_name TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            params_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'queued',
+            requested_by TEXT NOT NULL,
+            result_message TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_security_actions_host_status_updated
+            ON security_actions(host_id, status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_security_actions_alert_created
+            ON security_actions(alert_id, created_at);
         """
     )
     cols = conn.execute("PRAGMA table_info(reports)").fetchall()
@@ -126,6 +185,7 @@ def cleanup_old_reports(now_ts: int | None = None) -> int:
     cur = conn.execute("DELETE FROM reports WHERE ts < ?", (cutoff,))
     conn.execute("DELETE FROM security_alerts WHERE status='resolved' AND last_seen < ?", (cutoff,))
     conn.execute("DELETE FROM host_security WHERE ts < ?", (cutoff,))
+    conn.execute("DELETE FROM security_actions WHERE updated_at < ?", (cutoff,))
     conn.commit()
     deleted = int(cur.rowcount or 0)
     conn.close()
@@ -146,6 +206,19 @@ def verify_signature(body: bytes, x_timestamp: str, x_signature: str) -> None:
     digest = hmac.new(SHARED_SECRET.encode(), body + x_timestamp.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(digest, x_signature):
         raise HTTPException(status_code=401, detail="bad signature")
+
+
+def signed_json_response(payload: Dict[str, Any], request_timestamp: str, status_code: int = 200) -> Response:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    signature = hmac.new(
+        SHARED_SECRET.encode(), body + request_timestamp.encode(), hashlib.sha256
+    ).hexdigest()
+    return Response(
+        content=body,
+        status_code=status_code,
+        media_type="application/json",
+        headers={"X-Narwhal-Response-Signature": signature, "Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/v1/tls/ca")
@@ -523,6 +596,234 @@ def history(host_id: str, container_name: str, runtime: str = "", project: str =
     )
 
 
+def _action_item(row: sqlite3.Row) -> Dict[str, Any]:
+    try:
+        params = json.loads(row["params_json"] or "{}")
+    except (TypeError, ValueError):
+        params = {}
+    return {
+        "id": int(row["id"]),
+        "alert_id": int(row["alert_id"]),
+        "host_id": row["host_id"],
+        "runtime": row["runtime"],
+        "project": row["project"],
+        "container_name": row["container_name"],
+        "action_type": row["action_type"],
+        "params": params,
+        "status": row["status"],
+        "requested_by": row["requested_by"],
+        "result_message": row["result_message"],
+        "attempts": int(row["attempts"]),
+        "created_at": int(row["created_at"]),
+        "created_at_utc8": format_utc8(int(row["created_at"])),
+        "updated_at": int(row["updated_at"]),
+        "updated_at_utc8": format_utc8(int(row["updated_at"])),
+    }
+
+
+def _alert_details(raw: str) -> Dict[str, Any]:
+    try:
+        value = json.loads(raw or "{}")
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+@app.post("/api/v1/security/alerts/{alert_id}/actions")
+async def queue_security_action(alert_id: int, request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    requested_action = str(payload.get("action") or "").strip().lower()
+    action_type = {"remediate": "remediate_panel_pairing", "allow": "allow_panel_domains"}.get(
+        requested_action
+    )
+    if not action_type:
+        raise HTTPException(status_code=400, detail="action must be remediate or allow")
+
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    alert = conn.execute("SELECT * FROM security_alerts WHERE id=?", (alert_id,)).fetchone()
+    if alert is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="alert not found")
+    if alert["status"] != "active":
+        conn.close()
+        raise HTTPException(status_code=409, detail="alert is no longer active")
+    if alert["alert_type"] != "unauthorized_panel_pairing":
+        conn.close()
+        raise HTTPException(status_code=400, detail="this action only supports panel-pairing alerts")
+    if alert["runtime"] not in ("podman", "incus"):
+        conn.close()
+        raise HTTPException(status_code=400, detail="Docker and unknown runtimes are notice-only")
+    if not alert["container_name"]:
+        conn.close()
+        raise HTTPException(status_code=400, detail="alert has no container target")
+
+    details = _alert_details(alert["details_json"])
+    unapproved_domains = [
+        str(item).strip().lower().rstrip(".")
+        for item in details.get("unapproved_domains", [])
+        if isinstance(item, str) and item.strip()
+    ]
+    process_patterns = [
+        str(item).strip().lower()
+        for item in details.get("process_patterns", [])
+        if isinstance(item, str) and item.strip()
+    ]
+    config_files = [
+        str(item).strip()
+        for item in details.get("config_files", [])
+        if isinstance(item, str) and item.strip()
+    ]
+    if action_type == "allow_panel_domains":
+        if not unapproved_domains:
+            conn.close()
+            raise HTTPException(status_code=400, detail="alert has no exact domains to allow")
+        params = {"domains": sorted(set(unapproved_domains))}
+    else:
+        if not process_patterns and not config_files:
+            conn.close()
+            raise HTTPException(status_code=400, detail="alert has no safe remediation evidence")
+        params = {
+            "process_patterns": sorted(set(process_patterns)),
+            "config_files": sorted(set(config_files)),
+        }
+
+    existing = conn.execute(
+        """
+        SELECT * FROM security_actions
+        WHERE alert_id=? AND action_type=? AND status IN ('queued','dispatched')
+        ORDER BY id DESC LIMIT 1
+        """,
+        (alert_id, action_type),
+    ).fetchone()
+    if existing is not None:
+        conn.close()
+        return JSONResponse(content={"ok": True, "queued": False, "action": _action_item(existing)})
+
+    now = int(time.time())
+    requested_by = str(getattr(request.state, "dashboard_user", DASHBOARD_USERNAME or "dashboard"))[:100]
+    cur = conn.execute(
+        """
+        INSERT INTO security_actions(
+            alert_id, host_id, runtime, project, container_name, action_type, params_json,
+            status, requested_by, created_at, updated_at
+        ) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)
+        """,
+        (
+            alert_id,
+            alert["host_id"],
+            alert["runtime"],
+            alert["project"],
+            alert["container_name"],
+            action_type,
+            json.dumps(params, ensure_ascii=False),
+            requested_by,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM security_actions WHERE id=?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    return JSONResponse(status_code=202, content={"ok": True, "queued": True, "action": _action_item(row)})
+
+
+@app.post("/api/v1/actions/poll")
+async def poll_security_actions(
+    request: Request,
+    x_timestamp: str = Header(default=""),
+    x_signature: str = Header(default=""),
+) -> Response:
+    body = await request.body()
+    verify_signature(body, x_timestamp, x_signature)
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    host_id = str(payload.get("host_id") or "")[:200]
+    if not host_id:
+        raise HTTPException(status_code=400, detail="host_id is required")
+    now = int(time.time())
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        """
+        UPDATE security_actions
+        SET status='failed', result_message='agent did not confirm action after 3 attempts', updated_at=?
+        WHERE host_id=? AND status='dispatched' AND attempts>=3 AND updated_at < ?
+        """,
+        (now, host_id, now - 120),
+    )
+    rows = conn.execute(
+        """
+        SELECT * FROM security_actions
+        WHERE host_id=? AND attempts < 3
+          AND (status='queued' OR (status='dispatched' AND updated_at < ?))
+        ORDER BY id LIMIT 10
+        """,
+        (host_id, now - 120),
+    ).fetchall()
+    actions = []
+    for row in rows:
+        conn.execute(
+            "UPDATE security_actions SET status='dispatched', attempts=attempts+1, updated_at=? WHERE id=?",
+            (now, row["id"]),
+        )
+        action = _action_item(row)
+        action["status"] = "dispatched"
+        action["attempts"] += 1
+        actions.append(action)
+    conn.commit()
+    conn.close()
+    return signed_json_response({"ok": True, "actions": actions}, x_timestamp)
+
+
+@app.post("/api/v1/actions/result")
+async def security_action_result(
+    request: Request,
+    x_timestamp: str = Header(default=""),
+    x_signature: str = Header(default=""),
+) -> Response:
+    body = await request.body()
+    verify_signature(body, x_timestamp, x_signature)
+    try:
+        payload = json.loads(body)
+        action_id = int(payload.get("action_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid action result")
+    host_id = str(payload.get("host_id") or "")[:200]
+    status = str(payload.get("status") or "").lower()
+    if status not in ("succeeded", "failed"):
+        raise HTTPException(status_code=400, detail="status must be succeeded or failed")
+    message = str(payload.get("message") or "")[:2000]
+    now = int(time.time())
+    conn = db()
+    row = conn.execute("SELECT host_id, status FROM security_actions WHERE id=?", (action_id,)).fetchone()
+    if row is None or row["host_id"] != host_id:
+        conn.close()
+        raise HTTPException(status_code=404, detail="action not found for host")
+    if row["status"] not in ("succeeded", "failed"):
+        conn.execute(
+            "UPDATE security_actions SET status=?, result_message=?, updated_at=? WHERE id=?",
+            (status, message, now, action_id),
+        )
+        conn.commit()
+    conn.close()
+    return signed_json_response({"ok": True, "action_id": action_id}, x_timestamp)
+
+
+@app.get("/api/v1/security/actions")
+def security_actions(limit: int = 200) -> JSONResponse:
+    limit = max(1, min(limit, 1000))
+    conn = db()
+    rows = conn.execute("SELECT * FROM security_actions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return JSONResponse(content={"items": [_action_item(row) for row in rows]})
+
+
 @app.get("/api/v1/security/alerts")
 def security_alerts(active_only: bool = True, limit: int = 200) -> JSONResponse:
     limit = max(1, min(limit, 1000))
@@ -537,9 +838,11 @@ def security_alerts(active_only: bool = True, limit: int = 200) -> JSONResponse:
             "SELECT * FROM security_alerts ORDER BY last_seen DESC LIMIT ?",
             (limit,),
         ).fetchall()
-    conn.close()
     items = []
     for row in rows:
+        latest_action = conn.execute(
+            "SELECT * FROM security_actions WHERE alert_id=? ORDER BY id DESC LIMIT 1", (row["id"],)
+        ).fetchone()
         items.append(
             {
                 "id": int(row["id"]),
@@ -559,8 +862,11 @@ def security_alerts(active_only: bool = True, limit: int = 200) -> JSONResponse:
                 "last_seen_utc8": format_utc8(int(row["last_seen"])),
                 "occurrence_count": int(row["occurrence_count"]),
                 "status": row["status"],
+                "details": _alert_details(row["details_json"]),
+                "latest_action": _action_item(latest_action) if latest_action is not None else None,
             }
         )
+    conn.close()
     active_count = sum(1 for item in items if item["status"] == "active") if not active_only else len(items)
     return JSONResponse(content={"items": items, "active_count": active_count})
 
@@ -749,6 +1055,10 @@ th{background:#1a2c4e}
 .severity-critical{color:#ff5f6d;font-weight:bold}
 .severity-warning{color:#ffbf4b;font-weight:bold}
 .btn{border:1px solid #4b6fa8;padding:4px 8px;border-radius:6px;background:#1a2c4e;color:#dbe7ff;cursor:pointer}
+.btn-danger{background:#7c2330;border-color:#d94b61;margin-right:6px}
+.btn-allow{background:#185d4a;border-color:#36a77f}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.action-status{font-size:12px;margin-top:5px;color:#a9bddc;max-width:260px}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center}
 #card{background:#0d1730;border-radius:12px;padding:16px;width:min(1380px,96vw)}
 .legend{display:flex;gap:14px;align-items:center;margin:8px 0 4px 0;font-size:14px}
@@ -764,7 +1074,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 <h2>Narwhal Container Monitor Dashboard</h2>
 <p>每 15 秒自动刷新。CPU/内存使用率/连接数/网速展示采集到的原始上报值，服务端不再做 5 分钟平均。红色表示预警（CPU ≥ {ALERT_CPU_THRESHOLD_PERCENT:.2f}% 或连接数 ≥ {ALERT_CONN_THRESHOLD}）。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。<a href='/stats' style='color:#8cc7ff'>查看统计页</a></p>
 <h3>安全告警（活动：<span id='active-alert-count'>0</span>）</h3>
-<table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th></tr></thead><tbody></tbody></table>
+<table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th><th>操作</th></tr></thead><tbody></tbody></table>
 <h3>主机安全遥测</h3>
 <table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table>
 <h3>容器状态</h3>
@@ -826,19 +1136,59 @@ function formatCountryStats(tcpStats, udpStats){
 function escapeHtml(value){
   return String(value??'').replace(/[&<>'"]/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
 }
+const alertsById=new Map();
+function actionStatusText(action){
+  if(!action)return '';
+  const labels={queued:'等待节点',dispatched:'节点处理中',succeeded:'已完成',failed:'失败'};
+  const result=action.result_message?`：${action.result_message}`:'';
+  return `${labels[action.status]||action.status}${result}`;
+}
+async function queueAlertAction(alertId, actionName){
+  const alert=alertsById.get(Number(alertId)); if(!alert)return;
+  const details=alert.details||{};
+  let promptText='';
+  if(actionName==='remediate'){
+    const processes=(details.process_patterns||[]).join(', ')||'无';
+    const files=(details.config_files||[]).join(', ')||'无';
+    promptText=`确认清理 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的机场对接组件？\n\n将终止进程特征：${processes}\n停用并删除对应服务，删除配置：${files}\n容器本身不会停止。`;
+  }else{
+    const domains=(details.unapproved_domains||[]).join(', ');
+    promptText=`确认放行以下面板域名？\n${domains}\n\n放行后该节点以后不再对此域名告警。`;
+  }
+  if(!confirm(promptText))return;
+  try{
+    const response=await fetch(`/api/v1/security/alerts/${Number(alertId)}/actions`,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:actionName})
+    });
+    const result=await response.json();
+    if(!response.ok)throw new Error(result.detail||`HTTP ${response.status}`);
+    await loadAlerts();
+  }catch(error){window.alert(`操作提交失败：${error.message||error}`);}
+}
 async function loadAlerts(){
   const response=await fetch('/api/v1/security/alerts?active_only=true&limit=100');
   const data=await response.json();
   document.getElementById('active-alert-count').innerText=Number(data.active_count||0);
   const body=document.querySelector('#security-alerts tbody'); body.innerHTML='';
+  alertsById.clear();
   for(const alert of (data.items||[])){
+    alertsById.set(Number(alert.id),alert);
     const tr=document.createElement('tr');
     const runtime=alert.project?`${alert.runtime}/${alert.project}`:(alert.runtime||'-');
+    const supportedRuntime=alert.runtime==='podman'||alert.runtime==='incus';
+    const canRemediate=supportedRuntime&&((alert.details?.process_patterns||[]).length>0||(alert.details?.config_files||[]).length>0);
+    const actionable=alert.type==='unauthorized_panel_pairing'&&supportedRuntime;
+    const hasDomains=Array.isArray(alert.details?.unapproved_domains)&&alert.details.unapproved_domains.length>0;
+    const pending=alert.latest_action&&(alert.latest_action.status==='queued'||alert.latest_action.status==='dispatched');
+    const actions=actionable?
+      (canRemediate?`<button class='btn btn-danger' ${pending?'disabled':''} onclick="queueAlertAction(${Number(alert.id)},'remediate')">快速清理</button>`:'')+
+      (hasDomains?`<button class='btn btn-allow' ${pending?'disabled':''} onclick="queueAlertAction(${Number(alert.id)},'allow')">放行</button>`:''):
+      `<span>${alert.runtime==='docker'?'仅提醒':'-'}</span>`;
     tr.innerHTML=`<td class='severity-${escapeHtml(alert.severity)}'>${escapeHtml(alert.severity)}</td>`+
       `<td>${escapeHtml(alert.host_id)}</td><td>${escapeHtml(runtime)}</td>`+
       `<td>${escapeHtml(alert.container_name||'-')}</td><td>${escapeHtml(alert.type)}</td>`+
       `<td>${escapeHtml(alert.message)}</td><td>${escapeHtml(alert.last_seen_utc8)}</td>`+
-      `<td>${Number(alert.occurrence_count||0)}</td>`;
+      `<td>${Number(alert.occurrence_count||0)}</td><td>${actions}<div class='action-status'>${escapeHtml(actionStatusText(alert.latest_action))}</div></td>`;
     body.appendChild(tr);
   }
   const statusResponse=await fetch('/api/v1/security/status');

@@ -40,6 +40,14 @@ generate_secret() {
   tr -d '-' </proc/sys/kernel/random/uuid | cut -c 1-25
 }
 
+generate_dashboard_username() {
+  echo "narwhal-$(generate_secret | cut -c 1-10)"
+}
+
+generate_dashboard_password() {
+  printf '%s%s' "$(generate_secret)" "$(generate_secret)"
+}
+
 pick_random_port() {
   local fallback=49152
   if ! command -v ss >/dev/null 2>&1; then
@@ -322,6 +330,10 @@ main() {
   local default_cloudflare_api_token=""
   local default_alert_webhook_url=""
   local default_alert_webhook_min_severity="warning"
+  local default_dashboard_username
+  local default_dashboard_password
+  default_dashboard_username="$(generate_dashboard_username)"
+  default_dashboard_password="$(generate_dashboard_password)"
 
   default_image_source="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" IMAGE_SOURCE "$default_image_source")"
   default_github_image="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" GITHUB_IMAGE "$default_github_image")"
@@ -332,15 +344,19 @@ main() {
   default_tls_cert_mode="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" TLS_CERT_MODE "$default_tls_cert_mode")"
   default_cloudflare_api_token="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" CLOUDFLARE_API_TOKEN "$default_cloudflare_api_token")"
 
-  local env_secret env_th env_alert_webhook_url env_alert_webhook_min_severity
+  local env_secret env_th env_alert_webhook_url env_alert_webhook_min_severity env_dashboard_username env_dashboard_password
   env_secret="$(load_kv_from_file "$SERVER_ENV_FILE" SHARED_SECRET || true)"
   env_th="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_DISK_THRESHOLD_PERCENT || true)"
   env_alert_webhook_url="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_WEBHOOK_URL || true)"
   env_alert_webhook_min_severity="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_WEBHOOK_MIN_SEVERITY || true)"
+  env_dashboard_username="$(load_kv_from_file "$SERVER_ENV_FILE" DASHBOARD_USERNAME || true)"
+  env_dashboard_password="$(load_kv_from_file "$SERVER_ENV_FILE" DASHBOARD_PASSWORD || true)"
   default_secret="${env_secret:-$default_secret}"
   default_th="${env_th:-$default_th}"
   default_alert_webhook_url="${env_alert_webhook_url:-$default_alert_webhook_url}"
   default_alert_webhook_min_severity="${env_alert_webhook_min_severity:-$default_alert_webhook_min_severity}"
+  default_dashboard_username="${env_dashboard_username:-$default_dashboard_username}"
+  default_dashboard_password="${env_dashboard_password:-$default_dashboard_password}"
 
   local image_source github_image port secret th tls_enable tls_host tls_email tls_cert_mode cloudflare_api_token caddy_image alert_webhook_url alert_webhook_min_severity
 
@@ -406,6 +422,8 @@ ALERT_WEBHOOK_URL=$alert_webhook_url
 ALERT_WEBHOOK_MIN_SEVERITY=$alert_webhook_min_severity
 DB_PATH=/data/monitor.db
 TLS_CA_CERT_PATH=/tls-ca/root.crt
+DASHBOARD_USERNAME=$default_dashboard_username
+DASHBOARD_PASSWORD=$default_dashboard_password
 ENV
 
   cat >"$SERVER_INSTALL_ENV_FILE" <<ENV
@@ -418,6 +436,7 @@ TLS_EMAIL=$tls_email
 TLS_CERT_MODE=$tls_cert_mode
 CLOUDFLARE_API_TOKEN=$cloudflare_api_token
 ENV
+  chmod 0600 "$SERVER_ENV_FILE" "$SERVER_INSTALL_ENV_FILE"
 
   if [[ "$reset_data" == "yes" ]]; then
     echo "[INFO] 检测到 reset-data，请求清空历史采集数据（初始化数据库）..."
@@ -462,6 +481,7 @@ ENV
     "$image_name"
 
   setup_tls_proxy "$tls_host" "$port" "$tls_enable" "$tls_email" "$tls_cert_mode" "$cloudflare_api_token" "$caddy_image"
+  bash "$ROOT_DIR/scripts/setup-auto-update.sh" server "$ROOT_DIR"
 
   if [[ "$tls_enable" == "yes" ]]; then
     echo "Server started: https://${tls_host}"
@@ -476,7 +496,9 @@ Mode: $MODE
 Container Name: $CONTAINER_NAME
 Backend Port: $port
 Backend Binding: $port_binding
-Shared Secret: $secret
+Shared Secret: $(if [[ "$MODE" == "install" ]]; then echo "$secret"; else echo "preserved (see $SERVER_ENV_FILE)"; fi)
+Dashboard Username: $(if [[ "$MODE" == "install" ]]; then echo "$default_dashboard_username"; else echo "preserved (see $SERVER_ENV_FILE)"; fi)
+Dashboard Password: $(if [[ "$MODE" == "install" ]]; then echo "$default_dashboard_password"; else echo "preserved (see $SERVER_ENV_FILE)"; fi)
 Security Webhook: ${alert_webhook_url:-disabled}
 Webhook Minimum Severity: $alert_webhook_min_severity
 Disk Alert Threshold: $th%
@@ -493,6 +515,7 @@ TLS Cert Mode: ${tls_cert_mode:-N/A}
 Client Server URL: $(if [[ "$tls_enable" == "yes" ]]; then echo "https://${tls_host}"; else echo "http://$(hostname -I | awk '{print $1}'):${port}"; fi)
 TLS CA Bootstrap: $(if [[ "$tls_cert_mode" == "internal" ]]; then echo "HMAC-authenticated /api/v1/tls/ca"; else echo "system/public trust"; fi)
 Caddy Image: ${caddy_image:-N/A}
+Automatic Updates: enabled (origin/main every 15 minutes)
 ==================================
 EOF_SUM
 }

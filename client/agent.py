@@ -4,11 +4,13 @@ import hmac
 import ipaddress
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from typing import Dict, List, Tuple
 from urllib.parse import quote, urlparse
@@ -1649,11 +1651,14 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
         unapproved_domains = (
             panel_pairing.get("unapproved_domains") if isinstance(panel_pairing.get("unapproved_domains"), list) else []
         )
-        allowlist_configured = bool(os.getenv("SECURITY_ALLOWED_PANEL_DOMAINS", "").strip())
+        allowlist_configured = bool(_configured_allowed_panel_domains())
         pairing_is_allowed = allowlist_configured and bool(panel_domains) and not unapproved_domains
         if panel_detection_enabled and panel_pairing.get("detected") and not pairing_is_allowed:
             process_patterns = (
                 panel_pairing.get("process_patterns") if isinstance(panel_pairing.get("process_patterns"), list) else []
+            )
+            identity_patterns = (
+                panel_pairing.get("identity_patterns") if isinstance(panel_pairing.get("identity_patterns"), list) else []
             )
             config_files = panel_pairing.get("config_files") if isinstance(panel_pairing.get("config_files"), list) else []
             evidence = []
@@ -1661,6 +1666,8 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
                 evidence.append(f"未授权面板域名 {','.join(str(item) for item in unapproved_domains[:5])}")
             if process_patterns:
                 evidence.append(f"节点程序特征 {','.join(str(item) for item in process_patterns[:5])}")
+            if identity_patterns:
+                evidence.append(f"容器名称/镜像特征 {','.join(str(item) for item in identity_patterns[:5])}")
             if config_files:
                 evidence.append(f"配置文件 {','.join(str(item) for item in config_files[:3])}")
             listening_ports = security.get("listening_ports") if isinstance(security.get("listening_ports"), list) else []
@@ -1668,17 +1675,24 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
                 evidence.append(f"容器内部监听端口 {','.join(str(item) for item in listening_ports[:10])}")
             if not evidence:
                 evidence.append("发现 ApiHost/ApiKey/NodeID 等面板对接配置特征")
-            alerts.append(
-                _security_alert(
-                    "unauthorized_panel_pairing",
-                    "critical" if unapproved_domains else "warning",
-                    "疑似对接第三方机场面板",
-                    "；".join(evidence),
-                    len(unapproved_domains) or len(process_patterns) or len(config_files) or 1,
-                    1,
-                    container,
-                )
+            panel_alert = _security_alert(
+                "unauthorized_panel_pairing",
+                "critical" if unapproved_domains else "warning",
+                "疑似对接第三方机场面板",
+                "；".join(evidence),
+                len(unapproved_domains) or len(process_patterns) or len(config_files) or 1,
+                1,
+                container,
             )
+            panel_alert.update(
+                {
+                    "unapproved_domains": [str(item) for item in unapproved_domains[:20]],
+                    "process_patterns": [str(item) for item in process_patterns[:20]],
+                    "identity_patterns": [str(item) for item in identity_patterns[:20]],
+                    "config_files": [str(item) for item in config_files[:20]],
+                }
+            )
+            alerts.append(panel_alert)
         container_access = security.get("access_log")
         if isinstance(container_access, dict):
             alerts.extend(_http_security_alerts(container_access, container))
@@ -1810,6 +1824,75 @@ def _panel_domain_allowed(domain: str, allowed_domains: List[str]) -> bool:
     return False
 
 
+def _valid_panel_domain(value: str) -> bool:
+    candidate = value.strip().lower().rstrip(".")
+    try:
+        ipaddress.ip_address(candidate)
+        return True
+    except ValueError:
+        pass
+    if len(candidate) > 253 or not candidate:
+        return False
+    return all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) is not None
+        for label in candidate.split(".")
+    )
+
+
+def _configured_allowed_panel_domains() -> List[str]:
+    values = {
+        item.strip().lower().lstrip("*.").rstrip(".")
+        for item in os.getenv("SECURITY_ALLOWED_PANEL_DOMAINS", "").split(",")
+        if item.strip()
+    }
+    policy_path = os.getenv(
+        "SECURITY_PANEL_ALLOWLIST_FILE", "/opt/narwhal-monitor/panel-allowlist.json"
+    ).strip()
+    if policy_path:
+        try:
+            with open(policy_path, "r", encoding="utf-8") as policy_file:
+                stored = json.load(policy_file)
+            stored_domains = stored.get("domains", []) if isinstance(stored, dict) else stored
+            if isinstance(stored_domains, list):
+                values.update(
+                    str(item).strip().lower().lstrip("*.").rstrip(".")
+                    for item in stored_domains
+                    if isinstance(item, str) and item.strip()
+                )
+        except (OSError, TypeError, ValueError):
+            pass
+    return sorted(item for item in values if _valid_panel_domain(item))
+
+
+def add_allowed_panel_domains(domains: List[str]) -> List[str]:
+    normalized = {
+        str(item).strip().lower().rstrip(".")
+        for item in domains
+        if isinstance(item, str) and _valid_panel_domain(item)
+    }
+    if not normalized:
+        raise ValueError("no valid panel domains supplied")
+    merged = sorted(set(_configured_allowed_panel_domains()) | normalized)
+    policy_path = os.getenv(
+        "SECURITY_PANEL_ALLOWLIST_FILE", "/opt/narwhal-monitor/panel-allowlist.json"
+    ).strip()
+    if not policy_path or not (posixpath.isabs(policy_path) or os.path.isabs(policy_path)):
+        raise ValueError("SECURITY_PANEL_ALLOWLIST_FILE must be an absolute path")
+    parent = os.path.dirname(policy_path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".panel-allowlist-", dir=parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as policy_file:
+            json.dump({"domains": merged, "updated_at": int(time.time())}, policy_file, ensure_ascii=False)
+            policy_file.write("\n")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, policy_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return merged
+
+
 def collect_panel_pairing_indicators(
     name: str, runtime: str = "", project: str = "", image: str = ""
 ) -> Dict[str, object]:
@@ -1817,6 +1900,7 @@ def collect_panel_pairing_indicators(
     result: Dict[str, object] = {
         "detected": False,
         "process_patterns": [],
+        "identity_patterns": [],
         "config_files": [],
         "credential_markers": [],
         "panel_domains": [],
@@ -1835,9 +1919,8 @@ def collect_panel_pairing_indicators(
     ]
     process_output = run(_runtime_exec_cmd(runtime, name, "ps -eo comm,args 2>/dev/null", project)).lower()
     combined_identity = f"{name} {image}".lower()
-    process_patterns = sorted(
-        {pattern for pattern in patterns if pattern in process_output or pattern in combined_identity}
-    )
+    process_patterns = sorted({pattern for pattern in patterns if pattern in process_output})
+    identity_patterns = sorted({pattern for pattern in patterns if pattern in combined_identity})
 
     raw_paths = os.getenv(
         "SECURITY_PANEL_CONFIG_PATHS",
@@ -1892,13 +1975,14 @@ def collect_panel_pairing_indicators(
                     found_url = True
             if current_file and found_url:
                 config_files.add(current_file)
-    allowed_domains = [item.strip() for item in os.getenv("SECURITY_ALLOWED_PANEL_DOMAINS", "").split(",") if item.strip()]
+    allowed_domains = _configured_allowed_panel_domains()
     unapproved_domains = sorted(domain for domain in domains if not _panel_domain_allowed(domain, allowed_domains))
-    detected = bool(process_patterns or config_files or credential_markers or domains)
+    detected = bool(process_patterns or identity_patterns or config_files or credential_markers or domains)
     result.update(
         {
             "detected": detected,
             "process_patterns": process_patterns,
+            "identity_patterns": identity_patterns,
             "config_files": sorted(config_files),
             "credential_markers": sorted(credential_markers),
             "panel_domains": sorted(domains),
@@ -2579,6 +2663,190 @@ def server_tls_verify() -> bool | str:
     return ca_file
 
 
+def signed_post_json(server: str, secret: str, path: str, payload: Dict) -> Dict:
+    server = normalize_server_url(server)
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    timestamp = str(int(time.time()))
+    response = requests.post(
+        f"{server.rstrip('/')}{path}",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Timestamp": timestamp,
+            "X-Signature": sign(body, secret, int(timestamp)),
+        },
+        timeout=30,
+        verify=server_tls_verify(),
+    )
+    response.raise_for_status()
+    expected = hmac.new(
+        secret.encode(), response.content + timestamp.encode(), hashlib.sha256
+    ).hexdigest()
+    received = response.headers.get("X-Narwhal-Response-Signature", "")
+    if not received or not hmac.compare_digest(expected, received):
+        raise RuntimeError("Server action response signature verification failed")
+    value = response.json()
+    if not isinstance(value, dict):
+        raise RuntimeError("Server action response is not a JSON object")
+    return value
+
+
+def _run_action_command(cmd: List[str]) -> Tuple[bool, str]:
+    env = None
+    if cmd and cmd[0] == "podman-remote":
+        socket_path = os.getenv("PODMAN_SOCKET", "/run/podman/podman.sock")
+        if "CONTAINER_HOST" not in os.environ and os.path.exists(socket_path):
+            env = os.environ.copy()
+            env["CONTAINER_HOST"] = f"unix://{socket_path}"
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=90)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)[:500]
+    message = (result.stdout or result.stderr or "").strip()[:1000]
+    return result.returncode == 0, message
+
+
+def _configured_panel_process_patterns() -> List[str]:
+    return [
+        item.strip().lower()
+        for item in os.getenv(
+            "SECURITY_PANEL_PROCESS_PATTERNS", "xboard-node,xrayr,v2bx,soga,sspanel-uim-node"
+        ).split(",")
+        if re.fullmatch(r"[a-zA-Z0-9_.@-]{2,80}", item.strip())
+    ]
+
+
+def _configured_panel_config_paths() -> List[str]:
+    raw = os.getenv(
+        "SECURITY_PANEL_CONFIG_PATHS",
+        "/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml",
+    )
+    return sorted(
+        {
+            posixpath.normpath(item.strip())
+            for item in raw.split(",")
+            if re.fullmatch(r"/[A-Za-z0-9_./-]+", item.strip())
+        }
+    )
+
+
+def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
+    runtime_kind = str(action.get("runtime") or "").lower()
+    if runtime_kind not in ("podman", "incus"):
+        return False, "Docker and unknown runtimes are notice-only"
+    container_name = str(action.get("container_name") or "")
+    project = str(action.get("project") or "")
+    if not container_name or not re.fullmatch(r"[A-Za-z0-9_.:@+-]{1,200}", container_name):
+        return False, "invalid container target"
+    if project and not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", project):
+        return False, "invalid Incus project"
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    requested_patterns = params.get("process_patterns") if isinstance(params.get("process_patterns"), list) else []
+    requested_files = params.get("config_files") if isinstance(params.get("config_files"), list) else []
+    allowed_patterns = set(_configured_panel_process_patterns())
+    patterns = sorted(
+        {
+            str(item).strip().lower()
+            for item in requested_patterns
+            if isinstance(item, str) and str(item).strip().lower() in allowed_patterns
+        }
+    )
+    allowed_files = set(_configured_panel_config_paths())
+    config_files = sorted(
+        {
+            posixpath.normpath(str(item).strip())
+            for item in requested_files
+            if isinstance(item, str) and posixpath.normpath(str(item).strip()) in allowed_files
+        }
+    )
+    if not patterns and not config_files:
+        return False, "no locally approved remediation targets"
+
+    script_parts = ["set -u", "removed_services=0", "removed_configs=0", "killed_processes=0"]
+    for pattern in patterns:
+        quoted_pattern = shlex.quote(pattern)
+        process_regex = shlex.quote(rf"^(/[^ ]*/)?{re.escape(pattern)}([[:space:]]|$)")
+        script_parts.append(
+            "for signal in TERM KILL; do "
+            "for proc in /proc/[0-9]*; do "
+            "pid=${proc##*/}; [ \"$pid\" = \"$$\" ] && continue; "
+            "cmd=$(tr '\\000' ' ' < \"$proc/cmdline\" 2>/dev/null || true); "
+            f"if printf '%s\\n' \"$cmd\" | grep -Eiq {process_regex}; then "
+            "kill -$signal \"$pid\" 2>/dev/null && killed_processes=$((killed_processes+1)) || true; fi; "
+            "done; [ \"$signal\" = TERM ] && sleep 1; done"
+        )
+        script_parts.append(
+            "for unit_dir in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do "
+            "[ -d \"$unit_dir\" ] || continue; "
+            f"for unit in $(find \"$unit_dir\" -maxdepth 1 -iname {shlex.quote(pattern + '.service')} -print 2>/dev/null); do "
+            "[ -e \"$unit\" ] || [ -L \"$unit\" ] || continue; unit_name=${unit##*/}; "
+            "command -v systemctl >/dev/null 2>&1 && systemctl disable --now \"$unit_name\" >/dev/null 2>&1 || true; "
+            "rm -f -- \"$unit\" && removed_services=$((removed_services+1)); done; done; "
+            f"for init_file in $(find /etc/init.d -maxdepth 1 -iname {quoted_pattern} -print 2>/dev/null); do "
+            "[ -e \"$init_file\" ] || [ -L \"$init_file\" ] || continue; \"$init_file\" stop >/dev/null 2>&1 || true; "
+            "rm -f -- \"$init_file\" && removed_services=$((removed_services+1)); done; "
+            f"command -v rc-update >/dev/null 2>&1 && rc-update del {quoted_pattern} >/dev/null 2>&1 || true"
+        )
+    for config_file in config_files:
+        quoted_file = shlex.quote(config_file)
+        script_parts.append(
+            f"if [ -f {quoted_file} ] || [ -L {quoted_file} ]; then "
+            f"rm -f -- {quoted_file} && removed_configs=$((removed_configs+1)); fi"
+        )
+    script_parts.extend(
+        [
+            "command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true",
+            "printf 'killed_processes=%s removed_services=%s removed_configs=%s\\n' \"$killed_processes\" \"$removed_services\" \"$removed_configs\"",
+        ]
+    )
+    runtime_bin = get_runtime_bins().get(runtime_kind, "")
+    if not runtime_bin:
+        return False, f"runtime {runtime_kind} is unavailable"
+    command = _runtime_exec_cmd(runtime_bin, container_name, "; ".join(script_parts), project)
+    ok, output = _run_action_command(command)
+    return ok, output or ("remediation completed" if ok else "remediation command failed")
+
+
+def execute_security_action(action: Dict) -> Tuple[bool, str]:
+    action_type = str(action.get("action_type") or "")
+    if action_type == "allow_panel_domains":
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        domains = params.get("domains") if isinstance(params.get("domains"), list) else []
+        try:
+            merged = add_allowed_panel_domains(domains)
+        except (OSError, ValueError) as exc:
+            return False, f"allowlist update failed: {exc}"
+        return True, f"allowed {len(domains)} exact domain(s); allowlist now contains {len(merged)}"
+    if action_type == "remediate_panel_pairing":
+        return remediate_panel_pairing(action)
+    return False, "unsupported action type"
+
+
+def process_security_actions(server: str, secret: str, host_id: str) -> bool:
+    response = signed_post_json(server, secret, "/api/v1/actions/poll", {"host_id": host_id})
+    actions = response.get("actions") if isinstance(response.get("actions"), list) else []
+    changed = False
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        ok, message = execute_security_action(action)
+        action_id = int(action.get("id") or 0)
+        signed_post_json(
+            server,
+            secret,
+            "/api/v1/actions/result",
+            {
+                "action_id": action_id,
+                "host_id": host_id,
+                "status": "succeeded" if ok else "failed",
+                "message": message,
+            },
+        )
+        print(f"security action {action_id} {'succeeded' if ok else 'failed'}: {message}")
+        changed = changed or ok
+    return changed
+
+
 def push(server: str, secret: str, payload: Dict) -> None:
     server = normalize_server_url(server)
     body = json.dumps(payload, ensure_ascii=False).encode()
@@ -2657,7 +2925,22 @@ def main() -> None:
             print(f"reported {len(containers)} containers and {len(security.get('alerts', []))} security alerts to {args.server}")
         except Exception as e:
             print(f"report failed: {e}")
-        time.sleep(max(60, args.interval))
+        report_delay = max(60, args.interval)
+        try:
+            action_poll_interval = max(5, int(os.getenv("ACTION_POLL_INTERVAL", "10")))
+        except ValueError:
+            action_poll_interval = 10
+        deadline = time.monotonic() + report_delay
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(action_poll_interval, remaining))
+            try:
+                if process_security_actions(args.server, args.secret, args.host_id):
+                    break
+            except Exception as action_error:
+                print(f"security action poll failed: {action_error}")
 
 
 if __name__ == "__main__":

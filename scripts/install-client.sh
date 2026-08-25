@@ -129,6 +129,7 @@ default_secret="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SHARED_SECRET "$(
 default_tls_ca_file="$(load_kv_from_file "$CLIENT_ENV_FILE" SERVER_TLS_CA_FILE || true)"
 default_host_id="$(load_non_empty_or_default "$CLIENT_ENV_FILE" HOST_ID "$(hostname)")"
 default_interval="$(load_non_empty_or_default "$CLIENT_ENV_FILE" REPORT_INTERVAL "300")"
+default_action_poll_interval="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ACTION_POLL_INTERVAL "10")"
 default_runtimes="$(load_non_empty_or_default "$CLIENT_ENV_FILE" CONTAINER_RUNTIMES "auto")"
 default_docker_monitor_mode="$(load_non_empty_or_default "$CLIENT_ENV_FILE" DOCKER_MONITOR_MODE "notice")"
 default_monitored_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" MONITORED_IMAGE_PATTERNS "*")"
@@ -164,6 +165,7 @@ panel_detection_enabled="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY
 default_allowed_panel_domains="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_ALLOWED_PANEL_DOMAINS "")"
 panel_process_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_PANEL_PROCESS_PATTERNS "xboard-node,xrayr,v2bx,soga,sspanel-uim-node")"
 panel_config_paths="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_PANEL_CONFIG_PATHS "/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml")"
+panel_allowlist_file="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_PANEL_ALLOWLIST_FILE "/opt/narwhal-monitor/panel-allowlist.json")"
 
 server_url="$(ask_with_default "Server URL (e.g. https://server.example.com or https://1.2.3.4)" "$default_server_url")"
 secret="$(ask_with_default "Shared secret" "$default_secret")"
@@ -196,6 +198,7 @@ SHARED_SECRET=$secret
 SERVER_TLS_CA_FILE=$tls_ca_file
 HOST_ID=$host_id
 REPORT_INTERVAL=$interval
+ACTION_POLL_INTERVAL=$default_action_poll_interval
 WATCH_DISK_FILE=/xfs_disk.img
 CONTAINER_RUNTIMES=$runtimes
 DOCKER_MONITOR_MODE=$docker_monitor_mode
@@ -230,6 +233,7 @@ ALERT_AUTH_FAILURES_PER_IP=$auth_failures_per_ip
 SECURITY_SUSPICIOUS_PROCESS_PATTERNS=$suspicious_process_patterns
 SECURITY_PANEL_PAIRING_DETECTION_ENABLED=$panel_detection_enabled
 SECURITY_ALLOWED_PANEL_DOMAINS=$allowed_panel_domains
+SECURITY_PANEL_ALLOWLIST_FILE=$panel_allowlist_file
 SECURITY_PANEL_PROCESS_PATTERNS=$panel_process_patterns
 SECURITY_PANEL_CONFIG_PATHS=$panel_config_paths
 ENV
@@ -238,6 +242,7 @@ cat >"$CLIENT_INSTALL_ENV_FILE" <<ENV
 RUNTIME=host-agent
 AGENT_DIR=$CLIENT_APP_DIR
 ENV
+chmod 0600 "$CLIENT_ENV_FILE" "$CLIENT_INSTALL_ENV_FILE"
 
 # 为兼容旧版本，先尝试删除原容器化 client。
 podman rm -f narwhal-monitor-client >/dev/null 2>&1 || true
@@ -275,6 +280,7 @@ EOF_SERVICE
 systemctl daemon-reload
 systemctl enable narwhal-monitor-client.service >/dev/null
 systemctl restart narwhal-monitor-client.service
+bash "$ROOT_DIR/scripts/setup-auto-update.sh" client "$ROOT_DIR"
 
 cat <<EOF_SUM
 
@@ -284,7 +290,7 @@ Runtime: host agent (systemd)
 Service Name: narwhal-monitor-client.service
 Server URL: $server_url
 Server TLS CA: ${tls_ca_file:-system trust}
-Shared Secret: $secret
+Shared Secret: $(if [[ "$MODE" == "install" ]]; then echo "$secret"; else echo "preserved (see $CLIENT_ENV_FILE)"; fi)
 Host ID: $host_id
 Report Interval: $interval s
 Watch Disk File: /xfs_disk.img
@@ -301,5 +307,6 @@ Env File: $CLIENT_ENV_FILE
 Install Config: $CLIENT_INSTALL_ENV_FILE
 Agent Directory: $CLIENT_APP_DIR
 Venv Directory: $CLIENT_VENV_DIR
+Automatic Updates: enabled (origin/main every 15 minutes)
 ==================================
 EOF_SUM

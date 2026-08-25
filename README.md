@@ -5,6 +5,7 @@
 - **Server 主控端**：汇总多机容器状态、网络状态与预警，提供 Web 页面。
 - **Client 宿主机 Agent**：以 systemd 服务方式运行在宿主机，按固定间隔采集数据并上报。
 - **通信安全**：`HMAC-SHA256` 共享密钥签名鉴权。
+- **面板登录保护**：Server 安装时随机生成 Web 用户名和密码，使用 HTTP Basic Authentication 保护页面及管理 API。
 - **部署方式**：Server 容器化 + Client 宿主机 Agent，支持一键安装与一键更新。
 - **多运行时发现**：默认 `auto` 自动发现全部已安装运行时，也可显式指定组合。
 
@@ -15,6 +16,8 @@
 - **节点侧安全检测**：针对 DDoS、CC、扫描、异常出站、可疑进程、危险容器配置和机场面板对接进行检测与预警。
 - **NAT 场景识别**：不依赖 80/443 等固定端口，结合全部监听端口、运行时端口映射、进程、配置与面板域名判断。
 - **一键安装与更新**：`install.sh` 支持安装、更新和卸载；更新会复用 `/opt/narwhal-monitor/*.env` 配置并重建或重启服务。
+- **告警快速处理**：机场面板对接告警可在页面中选择“快速清理”或“放行”；只对 Podman/Incus 执行动作，Docker 始终仅提醒。
+- **自动更新**：Server 与 Client 默认每 15 分钟检查 GitHub `main`，只进行安全的 fast-forward 更新并记录日志。
 - **Server HTTPS 自动化**：支持自动拉起 Caddy 反向代理：
   - 域名场景：自动申请公网证书（ACME HTTP-01）。
   - Cloudflare 域名场景：支持 DNS Challenge（可橙云），自动签发并续期公网证书。
@@ -55,7 +58,7 @@ sudo bash scripts/install.sh
 1. 操作选择 `install`。
 2. 目标选择 `server`；同机安装两端时选择 `both`。
 3. “是否删除 Server 已有全部采集数据”首次安装可保持默认 `no`；已有数据时选择 `yes` 会清空数据库。
-4. 记录输入的共享密钥、访问地址和端口。镜像来源可选 `local` 本地构建，或 `github` 拉取镜像；拉取失败时会回退到本地构建。
+4. 记录共享密钥、访问地址和端口，以及安装摘要中随机生成的 `Dashboard Username` / `Dashboard Password`。镜像来源可选 `local` 本地构建，或 `github` 拉取镜像；拉取失败时会回退到本地构建。
 5. 按需配置 Caddy HTTPS 与告警 Webhook。公网部署建议启用 HTTPS。
 
 安装每台 Client 时依次选择：
@@ -81,6 +84,12 @@ sudo journalctl -u narwhal-monitor-client -n 100 --no-pager
 
 未启用 TLS 时，Server 监听安装时指定的 HTTP Backend Port。启用 Caddy 后，对外只使用配置的 HTTPS 地址，Backend Port 绑定到 `127.0.0.1` 供 Caddy 本机反代。Client 日志持续出现 `reported ... containers` 表示上报成功。
 
+浏览器首次打开 Server 会弹出登录框。随机凭据只在首次安装摘要中显示，并保存在权限为 `0600` 的 Server 环境文件中；忘记时可在 Server 主机查看：
+
+```bash
+sudo awk -F= '$1=="DASHBOARD_USERNAME" || $1=="DASHBOARD_PASSWORD" {print $1"="substr($0,index($0,"=")+1)}' /opt/narwhal-monitor/server.env
+```
+
 ### 更新现有部署
 
 在之前克隆的仓库目录执行；如果首次使用的是其他目录，请替换下面的 `cd` 路径：
@@ -105,6 +114,36 @@ sudo env SKIP_CLEANUP_ON_UPDATE=1 bash scripts/install.sh
 也可以再次执行引导脚本，它会先更新 `/opt/Narwhal-Cloud-podman-watcher`，再打开相同的安装/更新菜单。
 
 更新完成后，用首次部署后的检查命令确认 Server 与 Client 正常运行。若 `git pull --ff-only` 报错，请先处理仓库中的本地修改或分支分叉，不要使用会覆盖配置或代码的强制重置命令。
+
+### 自动更新
+
+首次安装或手动更新后，安装器会为对应端启用 systemd timer：
+
+- `narwhal-monitor-server-update.timer`
+- `narwhal-monitor-client-update.timer`
+
+Timer 每 15 分钟比较 GitHub `origin/main` 与已部署提交。自动更新具有以下保护：
+
+- 仓库存在已跟踪的本地修改、分支分叉或不能 fast-forward 时拒绝更新，不会强制覆盖。
+- Server 使用 GHCR 镜像时，会核对镜像的提交 revision；新提交对应的多架构镜像未构建完成时保留现有容器，稍后重试。
+- 更新成功才写入部署版本；失败会保留当前服务，并在下一周期重试。
+- 原有共享密钥、Dashboard 登录凭据、TLS 配置、数据库、Client CA 和节点域名白名单均保留。
+
+查看自动更新状态和审计日志：
+
+```bash
+sudo systemctl list-timers 'narwhal-monitor-*-update.timer'
+sudo journalctl -u narwhal-monitor-server-update.service -n 100 --no-pager
+sudo journalctl -u narwhal-monitor-client-update.service -n 100 --no-pager
+sudo tail -n 100 /opt/narwhal-monitor/server-auto-update.log
+sudo tail -n 100 /opt/narwhal-monitor/client-auto-update.log
+```
+
+如需暂停某一端自动更新，将对应配置中的 `AUTO_UPDATE_ENABLED=true` 改为 `false`：
+
+```bash
+sudo sed -i 's/^AUTO_UPDATE_ENABLED=.*/AUTO_UPDATE_ENABLED=false/' /opt/narwhal-monitor/client-auto-update.env
+```
 
 ### 卸载
 
@@ -164,6 +203,9 @@ sudo bash scripts/install-client.sh update
 | Client 安装参数 | `/opt/narwhal-monitor/client-install.env` |
 | Client Agent 与虚拟环境 | `/opt/narwhal-monitor/client-agent` |
 | Client systemd 单元 | `/etc/systemd/system/narwhal-monitor-client.service` |
+| 节点动态面板域名白名单 | `/opt/narwhal-monitor/panel-allowlist.json` |
+| 自动更新配置/版本/日志 | `/opt/narwhal-monitor/{server,client}-auto-update.{env,version,log}` |
+| 自动更新 systemd timer | `/etc/systemd/system/narwhal-monitor-{server,client}-update.timer` |
 | Caddy 配置与证书数据 | `/opt/narwhal-monitor/caddy` |
 
 ### 首次安装交互参数
@@ -249,8 +291,10 @@ SECURITY_WEB_SCAN_PATTERNS=.env,.git,wp-login,wp-admin,phpmyadmin,actuator,serve
 SECURITY_SUSPICIOUS_PROCESS_PATTERNS=xmrig,kinsing,kdevtmpfsi,watchbog,cryptonight,minerd,pwnrig,teamtnt,stratum+tcp,stratum+ssl,/dev/tcp/,nc -e,ncat -e,socat exec:,mkfifo /tmp
 SECURITY_PANEL_PAIRING_DETECTION_ENABLED=true
 SECURITY_ALLOWED_PANEL_DOMAINS=
+SECURITY_PANEL_ALLOWLIST_FILE=/opt/narwhal-monitor/panel-allowlist.json
 SECURITY_PANEL_PROCESS_PATTERNS=xboard-node,xrayr,v2bx,soga,sspanel-uim-node
 SECURITY_PANEL_CONFIG_PATHS=/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml
+ACTION_POLL_INTERVAL=10
 ALERT_WEB_SCAN_REQUESTS=10
 ALERT_AUTH_FAILURES_PER_IP=20
 ```
@@ -258,6 +302,17 @@ ALERT_AUTH_FAILURES_PER_IP=20
 Agent 会同时读取宿主机 `SECURITY_ACCESS_LOG_PATHS`，并通过对应的 Podman/Docker/Incus 运行时进入每个容器读取 `SECURITY_CONTAINER_ACCESS_LOG_PATHS`。因此面板或反代日志既可以位于宿主机，也可以只存在于容器内部；文件不存在的容器会自动跳过。也可以把容器日志只读挂载到宿主机后，仅保留宿主机路径。日志不可读时网络层检测仍正常运行，但该容器不会产生 HTTP/CC 日志告警。
 
 `SECURITY_ALLOWED_PANEL_DOMAINS` 是允许对接的面板域名白名单，支持父域匹配，例如配置 `example.com` 会允许 `panel.example.com`，但不会允许 `example.com.evil.test`。默认留空表示没有允许的第三方面板；发现明确面板域名时产生 critical 告警，只发现节点程序或配置特征但无法提取域名时产生 warning。检测过程不会把配置文件正文、API Key 或 Token 写入上报数据。
+
+### Critical 机场对接告警的处理
+
+活动的 `unauthorized_panel_pairing` 告警在总览页提供两个按钮：
+
+- **快速清理**：Server 把经过 HMAC 签名的定向动作发送给对应节点。Agent 不停止或删除容器，只在目标 Podman/Incus 容器内部终止本次检测命中的机场节点进程，停用并删除同名 systemd/OpenRC 服务定义，并删除本次检测到且同时属于 `SECURITY_PANEL_CONFIG_PATHS` 的配置文件。Agent 会再次校验容器、运行时、进程特征和配置路径，不接受任意 Shell 或任意文件路径。
+- **放行**：把告警中提取到的域名写入该节点的 `SECURITY_PANEL_ALLOWLIST_FILE`；下一次安全采样后告警自动恢复。该文件以 `0600` 权限原子写入，更新 Client 时保留。
+
+按钮提交、节点领取和执行结果记录在 Server 的 `security_actions` 审计表中，页面会显示“等待节点 / 节点处理中 / 已完成 / 失败”及结果。动作响应由共享密钥签名校验，即使使用 internal CA，也不会接受被篡改的动作。Docker 告警没有处置按钮，仍只提醒。
+
+> “快速清理”会删除容器内对应配置与服务定义，属于不可逆操作，页面提交前会列出目标并要求二次确认。它不会删除程序二进制，也不会停止 Incus/Podman 容器。
 
 机场面板/节点识别**不假设 80、443 或任何固定端口**。Agent 会枚举容器网络命名空间中的全部 TCP 监听端口，并展示 Podman publish 以及 Incus proxy device 中可见的外部端口到内部端口映射；公网 NAT 端口与容器端口可以完全不同。由宿主机自定义 nftables/iptables、上游路由器或云厂商实现且没有运行时元数据的 DNAT 无法可靠归属到具体容器，此时仍通过进程、配置文件、环境变量和面板域名判断是否存在机场对接。
 Agent 启动时会把现有日志位置记为基线，只统计之后追加的新请求，避免把历史日志误判为当前攻击。
@@ -268,6 +323,8 @@ Server 的 `/opt/narwhal-monitor/server.env` 可配置：
 ```dotenv
 ALERT_WEBHOOK_URL=https://example.com/your-webhook
 ALERT_WEBHOOK_MIN_SEVERITY=warning
+DASHBOARD_USERNAME=安装时随机生成
+DASHBOARD_PASSWORD=安装时随机生成
 ```
 
 Webhook 仅在告警首次出现、级别升级或恢复后再次出现时发送，正文格式为：
@@ -279,12 +336,15 @@ Webhook 仅在告警首次出现、级别升级或恢复后再次出现时发送
 活动告警可在总览页面查看，也可查询：
 
 ```bash
-curl -s http://127.0.0.1:8080/api/v1/security/alerts | jq
-curl -s 'http://127.0.0.1:8080/api/v1/security/alerts?active_only=false&limit=200' | jq
-curl -s http://127.0.0.1:8080/api/v1/security/status | jq
+dashboard_user="$(sudo awk -F= '$1=="DASHBOARD_USERNAME"{print substr($0,index($0,"=")+1);exit}' /opt/narwhal-monitor/server.env)"
+dashboard_password="$(sudo awk -F= '$1=="DASHBOARD_PASSWORD"{print substr($0,index($0,"=")+1);exit}' /opt/narwhal-monitor/server.env)"
+curl -su "$dashboard_user:$dashboard_password" http://127.0.0.1:8080/api/v1/security/alerts | jq
+curl -su "$dashboard_user:$dashboard_password" 'http://127.0.0.1:8080/api/v1/security/alerts?active_only=false&limit=200' | jq
+curl -su "$dashboard_user:$dashboard_password" http://127.0.0.1:8080/api/v1/security/status | jq
+curl -su "$dashboard_user:$dashboard_password" http://127.0.0.1:8080/api/v1/security/actions | jq
 ```
 
-> 阈值必须按机器带宽、正常高峰 RPS 和业务连接模型校准。配置风险仅告警，不会自动修改 Incus/Podman 配置或封禁流量。扫描检测基于内核累计计数器与采样时仍存在的 socket，是轻量级异常检测；如果需要逐次 `execve/connect/open` 事件、反弹 Shell、落地新二进制和容器逃逸检测，应在节点额外部署 Falco/eBPF 运行时安全组件。“滥用”表示行为异常线索，最终定性仍需结合供应商投诉、认证日志和业务审计。
+> 阈值必须按机器带宽、正常高峰 RPS 和业务连接模型校准。除管理员在页面二次确认的机场对接“快速清理”外，其余配置风险只告警，不会自动修改 Incus/Podman 配置或封禁流量。扫描检测基于内核累计计数器与采样时仍存在的 socket，是轻量级异常检测；如果需要逐次 `execve/connect/open` 事件、反弹 Shell、落地新二进制和容器逃逸检测，应在节点额外部署 Falco/eBPF 运行时安全组件。“滥用”表示行为异常线索，最终定性仍需结合供应商投诉、认证日志和业务审计。
 
 ## HTTPS 配置指引
 

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import hmac
 import importlib.util
@@ -154,6 +155,76 @@ class ServerRuntimeTests(unittest.TestCase):
         body = json.loads(response.body)
         self.assertEqual(body["active_count"], 1)
         self.assertEqual(body["items"][0]["type"], "port_scan")
+
+    def test_dashboard_basic_auth_validates_generated_credentials(self):
+        original_user = server.DASHBOARD_USERNAME
+        original_password = server.DASHBOARD_PASSWORD
+        try:
+            server.DASHBOARD_USERNAME = "narwhal-test"
+            server.DASHBOARD_PASSWORD = "random-password"
+            token = base64.b64encode(b"narwhal-test:random-password").decode()
+            self.assertEqual(
+                server.dashboard_user_from_authorization(f"Basic {token}"), "narwhal-test"
+            )
+            self.assertIsNone(server.dashboard_user_from_authorization("Basic invalid"))
+            wrong = base64.b64encode(b"narwhal-test:wrong").decode()
+            self.assertIsNone(server.dashboard_user_from_authorization(f"Basic {wrong}"))
+        finally:
+            server.DASHBOARD_USERNAME = original_user
+            server.DASHBOARD_PASSWORD = original_password
+
+    def test_panel_action_queue_and_agent_poll_are_signed(self):
+        now = int(time.time())
+        alert = {
+            "type": "unauthorized_panel_pairing",
+            "severity": "critical",
+            "title": "panel",
+            "message": "unapproved panel",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node1",
+            "unapproved_domains": ["panel.example.net"],
+            "process_patterns": ["v2bx"],
+            "config_files": ["/etc/V2bX/config.json"],
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", now, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class DashboardRequest:
+            state = State()
+
+            async def json(self):
+                return {"action": "remediate"}
+
+        queued = asyncio.run(server.queue_security_action(alert_id, DashboardRequest()))
+        queued_body = json.loads(queued.body)
+        self.assertTrue(queued_body["queued"])
+        self.assertEqual(queued_body["action"]["action_type"], "remediate_panel_pairing")
+
+        poll_body = json.dumps({"host_id": "host1"}, separators=(",", ":")).encode()
+
+        class PollRequest:
+            async def body(self):
+                return poll_body
+
+        timestamp = str(now)
+        signature = hmac.new(
+            server.SHARED_SECRET.encode(), poll_body + timestamp.encode(), hashlib.sha256
+        ).hexdigest()
+        response = asyncio.run(server.poll_security_actions(PollRequest(), timestamp, signature))
+        response_body = json.loads(response.body)
+        self.assertEqual(len(response_body["actions"]), 1)
+        expected = hmac.new(
+            server.SHARED_SECRET.encode(), response.body + timestamp.encode(), hashlib.sha256
+        ).hexdigest()
+        self.assertEqual(response.headers["x-narwhal-response-signature"], expected)
+        self.assertNotIn("stop_container", response.body.decode())
 
     def test_latest_keeps_same_incus_name_from_different_projects_separate(self):
         self._insert("incus", 10, "default")

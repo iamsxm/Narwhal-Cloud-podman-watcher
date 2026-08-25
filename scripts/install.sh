@@ -214,11 +214,21 @@ uninstall_narwhal_related() {
   fi
 
   remove_systemd_service_if_exists "narwhal-monitor-client.service"
+  remove_systemd_service_if_exists "narwhal-monitor-client-update.timer"
+  remove_systemd_service_if_exists "narwhal-monitor-server-update.timer"
+  remove_systemd_service_if_exists "narwhal-monitor-client-update.service"
+  remove_systemd_service_if_exists "narwhal-monitor-server-update.service"
   if [[ -f "/etc/systemd/system/narwhal-monitor-client.service" ]]; then
     echo "[INFO] 删除 systemd 服务文件: /etc/systemd/system/narwhal-monitor-client.service"
     rm -f /etc/systemd/system/narwhal-monitor-client.service
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
+  rm -f \
+    /etc/systemd/system/narwhal-monitor-client-update.timer \
+    /etc/systemd/system/narwhal-monitor-server-update.timer \
+    /etc/systemd/system/narwhal-monitor-client-update.service \
+    /etc/systemd/system/narwhal-monitor-server-update.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
 
   if [[ -d "$INSTALL_BASE_DIR" ]]; then
     echo "[INFO] 删除配置与数据目录: $INSTALL_BASE_DIR"

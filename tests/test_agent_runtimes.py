@@ -234,6 +234,44 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertTrue(agent._panel_domain_allowed("api.trusted.example.com", ["trusted.example.com"]))
         self.assertFalse(agent._panel_domain_allowed("trusted.example.com.evil.test", ["trusted.example.com"]))
 
+    def test_persistent_panel_allowlist_merges_exact_domains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = str(Path(tmp) / "allowlist.json")
+            env = {
+                "SECURITY_ALLOWED_PANEL_DOMAINS": "trusted.example.com",
+                "SECURITY_PANEL_ALLOWLIST_FILE": policy,
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                merged = agent.add_allowed_panel_domains(["panel.example.net"])
+                self.assertEqual(merged, ["panel.example.net", "trusted.example.com"])
+                self.assertEqual(agent._configured_allowed_panel_domains(), merged)
+                if os.name != "nt":
+                    self.assertEqual(Path(policy).stat().st_mode & 0o777, 0o600)
+
+    def test_panel_remediation_executes_inside_container_without_stopping_container(self):
+        action = {
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node1",
+            "params": {
+                "process_patterns": ["v2bx"],
+                "config_files": ["/etc/V2bX/config.json"],
+            },
+        }
+        env = {
+            "SECURITY_PANEL_PROCESS_PATTERNS": "v2bx,xrayr",
+            "SECURITY_PANEL_CONFIG_PATHS": "/etc/V2bX/config.json,/etc/XrayR/config.yml",
+        }
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            agent, "get_runtime_bins", return_value={"incus": "incus"}
+        ), mock.patch.object(agent, "_run_action_command", return_value=(True, "cleaned")) as runner:
+            ok, _ = agent.remediate_panel_pairing(action)
+        self.assertTrue(ok)
+        command = runner.call_args.args[0]
+        self.assertEqual(command[:5], ["incus", "--project", "default", "exec", "node1"])
+        self.assertIn("/etc/V2bX/config.json", command[-1])
+        self.assertNotIn(" stop node1", " ".join(command))
+
     def test_parses_caddy_and_nginx_access_logs(self):
         caddy = agent._parse_access_log_line(
             json.dumps(

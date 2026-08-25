@@ -40,10 +40,17 @@ if [[ -z "$REPO_DIR" || ! -d "$REPO_DIR/.git" ]]; then
   exit 1
 fi
 
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  log "another update is already running"
-  exit 0
+if [[ "${NARWHAL_UPDATE_LOCKED:-0}" != "1" ]]; then
+  set +e
+  flock --exclusive --nonblock --close --conflict-exit-code 75 "$LOCK_FILE" \
+    env NARWHAL_UPDATE_LOCKED=1 bash "$0" "$SIDE"
+  lock_result=$?
+  set -e
+  if [[ "$lock_result" -eq 75 ]]; then
+    log "another update is already running"
+    exit 0
+  fi
+  exit "$lock_result"
 fi
 
 remote_commit="$(git -C "$REPO_DIR" ls-remote origin "refs/heads/$BRANCH" | awk 'NR==1{print $1}')"

@@ -435,6 +435,10 @@ class SecurityTelemetryTests(unittest.TestCase):
             agent._decode_proc_addr("0000000000000000FFFF000006005B0A", is_v6=True),
             "10.91.0.6",
         )
+        self.assertEqual(
+            agent._parse_socket_endpoint("[::ffff:113.118.70.81]:31022"),
+            ("113.118.70.81", 31022),
+        )
 
     def test_audits_podman_and_incus_isolation_risks(self):
         oci = agent._oci_security_risks(

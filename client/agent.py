@@ -765,6 +765,14 @@ def _parse_socket_endpoint(endpoint: str) -> Tuple[str, int]:
         port = int(port_text)
     except ValueError:
         port = 0
+    try:
+        parsed_host = ipaddress.ip_address(host)
+        if isinstance(parsed_host, ipaddress.IPv6Address) and parsed_host.ipv4_mapped:
+            host = str(parsed_host.ipv4_mapped)
+        else:
+            host = str(parsed_host)
+    except ValueError:
+        pass
     return host, port
 
 

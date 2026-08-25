@@ -426,6 +426,46 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertEqual(statuses, ["suppressed", "active"])
         self.assertEqual([item["message"] for item in notifications], ["panel two"])
 
+    def test_new_panel_alert_row_inherits_latest_container_remediation_status(self):
+        first = {
+            "type": "unauthorized_panel_pairing",
+            "severity": "critical",
+            "title": "panel",
+            "message": "first domain",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node1",
+            "unapproved_domains": ["one.example.net"],
+            "process_patterns": ["v2bx"],
+        }
+        second = dict(first, message="second domain", unapproved_domains=["two.example.net"])
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [first])
+        first_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.execute(
+            """
+            INSERT INTO security_actions(
+                alert_id,host_id,runtime,project,container_name,action_type,params_json,
+                status,requested_by,result_message,created_at,updated_at
+            ) VALUES(?,?,?,?,?,'remediate_panel_pairing','{}','failed','operator',?,101,101)
+            """,
+            (
+                first_id,
+                "host1",
+                "incus",
+                "default",
+                "node1",
+                "no matching process, service or config was removed",
+            ),
+        )
+        server.process_security_alerts(conn, "host1", 102, [second])
+        conn.commit()
+        conn.close()
+        items = json.loads(server.security_alerts().body)["items"]
+        current = next(item for item in items if item["message"] == "second domain")
+        self.assertEqual(current["latest_action"]["status"], "failed")
+        self.assertEqual(current["latest_action"]["alert_id"], first_id)
+
     def test_deny_extracts_safe_evidence_from_legacy_alert_message(self):
         alert = {
             "type": "unauthorized_panel_pairing",

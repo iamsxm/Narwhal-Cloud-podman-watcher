@@ -772,6 +772,31 @@ def _queue_security_action_row(
     return row, True
 
 
+def _latest_action_for_alert(
+    conn: sqlite3.Connection, alert: sqlite3.Row
+) -> sqlite3.Row | None:
+    latest = conn.execute(
+        "SELECT * FROM security_actions WHERE alert_id=? ORDER BY id DESC LIMIT 1",
+        (alert["id"],),
+    ).fetchone()
+    if latest is not None or alert["alert_type"] != "unauthorized_panel_pairing":
+        return latest
+    return conn.execute(
+        """
+        SELECT * FROM security_actions
+        WHERE host_id=? AND runtime=? AND project=? AND container_name=?
+          AND action_type IN ('remediate_panel_pairing','allow_panel_domains')
+        ORDER BY id DESC LIMIT 1
+        """,
+        (
+            alert["host_id"],
+            alert["runtime"],
+            alert["project"],
+            alert["container_name"],
+        ),
+    ).fetchone()
+
+
 @app.post("/api/v1/security/alerts/{alert_id}/actions")
 async def queue_security_action(alert_id: int, request: Request) -> JSONResponse:
     try:
@@ -1066,9 +1091,7 @@ def security_alerts(active_only: bool = True, limit: int = 200) -> JSONResponse:
         ).fetchall()
     items = []
     for row in rows:
-        latest_action = conn.execute(
-            "SELECT * FROM security_actions WHERE alert_id=? ORDER BY id DESC LIMIT 1", (row["id"],)
-        ).fetchone()
+        latest_action = _latest_action_for_alert(conn, row)
         items.append(
             {
                 "id": int(row["id"]),

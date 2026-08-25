@@ -63,7 +63,7 @@ ask_with_default() {
   local prompt="$1"
   local current="$2"
   local answer=""
-  if [[ "$MODE" == "update" && -n "$current" ]]; then
+  if [[ "$MODE" == "update" ]]; then
     echo "$current"
     return
   fi

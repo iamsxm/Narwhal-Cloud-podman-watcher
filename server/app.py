@@ -1607,14 +1607,16 @@ async function loadAlerts(){
   const statusBody=document.querySelector('#security-status tbody'); statusBody.innerHTML='';
   for(const item of (statusData.items||[])){
     const access=item.access_log||{};
-    const logState=!access.enabled?'未配置':(Number(access.readable_files||0)>0?'正常':'不可读');
+    const source=String(access.source||'');
+    const containerLogs=Number(access.container_readable_files||0);
+    const logState=!access.enabled?'未配置':(source==='host'?'宿主机正常':(source==='container'?`容器日志正常 (${containerLogs})`:(source==='permission_denied'?'权限不足':(source==='not_found'?'未发现日志文件':'待采集'))));
     const tr=document.createElement('tr');
     tr.innerHTML=`<td>${escapeHtml(item.host_id)}</td>`+
       `<td>${formatSmallNumber(bpsToMbps(item.total_rx_bps),2)}</td>`+
       `<td>${formatSmallNumber(item.total_rx_pps,1)}</td><td>${Number(item.syn_recv_count||0)}</td>`+
       `<td>${formatSmallNumber(access.requests_per_second,1)}</td>`+
       `<td>${formatSmallNumber(access.top_ip_requests_per_second,1)} ${escapeHtml(access.top_ip||'')}</td>`+
-      `<td class='${logState==='正常'?'ok':'bad'}'>${logState}</td><td>${escapeHtml(item.timestamp_utc8)}</td>`;
+      `<td class='${source==='host'||source==='container'?'ok':(source==='not_found'?'':'bad')}'>${escapeHtml(logState)}</td><td>${escapeHtml(item.timestamp_utc8)}</td>`;
     statusBody.appendChild(tr);
   }
 }
@@ -1684,8 +1686,8 @@ async function load(){
       `<span class='host-summary'>${[...runtimeCounts.entries()].map(([name,count])=>`<span class='pill'>${escapeHtml(name)} ${count}</span>`).join('')}`+
       `${versionBadge(latest.agent_version,d.server_version)}`+
       `<span class='pill ${offlineCount?'pill-bad':'pill-ok'}'>${offlineCount?`${offlineCount} 个离线`:'全部在线'}</span>`+
-      `<span class='pill ${latest.container_network_ok_v4?'pill-ok':'pill-bad'}'>IPv4 ${latest.container_network_ok_v4?'正常':'异常'}</span>`+
-      `<span class='pill ${latest.container_network_ok_v6?'pill-ok':'pill-warn'}'>IPv6 ${latest.container_network_ok_v6?'正常':'不可用'}</span></span>`;
+      `<span class='pill ${latest.container_network_ok_v4?'pill-ok':'pill-bad'}'>主机 IPv4 ${latest.container_network_ok_v4?'正常':'异常'}</span>`+
+      `<span class='pill ${latest.container_network_ok_v6?'pill-ok':'pill-warn'}'>主机 IPv6 ${latest.container_network_ok_v6?'正常':'不可用'}</span></span>`;
     const panel=document.createElement('div');
     panel.id=panelId;
     panel.className='host-panel';

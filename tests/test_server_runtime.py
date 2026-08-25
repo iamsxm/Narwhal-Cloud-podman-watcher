@@ -224,6 +224,8 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("/container-detail?", html)
         self.assertIn("versionBadge(latest.agent_version,d.server_version)", html)
         self.assertIn("容器安全与运行状态中心", html)
+        self.assertIn("容器日志正常", html)
+        self.assertIn("主机 IPv4", html)
         self.assertNotIn("<table id='t'", html)
 
     def test_container_detail_is_a_dedicated_internal_metrics_page(self):

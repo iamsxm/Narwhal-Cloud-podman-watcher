@@ -44,6 +44,15 @@ class RuntimeDiscoveryTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"SERVER_TLS_CA_FILE": ca_file.name}, clear=True):
                 self.assertEqual(agent.server_tls_verify(), ca_file.name)
 
+    def test_network_health_uses_host_routes_without_container_curl(self):
+        def family_available(family):
+            return family == agent.socket.AF_INET
+
+        with mock.patch.object(
+            agent, "_host_ip_family_available", side_effect=family_available
+        ):
+            self.assertEqual(agent.network_health([]), (True, False))
+
     def test_lists_oci_and_incus_containers_together(self):
         incus_payload = json.dumps(
             [
@@ -363,6 +372,8 @@ class SecurityTelemetryTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
             agent, "get_runtime_bins", return_value={"incus": "incus"}
+        ), mock.patch.object(
+            agent, "_incus_host_namespace_kill", return_value=(0, 0, 0, "")
         ), mock.patch.object(agent, "_run_action_command", return_value=(True, "cleaned")) as runner:
             ok, _ = agent.remediate_panel_pairing(action)
         self.assertTrue(ok)
@@ -382,6 +393,8 @@ class SecurityTelemetryTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"SECURITY_PANEL_PROCESS_PATTERNS": "v2bx"}, clear=False
         ), mock.patch.object(agent, "get_runtime_bins", return_value={"incus": "incus"}), mock.patch.object(
+            agent, "_incus_host_namespace_kill", return_value=(1, 0, 0, "host matched but not killed")
+        ), mock.patch.object(
             agent,
             "_run_action_command",
             return_value=(False, "killed_processes=0 removed_services=0 removed_configs=0 cleanup_errors=0"),
@@ -389,6 +402,32 @@ class SecurityTelemetryTests(unittest.TestCase):
             ok, message = agent.remediate_panel_pairing(action)
         self.assertFalse(ok)
         self.assertIn("killed_processes=0", message)
+
+    def test_incus_remediation_falls_back_to_host_user_namespace(self):
+        action = {
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node1",
+            "params": {"process_patterns": ["v2bx"], "process_pids": [4321]},
+        }
+        results = [
+            (False, "killed_processes=0 removed_services=0 removed_configs=0 cleanup_errors=0"),
+            (True, "host_matched_processes=1 host_killed_processes=1 host_kill_errors=0"),
+        ]
+        with mock.patch.dict(
+            os.environ, {"SECURITY_PANEL_PROCESS_PATTERNS": "v2bx"}, clear=False
+        ), mock.patch.object(agent, "get_runtime_bins", return_value={"incus": "incus"}), mock.patch.object(
+            agent, "_incus_instance_pid", return_value=9876
+        ), mock.patch.object(agent.shutil, "which", return_value="/usr/bin/nsenter"), mock.patch.object(
+            agent, "_run_action_command", side_effect=results
+        ) as runner:
+            ok, message = agent.remediate_panel_pairing(action)
+
+        self.assertTrue(ok)
+        self.assertIn("killed_processes=1", message)
+        host_command = runner.call_args_list[1].args[0]
+        self.assertEqual(host_command[:5], ["nsenter", "-t", "9876", "-p", "-m"])
+        self.assertIn('"$candidate" = "$pattern"', host_command[-1])
 
     def test_confirmed_panel_domain_is_silently_auto_remediated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -505,6 +544,38 @@ class SecurityTelemetryTests(unittest.TestCase):
             self.assertEqual(first["requests"], 0)
             self.assertEqual(second["requests"], 1)
             self.assertEqual(second["status_4xx"], 1)
+
+    def test_access_log_reader_distinguishes_missing_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "missing-access.log")
+            with mock.patch.dict(
+                os.environ, {"SECURITY_ACCESS_LOG_PATHS": missing}, clear=False
+            ):
+                result = agent._collect_access_log_stats(10)
+            self.assertEqual(result["configured_files"], 1)
+            self.assertEqual(result["missing_files"], 1)
+            self.assertEqual(result["unreadable_files"], 0)
+
+    def test_host_telemetry_reports_container_log_source(self):
+        host_access = {
+            "enabled": True,
+            "configured_files": 2,
+            "readable_files": 0,
+            "missing_files": 2,
+            "unreadable_files": 0,
+        }
+        container = {
+            "name": "panel",
+            "runtime": "incus",
+            "security": {
+                "access_log": {"enabled": True, "readable_files": 1},
+                "panel_pairing": {},
+            },
+        }
+        with mock.patch.object(agent, "_collect_access_log_stats", return_value=host_access):
+            result = agent.collect_security_summary([container], 60)
+        self.assertEqual(result["access_log"]["source"], "container")
+        self.assertEqual(result["access_log"]["container_readable_files"], 1)
 
     def test_container_access_log_reader_scans_logs_inside_runtime(self):
         state = {"size": 100}

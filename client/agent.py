@@ -1051,7 +1051,10 @@ def _collect_access_log_stats(interval_seconds: float) -> Dict[str, object]:
     paths = [x.strip() for x in raw_paths.split(",") if x.strip()]
     stats: Dict[str, object] = {
         "enabled": bool(paths),
+        "configured_files": len(paths),
         "readable_files": 0,
+        "missing_files": 0,
+        "unreadable_files": 0,
         "requests": 0,
         "requests_per_second": 0.0,
         "unique_ips": 0,
@@ -1080,6 +1083,8 @@ def _collect_access_log_stats(interval_seconds: float) -> Dict[str, object]:
     status_5xx = 0
     parse_errors = 0
     readable_files = 0
+    missing_files = 0
+    unreadable_files = 0
     web_scan_patterns = [
         item.strip().lower()
         for item in os.getenv(
@@ -1112,7 +1117,11 @@ def _collect_access_log_stats(interval_seconds: float) -> Dict[str, object]:
                 offset = f.tell()
             _access_log_states[path] = {"inode": inode, "offset": offset}
             readable_files += 1
-        except Exception:
+        except FileNotFoundError:
+            missing_files += 1
+            continue
+        except (PermissionError, OSError):
+            unreadable_files += 1
             continue
         for line in lines[-20000:]:
             event = _parse_access_log_line(line)
@@ -1159,6 +1168,8 @@ def _collect_access_log_stats(interval_seconds: float) -> Dict[str, object]:
     stats.update(
         {
             "readable_files": readable_files,
+            "missing_files": missing_files,
+            "unreadable_files": unreadable_files,
             "requests": requests_count,
             "requests_per_second": requests_count / interval,
             "unique_ips": len(ip_counts),
@@ -1463,6 +1474,7 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
         "off",
     )
     alerts: List[Dict[str, object]] = []
+    container_access_readable_files = 0
 
     for container in containers:
         if container.get("runtime") == "docker" and container.get("monitor_mode") == "notice":
@@ -1765,6 +1777,7 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
             alerts.append(panel_alert)
         container_access = security.get("access_log")
         if isinstance(container_access, dict):
+            container_access_readable_files += int(container_access.get("readable_files") or 0)
             alerts.extend(_http_security_alerts(container_access, container))
 
     total_rx_bps = float(summary["total_rx_bps"])
@@ -1804,6 +1817,18 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
                 ddos_syn,
             )
         )
+
+    access["container_readable_files"] = container_access_readable_files
+    if int(access.get("readable_files") or 0) > 0:
+        access["source"] = "host"
+    elif container_access_readable_files > 0:
+        access["source"] = "container"
+    elif int(access.get("unreadable_files") or 0) > 0:
+        access["source"] = "permission_denied"
+    elif int(access.get("missing_files") or 0) > 0:
+        access["source"] = "not_found"
+    else:
+        access["source"] = "disabled"
 
     alerts.extend(_http_security_alerts(access))
 
@@ -2763,13 +2788,25 @@ def collect_disk_alert() -> Dict:
     return dict(result)
 
 
+def _host_ip_family_available(family: int) -> bool:
+    target = ("1.1.1.1", 53) if family == socket.AF_INET else ("2606:4700:4700::1111", 53)
+    try:
+        probe = socket.socket(family, socket.SOCK_DGRAM)
+        probe.settimeout(2)
+        probe.connect(target)
+        address = probe.getsockname()[0]
+        probe.close()
+        return bool(address) and address not in ("0.0.0.0", "::")
+    except OSError:
+        return False
+
+
 def network_health(containers: List[Dict[str, str]] | None = None) -> Tuple[bool, bool]:
     containers = containers if containers is not None else list_containers()
-    if not containers:
-        return False, False
-
-    v4_ok = False
-    v6_ok = False
+    v4_ok = _host_ip_family_available(socket.AF_INET)
+    v6_ok = _host_ip_family_available(socket.AF_INET6)
+    if not containers or (v4_ok and v6_ok):
+        return v4_ok, v6_ok
     for item in containers:
         name = item.get("name", "")
         if not name:
@@ -2906,7 +2943,7 @@ def _configured_panel_process_patterns() -> List[str]:
 def _configured_panel_config_paths() -> List[str]:
     raw = os.getenv(
         "SECURITY_PANEL_CONFIG_PATHS",
-        "/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml",
+        "/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/V2bX/config.json.bak,/usr/local/V2bX/config.json,/usr/local/V2bX/config.json.bak,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml",
     )
     return sorted(
         {
@@ -2917,6 +2954,58 @@ def _configured_panel_config_paths() -> List[str]:
     )
 
 
+def _incus_host_namespace_kill(
+    runtime_bin: str, container_name: str, project: str, patterns: List[str]
+) -> Tuple[int, int, int, str]:
+    """Kill exact allowlisted process identities with host user-namespace privileges.
+
+    Some unprivileged Incus/OpenRC containers expose UID 0 inside ``incus exec``
+    but deny signals to older processes that retain a different kernel uid map.
+    Host root enters only the target container PID/mount namespaces and rechecks
+    the exact process identity before signalling it.
+    """
+    init_pid = _incus_instance_pid(runtime_bin, container_name, project)
+    if init_pid <= 1 or not shutil.which("nsenter") or not patterns:
+        return 0, 0, 0, "host namespace fallback unavailable"
+    safe_patterns = " ".join(shlex.quote(item) for item in patterns)
+    script = (
+        "matched=0; killed=0; errors=0; "
+        f"for pattern in {safe_patterns}; do "
+        "for proc in /proc/[0-9]*; do pid=${proc##*/}; "
+        "[ \"$pid\" = 1 ] && continue; [ \"$pid\" = \"$$\" ] && continue; "
+        "state=$(awk '{print $3}' \"$proc/stat\" 2>/dev/null || true); [ \"$state\" = Z ] && continue; "
+        "comm=$(cat \"$proc/comm\" 2>/dev/null || true); "
+        "argv0=$(tr '\\000' '\\n' < \"$proc/cmdline\" 2>/dev/null | head -n 1); "
+        "exe=$(readlink \"$proc/exe\" 2>/dev/null || true); found=0; "
+        "for candidate in \"$comm\" \"${argv0##*/}\" \"${exe##*/}\"; do "
+        "candidate=$(printf '%s' \"$candidate\" | tr '[:upper:]' '[:lower:]'); "
+        "[ \"$candidate\" = \"$pattern\" ] && found=1; done; "
+        "[ \"$found\" -eq 1 ] || continue; matched=$((matched+1)); "
+        "if kill -TERM \"$pid\" 2>/dev/null; then killed=$((killed+1)); "
+        "sleep 1; [ -d \"$proc\" ] && kill -KILL \"$pid\" 2>/dev/null || true; "
+        "else errors=$((errors+1)); fi; done; done; "
+        "printf 'host_matched_processes=%s host_killed_processes=%s host_kill_errors=%s\\n' "
+        '"$matched" "$killed" "$errors"; [ "$errors" -eq 0 ]'
+    )
+    ok, output = _run_action_command(
+        ["nsenter", "-t", str(init_pid), "-p", "-m", "--", "sh", "-lc", script]
+    )
+    values = {
+        key: int(value)
+        for key, value in re.findall(
+            r"\b(host_matched_processes|host_killed_processes|host_kill_errors)=(\d+)\b",
+            output or "",
+        )
+    }
+    errors = values.get("host_kill_errors", 0)
+    if not ok and not values:
+        errors = 1
+    return (
+        values.get("host_matched_processes", 0),
+        values.get("host_killed_processes", 0),
+        errors,
+        output,
+    )
 def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
     runtime_kind = str(action.get("runtime") or "").lower()
     if runtime_kind not in ("podman", "incus"):
@@ -3025,6 +3114,28 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
         return False, f"runtime {runtime_kind} is unavailable"
     command = _runtime_exec_cmd(runtime_bin, container_name, "; ".join(script_parts), project)
     ok, output = _run_action_command(command)
+    counts = {
+        key: int(value)
+        for key, value in re.findall(
+            r"\b(killed_processes|removed_services|removed_configs|cleanup_errors)=(\d+)\b",
+            output or "",
+        )
+    }
+    if runtime_kind == "incus" and patterns:
+        _, host_killed, host_errors, host_output = _incus_host_namespace_kill(
+            runtime_bin, container_name, project, patterns
+        )
+        if host_killed or host_errors:
+            counts["killed_processes"] = counts.get("killed_processes", 0) + host_killed
+            counts["cleanup_errors"] = counts.get("cleanup_errors", 0) + host_errors
+            output = (
+                f"killed_processes={counts.get('killed_processes', 0)} "
+                f"removed_services={counts.get('removed_services', 0)} "
+                f"removed_configs={counts.get('removed_configs', 0)} "
+                f"cleanup_errors={counts.get('cleanup_errors', 0)}; {host_output}"
+            )
+            changes = sum(counts.get(key, 0) for key in ("killed_processes", "removed_services", "removed_configs"))
+            ok = counts.get("cleanup_errors", 0) == 0 and changes > 0
     return ok, output or ("remediation completed" if ok else "remediation command failed")
 
 

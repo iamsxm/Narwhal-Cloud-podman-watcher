@@ -6,6 +6,7 @@ CLIENT_ENV_FILE="/opt/narwhal-monitor/client.env"
 CLIENT_INSTALL_ENV_FILE="/opt/narwhal-monitor/client-install.env"
 CLIENT_APP_DIR="/opt/narwhal-monitor/client-agent"
 CLIENT_VENV_DIR="$CLIENT_APP_DIR/.venv"
+CLIENT_CA_FILE="/opt/narwhal-monitor/server-ca.crt"
 SYSTEMD_SERVICE_FILE="/etc/systemd/system/narwhal-monitor-client.service"
 MODE="${1:-install}"
 
@@ -125,6 +126,7 @@ ensure_client_venv() {
 
 default_server_url="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SERVER_URL "http://127.0.0.1:8080")"
 default_secret="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SHARED_SECRET "$(generate_secret)")"
+default_tls_ca_file="$(load_kv_from_file "$CLIENT_ENV_FILE" SERVER_TLS_CA_FILE || true)"
 default_host_id="$(load_non_empty_or_default "$CLIENT_ENV_FILE" HOST_ID "$(hostname)")"
 default_interval="$(load_non_empty_or_default "$CLIENT_ENV_FILE" REPORT_INTERVAL "300")"
 default_runtimes="$(load_non_empty_or_default "$CLIENT_ENV_FILE" CONTAINER_RUNTIMES "auto")"
@@ -178,9 +180,20 @@ container_access_log_paths="$(ask_with_default "Access log paths inside every co
 allowed_panel_domains="$(ask_with_default "Allowed airport panel domains (comma-separated; empty means none)" "$default_allowed_panel_domains")"
 
 mkdir -p /opt/narwhal-monitor
+tls_ca_output="${default_tls_ca_file:-$CLIENT_CA_FILE}"
+tls_ca_file=""
+if [[ "$server_url" == https://* || "$server_url" != *://* ]]; then
+  echo "[INFO] Validating Server TLS and bootstrapping an internal CA when required..."
+  tls_ca_file="$(printf '%s' "$secret" | python3 "$ROOT_DIR/scripts/bootstrap-client-ca.py" \
+    --server-url "$server_url" \
+    --secret-stdin \
+    --output "$tls_ca_output")"
+fi
+
 cat >"$CLIENT_ENV_FILE" <<ENV
 SERVER_URL=$server_url
 SHARED_SECRET=$secret
+SERVER_TLS_CA_FILE=$tls_ca_file
 HOST_ID=$host_id
 REPORT_INTERVAL=$interval
 WATCH_DISK_FILE=/xfs_disk.img
@@ -269,6 +282,7 @@ Mode: $MODE
 Runtime: host agent (systemd)
 Service Name: narwhal-monitor-client.service
 Server URL: $server_url
+Server TLS CA: ${tls_ca_file:-system trust}
 Shared Secret: $secret
 Host ID: $host_id
 Report Interval: $interval s

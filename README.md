@@ -18,9 +18,9 @@
 - **Server HTTPS 自动化**：支持自动拉起 Caddy 反向代理：
   - 域名场景：自动申请公网证书（ACME HTTP-01）。
   - Cloudflare 域名场景：支持 DNS Challenge（可橙云），自动签发并续期公网证书。
-  - IP 场景：自动签发内部证书（`tls internal`）。
+  - IP 场景：自动签发内部证书（`tls internal`），Client 使用共享密钥认证并自动获取、校验和保存公开根证书。
 
-> 注意：IP 场景下的内部证书不是公网 CA 证书，浏览器默认可能提示不受信任；如需“绿锁”建议使用域名。
+> 注意：IP 场景下的内部证书不是公网 CA 证书。Client 安装器会自动建立信任，但浏览器仍可能提示不受信任；如需浏览器直接显示“绿锁”，建议使用域名和公网证书。
 
 ## 部署、更新与卸载
 
@@ -61,10 +61,11 @@ sudo bash scripts/install.sh
 安装每台 Client 时依次选择：
 
 1. 操作选择 `install`，目标选择 `client`。
-2. `Server URL` 填写 Server 的完整地址，例如 `https://monitor.example.com` 或 `http://10.0.0.2:8080`。
+2. `Server URL` 填写 Server 安装摘要中的 `Client Server URL`，例如 `https://monitor.example.com` 或 `https://10.0.0.2`。启用 Caddy 时不要追加随机 Backend Port；HTTPS 默认使用 443。
 3. `Shared secret` 必须与 Server 完全一致；`Host ID` 必须在所有节点中唯一。
-4. 运行时建议保留 `auto`。Podman 与 Incus 默认完整监测；Docker 默认仅发现并提醒，不做深度扫描。
-5. `Allowed airport panel domains` 填写允许对接的面板域名，多个域名用英文逗号分隔；留空表示不允许任何外部面板域名。
+4. Client 会先使用系统 CA 验证 Server；如果是 IP/internal 模式，则通过 HMAC 认证接口获取公开根证书、验证响应签名并再次完成 TLS 校验。不会下载或传输 Caddy 根私钥。
+5. 运行时建议保留 `auto`。Podman 与 Incus 默认完整监测；Docker 默认仅发现并提醒，不做深度扫描。
+6. `Allowed airport panel domains` 填写允许对接的面板域名，多个域名用英文逗号分隔；留空表示不允许任何外部面板域名。
 
 首次部署后的检查命令：
 
@@ -78,7 +79,7 @@ sudo systemctl status narwhal-monitor-client --no-pager
 sudo journalctl -u narwhal-monitor-client -n 100 --no-pager
 ```
 
-Server 默认监听 `http://SERVER_IP:8080/`；启用 Caddy 后使用配置的 HTTPS 地址访问。Client 日志持续出现 `reported ... containers` 表示上报成功。
+未启用 TLS 时，Server 监听安装时指定的 HTTP Backend Port。启用 Caddy 后，对外只使用配置的 HTTPS 地址，Backend Port 绑定到 `127.0.0.1` 供 Caddy 本机反代。Client 日志持续出现 `reported ... containers` 表示上报成功。
 
 ### 更新现有部署
 
@@ -157,7 +158,9 @@ sudo bash scripts/install-client.sh update
 | Server 运行配置 | `/opt/narwhal-monitor/server.env` |
 | Server 安装参数 | `/opt/narwhal-monitor/server-install.env` |
 | Server SQLite 数据 | `/opt/narwhal-monitor/server-data/monitor.db` |
+| Server 导出的公开内部 CA | `/opt/narwhal-monitor/tls-ca/root.crt` |
 | Client 运行配置 | `/opt/narwhal-monitor/client.env` |
+| Client 自动获取的 Server CA | `/opt/narwhal-monitor/server-ca.crt` |
 | Client 安装参数 | `/opt/narwhal-monitor/client-install.env` |
 | Client Agent 与虚拟环境 | `/opt/narwhal-monitor/client-agent` |
 | Client systemd 单元 | `/etc/systemd/system/narwhal-monitor-client.service` |
@@ -183,6 +186,8 @@ Client 参数：
 Client 配置写入 `/opt/narwhal-monitor/client.env`：
 
 ```dotenv
+SERVER_URL=https://monitor.example.com
+SERVER_TLS_CA_FILE=
 CONTAINER_RUNTIMES=auto
 DOCKER_MONITOR_MODE=notice
 MONITORED_IMAGE_PATTERNS=*
@@ -281,9 +286,9 @@ curl -s http://127.0.0.1:8080/api/v1/security/status | jq
 
 > 阈值必须按机器带宽、正常高峰 RPS 和业务连接模型校准。配置风险仅告警，不会自动修改 Incus/Podman 配置或封禁流量。扫描检测基于内核累计计数器与采样时仍存在的 socket，是轻量级异常检测；如果需要逐次 `execve/connect/open` 事件、反弹 Shell、落地新二进制和容器逃逸检测，应在节点额外部署 Falco/eBPF 运行时安全组件。“滥用”表示行为异常线索，最终定性仍需结合供应商投诉、认证日志和业务审计。
 
-## HTTPS 配置指引（两种公网证书方式）
+## HTTPS 配置指引
 
-> 两种方式都会由 Caddy 自动续期证书，无需手工续期。
+> 三种方式都会由 Caddy 自动续期证书，无需手工续期。域名方式使用公网 CA；IP 方式使用由 Client 自动信任的内部 CA。
 
 ### 方式 A：域名直连（ACME HTTP-01，最简单）
 
@@ -315,6 +320,19 @@ curl -s http://127.0.0.1:8080/api/v1/security/status | jq
 4. Client 端 `SERVER_URL` 使用 `https://monitor.example.com`。
 
 > 安全建议：Cloudflare Token 请仅授予单一 Zone 的最小权限，避免使用全局 API Key。
+
+### 方式 C：直接使用 IP（内部 CA）
+
+适用：暂时没有域名，但仍希望 Client 到 Server 的链路保持完整 TLS 校验。
+
+1. Server 安装时填写：
+   - `Enable HTTPS reverse proxy`: `yes`
+   - `TLS host`: Server 公网 IP
+   - `TLS cert mode`: `auto` 或 `internal`
+2. Server 会生成内部 CA，并只把公开根证书导出到 `/opt/narwhal-monitor/tls-ca/root.crt`；根私钥不会挂载到 Server 应用容器，也不会传给 Client。
+3. Client 的 `SERVER_URL` 填写 `https://SERVER_IP`，不要追加安装摘要中的随机 Backend Port。
+4. Client 安装器发现系统不信任该证书后，会访问 `/api/v1/tls/ca`。请求与响应都通过 `SHARED_SECRET` 做 HMAC-SHA256 校验，校验成功后把证书保存到 `/opt/narwhal-monitor/server-ca.crt`，并写入 `SERVER_TLS_CA_FILE`。
+5. 如果共享密钥错误、响应被篡改、证书主机名不匹配或最终 TLS 校验失败，Client 安装会直接中止，不会降级为跳过证书验证。
 
 ## 宿主机原始值一键采集（排查/改造前确认）
 

@@ -20,9 +20,11 @@ class ServerRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         server.DB_PATH = str(Path(self.tmp.name) / "monitor.db")
+        self.original_tls_ca_path = server.TLS_CA_CERT_PATH
         server.init_db()
 
     def tearDown(self):
+        server.TLS_CA_CERT_PATH = self.original_tls_ca_path
         self.tmp.cleanup()
 
     def _insert(self, runtime: str, cpu: float, project: str = ""):
@@ -94,6 +96,25 @@ class ServerRuntimeTests(unittest.TestCase):
         status = json.loads(server.security_status().body)
         self.assertEqual(status["items"][0]["total_rx_bps"], 1234)
         self.assertEqual(status["items"][0]["access_log"]["requests_per_second"], 2)
+
+    def test_tls_ca_endpoint_authenticates_request_and_response(self):
+        certificate = b"-----BEGIN CERTIFICATE-----\ntest-public-ca\n-----END CERTIFICATE-----\n"
+        ca_path = Path(self.tmp.name) / "root.crt"
+        ca_path.write_bytes(certificate)
+        server.TLS_CA_CERT_PATH = str(ca_path)
+        timestamp = str(int(time.time()))
+        request_signature = hmac.new(
+            server.SHARED_SECRET.encode(), timestamp.encode(), hashlib.sha256
+        ).hexdigest()
+
+        response = server.tls_ca(timestamp, request_signature)
+
+        self.assertEqual(response.body, certificate)
+        expected_response_signature = hmac.new(
+            server.SHARED_SECRET.encode(), certificate + timestamp.encode(), hashlib.sha256
+        ).hexdigest()
+        self.assertEqual(response.headers["x-narwhal-ca-signature"], expected_response_signature)
+        self.assertEqual(response.headers["cache-control"], "no-store")
 
     def test_security_alert_lifecycle_deduplicates_and_resolves(self):
         alert = {

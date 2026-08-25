@@ -6,6 +6,7 @@ SERVER_ENV_FILE="/opt/narwhal-monitor/server.env"
 SERVER_INSTALL_ENV_FILE="/opt/narwhal-monitor/server-install.env"
 SERVER_DATA_DIR="/opt/narwhal-monitor/server-data"
 TLS_DIR="/opt/narwhal-monitor/caddy"
+TLS_CA_EXPORT_DIR="/opt/narwhal-monitor/tls-ca"
 CONTAINER_NAME="narwhal-monitor-server"
 TLS_CONTAINER_NAME="narwhal-monitor-caddy"
 
@@ -140,6 +141,8 @@ setup_tls_proxy() {
   local caddy_image="$7"
 
   podman rm -f "$TLS_CONTAINER_NAME" >/dev/null 2>&1 || true
+  mkdir -p "$TLS_CA_EXPORT_DIR"
+  rm -f "$TLS_CA_EXPORT_DIR/root.crt"
 
   if [[ "$enable_tls" != "yes" ]]; then
     return
@@ -241,13 +244,29 @@ CADDY
   podman_args+=( "$caddy_image" )
 
   podman "${podman_args[@]}"
+
+  if [[ "$tls_cert_mode" == "internal" || "$host_is_ip" == "yes" ]]; then
+    local generated_root="$TLS_DIR/data/caddy/pki/authorities/local/root.crt"
+    local attempt=""
+    for attempt in $(seq 1 30); do
+      if [[ -s "$generated_root" ]]; then
+        install -m 0644 "$generated_root" "$TLS_CA_EXPORT_DIR/root.crt"
+        echo "[OK] Internal TLS CA exported for authenticated Client bootstrap."
+        return
+      fi
+      sleep 1
+    done
+    echo "[ERROR] Caddy internal CA was not generated within 30 seconds."
+    podman logs --tail 100 "$TLS_CONTAINER_NAME" 2>&1 || true
+    return 1
+  fi
 }
 
 print_https_guide() {
   cat <<'EOF_HTTPS_GUIDE'
 
-===== HTTPS 配置指引（两种公网证书方式）=====
-两种方式都会由 Caddy 自动续期证书，无需手工续期。
+===== HTTPS 配置指引 =====
+三种方式都会由 Caddy 自动续期证书。域名使用公网 CA，IP 使用内部 CA。
 
 方式 A：域名直连（ACME HTTP-01，最简单）
 适用：你使用 Cloudflare 托管 DNS，但可将该记录设置为 DNS only（灰云）。
@@ -273,6 +292,12 @@ print_https_guide() {
      - Cloudflare API token: 填入上一步 token
   3) 脚本会自动使用带 Cloudflare DNS 模块的 Caddy 镜像并注入 token。
   4) Client 端 SERVER_URL 使用：https://monitor.example.com
+
+方式 C：直接使用 IP（内部 CA）
+  1) TLS host 填写 Server 公网 IP，TLS cert mode 选择 auto 或 internal。
+  2) Client 端 SERVER_URL 使用 https://SERVER_IP，不要追加随机 Backend Port。
+  3) Client 安装器会通过共享密钥认证接口自动获取、验证并保存公开根证书。
+  4) 不会传输 CA 私钥，也不会降级为跳过 TLS 验证。
 ==============================================
 
 EOF_HTTPS_GUIDE
@@ -373,13 +398,14 @@ main() {
     caddy_image=""
   fi
 
-  mkdir -p "$SERVER_DATA_DIR"
+  mkdir -p "$SERVER_DATA_DIR" "$TLS_CA_EXPORT_DIR"
   cat >"$SERVER_ENV_FILE" <<ENV
 SHARED_SECRET=$secret
 ALERT_DISK_THRESHOLD_PERCENT=$th
 ALERT_WEBHOOK_URL=$alert_webhook_url
 ALERT_WEBHOOK_MIN_SEVERITY=$alert_webhook_min_severity
 DB_PATH=/data/monitor.db
+TLS_CA_CERT_PATH=/tls-ca/root.crt
 ENV
 
   cat >"$SERVER_INSTALL_ENV_FILE" <<ENV
@@ -421,11 +447,17 @@ ENV
       ;;
   esac
 
+  local port_binding="${port}:8080"
+  if [[ "$tls_enable" == "yes" ]]; then
+    port_binding="127.0.0.1:${port}:8080"
+  fi
+
   podman run -d --name "$CONTAINER_NAME" \
     --restart=always \
-    -p ${port}:8080 \
+    -p "$port_binding" \
     --env-file "$SERVER_ENV_FILE" \
     -v "$SERVER_DATA_DIR:/data" \
+    -v "$TLS_CA_EXPORT_DIR:/tls-ca:ro" \
     "$image_name"
 
   setup_tls_proxy "$tls_host" "$port" "$tls_enable" "$tls_email" "$tls_cert_mode" "$cloudflare_api_token" "$caddy_image"
@@ -442,6 +474,7 @@ ENV
 Mode: $MODE
 Container Name: $CONTAINER_NAME
 Backend Port: $port
+Backend Binding: $port_binding
 Shared Secret: $secret
 Security Webhook: ${alert_webhook_url:-disabled}
 Webhook Minimum Severity: $alert_webhook_min_severity
@@ -456,6 +489,8 @@ HTTPS Enabled: $tls_enable
 HTTPS Host: ${tls_host:-N/A}
 TLS Proxy Container: $TLS_CONTAINER_NAME
 TLS Cert Mode: ${tls_cert_mode:-N/A}
+Client Server URL: $(if [[ "$tls_enable" == "yes" ]]; then echo "https://${tls_host}"; else echo "http://$(hostname -I | awk '{print $1}'):${port}"; fi)
+TLS CA Bootstrap: $(if [[ "$tls_cert_mode" == "internal" ]]; then echo "HMAC-authenticated /api/v1/tls/ca"; else echo "system/public trust"; fi)
 Caddy Image: ${caddy_image:-N/A}
 ==================================
 EOF_SUM

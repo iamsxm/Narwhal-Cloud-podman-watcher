@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 DB_PATH = os.getenv("DB_PATH", "/data/monitor.db")
 SHARED_SECRET = os.getenv("SHARED_SECRET", "change-me")
@@ -21,6 +21,7 @@ OFFLINE_HIDE_SECONDS = int(os.getenv("OFFLINE_HIDE_SECONDS", str(24 * 3600)))
 PURGE_SECONDS = int(os.getenv("PURGE_SECONDS", str(30 * 24 * 3600)))
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 ALERT_WEBHOOK_MIN_SEVERITY = os.getenv("ALERT_WEBHOOK_MIN_SEVERITY", "warning").strip().lower()
+TLS_CA_CERT_PATH = os.getenv("TLS_CA_CERT_PATH", "/tls-ca/root.crt")
 UTC8 = timezone(timedelta(hours=8))
 
 
@@ -145,6 +146,33 @@ def verify_signature(body: bytes, x_timestamp: str, x_signature: str) -> None:
     digest = hmac.new(SHARED_SECRET.encode(), body + x_timestamp.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(digest, x_signature):
         raise HTTPException(status_code=401, detail="bad signature")
+
+
+@app.get("/api/v1/tls/ca")
+def tls_ca(
+    x_timestamp: str = Header(default=""),
+    x_signature: str = Header(default=""),
+) -> Response:
+    """Return the public internal-CA certificate with an authenticated response."""
+    verify_signature(b"", x_timestamp, x_signature)
+    try:
+        with open(TLS_CA_CERT_PATH, "rb") as ca_file:
+            certificate = ca_file.read(65537)
+    except OSError:
+        raise HTTPException(status_code=503, detail="internal TLS CA is not available")
+    if len(certificate) > 65536 or not certificate.startswith(b"-----BEGIN CERTIFICATE-----"):
+        raise HTTPException(status_code=500, detail="invalid internal TLS CA certificate")
+    response_signature = hmac.new(
+        SHARED_SECRET.encode(), certificate + x_timestamp.encode(), hashlib.sha256
+    ).hexdigest()
+    return Response(
+        content=certificate,
+        media_type="application/x-pem-file",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Narwhal-CA-Signature": response_signature,
+        },
+    )
 
 
 _SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}

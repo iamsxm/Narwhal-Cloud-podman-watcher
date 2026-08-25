@@ -2570,6 +2570,15 @@ def normalize_server_url(server: str) -> str:
     return cleaned
 
 
+def server_tls_verify() -> bool | str:
+    ca_file = os.getenv("SERVER_TLS_CA_FILE", "").strip()
+    if not ca_file:
+        return True
+    if not os.path.isfile(ca_file):
+        raise RuntimeError(f"SERVER_TLS_CA_FILE does not exist: {ca_file}")
+    return ca_file
+
+
 def push(server: str, secret: str, payload: Dict) -> None:
     server = normalize_server_url(server)
     body = json.dumps(payload, ensure_ascii=False).encode()
@@ -2580,6 +2589,7 @@ def push(server: str, secret: str, payload: Dict) -> None:
         data=body,
         headers={"Content-Type": "application/json", "X-Timestamp": str(ts), "X-Signature": sig},
         timeout=15,
+        verify=server_tls_verify(),
     )
     r.raise_for_status()
 

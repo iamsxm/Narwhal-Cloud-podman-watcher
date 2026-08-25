@@ -33,6 +33,15 @@ class RuntimeDiscoveryTests(unittest.TestCase):
             with mock.patch.object(agent.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"):
                 self.assertEqual(agent.get_runtime_bins(), {"docker": "docker", "incus": "incus"})
 
+    def test_server_tls_verify_defaults_to_enabled(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIs(agent.server_tls_verify(), True)
+
+    def test_server_tls_verify_uses_configured_ca(self):
+        with tempfile.NamedTemporaryFile() as ca_file:
+            with mock.patch.dict(os.environ, {"SERVER_TLS_CA_FILE": ca_file.name}, clear=True):
+                self.assertEqual(agent.server_tls_verify(), ca_file.name)
+
     def test_lists_oci_and_incus_containers_together(self):
         incus_payload = json.dumps(
             [

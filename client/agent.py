@@ -2053,6 +2053,8 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
     ddos_rx_bps = _env_float("ALERT_DDOS_RX_BPS", 100_000_000)
     ddos_rx_pps = _env_float("ALERT_DDOS_RX_PPS", 50_000)
     ddos_syn = _env_float("ALERT_DDOS_SYN_RECV", 200)
+    conn_warning = _env_float("ALERT_CONN_WARNING_THRESHOLD", 500)
+    conn_critical = _env_float("ALERT_CONN_CRITICAL_THRESHOLD", 1000)
     inbound_unique_ip_threshold = _env_float("ALERT_INBOUND_UNIQUE_IPS", 10)
     scan_ports = _env_float("ALERT_SCAN_UNIQUE_PORTS", 20)
     abuse_unique_ips = _env_float("ALERT_ABUSE_OUTBOUND_UNIQUE_IPS", 200)
@@ -2103,6 +2105,23 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
         summary["total_rx_pps"] = float(summary["total_rx_pps"]) + rx_pps
         summary["total_tx_pps"] = float(summary["total_tx_pps"]) + tx_pps
         summary["syn_recv_count"] = int(summary["syn_recv_count"]) + syn_recv
+
+        conn_count = int(container.get("conn_count") or 0)
+        if conn_count > conn_warning:
+            critical = conn_count > conn_critical
+            alerts.append(
+                _security_alert(
+                    "container_connection_count",
+                    "critical" if critical else "warning",
+                    "容器连接数严重过高" if critical else "容器连接数过高",
+                    f"容器当前连接数 {conn_count} 超过"
+                    f"{'严重告警' if critical else '告警'}阈值 "
+                    f"{int(conn_critical if critical else conn_warning)}",
+                    conn_count,
+                    conn_critical if critical else conn_warning,
+                    container,
+                )
+            )
 
         if rx_bps >= ddos_rx_bps:
             alerts.append(
@@ -4552,6 +4571,32 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
 
 def execute_security_action(action: Dict) -> Tuple[bool, str]:
     action_type = str(action.get("action_type") or "")
+    if action_type == "stop_container":
+        runtime_kind = str(action.get("runtime") or "").strip().lower()
+        container_name = str(action.get("container_name") or "").strip()
+        project = str(action.get("project") or "").strip()
+        if runtime_kind not in ("podman", "docker", "incus"):
+            return False, "unsupported runtime for automatic stop"
+        if not re.fullmatch(r"[A-Za-z0-9_.:@+-]{1,200}", container_name):
+            return False, "invalid container target"
+        if project and not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", project):
+            return False, "invalid Incus project"
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        if str(params.get("reason") or "") != "sustained_connection_overload":
+            return False, "automatic stop reason is missing or invalid"
+        runtime_bin = get_runtime_bins().get(runtime_kind, "")
+        if not runtime_bin:
+            return False, f"runtime {runtime_kind} is unavailable"
+        command = _runtime_base(runtime_bin, project) + ["stop", container_name]
+        ok, message = _run_action_command(command)
+        if ok:
+            count = int(params.get("connection_count") or 0)
+            duration = int(params.get("duration_seconds") or 0)
+            return True, (
+                message
+                or f"stopped after {count} connections remained above the limit for {duration} seconds"
+            )
+        return False, message or "container stop command failed"
     if action_type == "allow_panel_domains":
         params = action.get("params") if isinstance(action.get("params"), dict) else {}
         domains = params.get("domains") if isinstance(params.get("domains"), list) else []

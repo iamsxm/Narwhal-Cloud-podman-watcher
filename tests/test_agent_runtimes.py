@@ -971,6 +971,55 @@ class SecurityTelemetryTests(unittest.TestCase):
             }.issubset(types)
         )
 
+    def test_connection_count_alert_uses_warning_and_critical_thresholds(self):
+        container = {"name": "node1", "runtime": "podman", "conn_count": 501, "security": {}}
+        env = {
+            "SECURITY_MONITOR_ENABLED": "true",
+            "SECURITY_ACCESS_LOG_PATHS": "",
+            "ALERT_CONN_WARNING_THRESHOLD": "500",
+            "ALERT_CONN_CRITICAL_THRESHOLD": "1000",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            container["conn_count"] = 500
+            normal = agent.collect_security_summary([container], 60)
+            container["conn_count"] = 1000
+            upper_warning = agent.collect_security_summary([container], 60)
+            container["conn_count"] = 501
+            warning = agent.collect_security_summary([container], 60)
+            container["conn_count"] = 1001
+            critical = agent.collect_security_summary([container], 60)
+        self.assertFalse(any(x["type"] == "container_connection_count" for x in normal["alerts"]))
+        upper_warning_alert = next(
+            x for x in upper_warning["alerts"] if x["type"] == "container_connection_count"
+        )
+        warning_alert = next(x for x in warning["alerts"] if x["type"] == "container_connection_count")
+        critical_alert = next(x for x in critical["alerts"] if x["type"] == "container_connection_count")
+        self.assertEqual(upper_warning_alert["severity"], "warning")
+        self.assertEqual(warning_alert["severity"], "warning")
+        self.assertEqual(critical_alert["severity"], "critical")
+
+    def test_signed_automatic_stop_targets_only_the_named_container(self):
+        action = {
+            "action_type": "stop_container",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node1",
+            "params": {
+                "reason": "sustained_connection_overload",
+                "connection_count": 1600,
+                "duration_seconds": 900,
+            },
+        }
+        with mock.patch.object(
+            agent, "get_runtime_bins", return_value={"incus": "incus"}
+        ), mock.patch.object(
+            agent, "_run_action_command", return_value=(True, "stopped")
+        ) as runner:
+            ok, message = agent.execute_security_action(action)
+        self.assertTrue(ok)
+        self.assertEqual(message, "stopped")
+        self.assertEqual(runner.call_args.args[0], ["incus", "--project", "default", "stop", "node1"])
+
     def test_security_summary_detects_http_cc_signals(self):
         access_stats = {
             "enabled": True,

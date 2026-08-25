@@ -123,6 +123,7 @@ class ServerRuntimeTests(unittest.TestCase):
                 "server_version": server.APP_VERSION,
                 "records": 1,
                 "new_alerts": 0,
+                "automatic_stops_queued": 0,
             },
         )
 
@@ -604,6 +605,92 @@ class ServerRuntimeTests(unittest.TestCase):
         item = json.loads(server.latest().body)["items"][0]
         self.assertEqual(item["mem_limit_bytes"], 4)
         self.assertEqual(item["cpu_effective_cpus"], 2)
+
+    def test_latest_hides_an_entire_stale_host_but_keeps_stale_detail_access(self):
+        stale_ts = int(time.time()) - server.STALE_SECONDS - 1
+        self._insert("incus", 20, "default", timestamp=stale_ts)
+        self.assertEqual(json.loads(server.latest().body)["items"], [])
+        stale_items = json.loads(server.latest(include_stale=True).body)["items"]
+        self.assertEqual(len(stale_items), 1)
+        self.assertTrue(stale_items[0]["alerts"]["host_stale"])
+
+    def test_latest_exposes_warning_and_critical_connection_levels(self):
+        now = int(time.time())
+        self._insert("podman", 1, timestamp=now)
+        conn = sqlite3.connect(server.DB_PATH)
+        conn.execute("UPDATE reports SET conn_count=501")
+        conn.commit()
+        conn.close()
+        warning = json.loads(server.latest().body)["items"][0]
+        self.assertEqual(warning["alerts"]["conn_severity"], "warning")
+
+        conn = sqlite3.connect(server.DB_PATH)
+        conn.execute("UPDATE reports SET conn_count=1001")
+        conn.commit()
+        conn.close()
+        critical = json.loads(server.latest().body)["items"][0]
+        self.assertEqual(critical["alerts"]["conn_severity"], "critical")
+
+    def test_sustained_connection_overload_queues_one_automatic_stop(self):
+        container = {
+            "name": "node1",
+            "runtime": "incus",
+            "project": "default",
+            "conn_count": server.CONNECTION_STOP_THRESHOLD,
+        }
+        conn = server.db()
+        self.assertEqual(server.process_connection_overloads(conn, "host", 900, [container]), 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM connection_overloads").fetchone()[0], 0)
+        container["conn_count"] += 1
+        self.assertEqual(server.process_connection_overloads(conn, "host", 1000, [container]), 0)
+        self.assertEqual(server.process_connection_overloads(conn, "host", 1300, [container]), 0)
+        self.assertEqual(server.process_connection_overloads(conn, "host", 1600, [container]), 0)
+        self.assertEqual(server.process_connection_overloads(conn, "host", 1900, [container]), 1)
+        self.assertEqual(server.process_connection_overloads(conn, "host", 2200, [container]), 0)
+        action = conn.execute("SELECT * FROM security_actions").fetchone()
+        state = conn.execute("SELECT sample_count, stop_action_id FROM connection_overloads").fetchone()
+        conn.close()
+        self.assertEqual(action["action_type"], "stop_container")
+        self.assertEqual(action["requested_by"], "system:connection-guard")
+        self.assertEqual(tuple(state), (5, action["id"]))
+
+    def test_connection_overload_gap_resets_continuous_timer(self):
+        container = {
+            "name": "node1",
+            "runtime": "podman",
+            "conn_count": server.CONNECTION_STOP_THRESHOLD + 1,
+        }
+        conn = server.db()
+        server.process_connection_overloads(conn, "host", 1000, [container])
+        server.process_connection_overloads(
+            conn, "host", 1000 + server.CONNECTION_STOP_MAX_GAP_SECONDS + 1, [container]
+        )
+        state = conn.execute("SELECT first_seen, sample_count FROM connection_overloads").fetchone()
+        actions = conn.execute("SELECT COUNT(*) FROM security_actions").fetchone()[0]
+        conn.close()
+        self.assertEqual(tuple(state), (1000 + server.CONNECTION_STOP_MAX_GAP_SECONDS + 1, 1))
+        self.assertEqual(actions, 0)
+
+    def test_inactive_host_cleanup_removes_associated_monitoring_data(self):
+        self._insert("incus", 1, "default", timestamp=1000)
+        conn = server.db()
+        conn.execute(
+            "INSERT INTO hosts(host_id, last_seen, agent_version) VALUES('host',1000,'1.0.0')"
+        )
+        conn.execute(
+            "INSERT INTO host_security(host_id,ts,payload_json) VALUES('host',1000,'{}')"
+        )
+        conn.commit()
+        conn.close()
+
+        server.cleanup_old_reports(1000 + server.OFFLINE_HOST_PURGE_SECONDS + 1)
+        conn = server.db()
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("hosts", "reports", "host_security")
+        }
+        conn.close()
+        self.assertEqual(counts, {"hosts": 0, "reports": 0, "host_security": 0})
 
     def test_schema_has_runtime_column(self):
         conn = sqlite3.connect(server.DB_PATH)

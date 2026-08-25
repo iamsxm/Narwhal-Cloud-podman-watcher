@@ -378,6 +378,12 @@ main() {
   local default_cloudflare_api_token=""
   local default_alert_webhook_url=""
   local default_alert_webhook_min_severity="warning"
+  local default_conn_warning_threshold="500"
+  local default_conn_critical_threshold="1000"
+  local default_connection_stop_threshold="1500"
+  local default_connection_stop_duration_seconds="900"
+  local default_connection_stop_max_gap_seconds="600"
+  local default_offline_host_purge_seconds="86400"
   local default_dashboard_username
   local default_dashboard_password
   default_dashboard_username="$(generate_dashboard_username)"
@@ -393,18 +399,31 @@ main() {
   default_cloudflare_api_token="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" CLOUDFLARE_API_TOKEN "$default_cloudflare_api_token")"
 
   local env_secret env_th env_alert_webhook_url env_alert_webhook_min_severity env_dashboard_username env_dashboard_password
+  local env_conn_warning_threshold env_conn_critical_threshold env_connection_stop_threshold env_connection_stop_duration_seconds env_connection_stop_max_gap_seconds env_offline_host_purge_seconds
   env_secret="$(load_kv_from_file "$SERVER_ENV_FILE" SHARED_SECRET || true)"
   env_th="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_DISK_THRESHOLD_PERCENT || true)"
   env_alert_webhook_url="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_WEBHOOK_URL || true)"
   env_alert_webhook_min_severity="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_WEBHOOK_MIN_SEVERITY || true)"
   env_dashboard_username="$(load_kv_from_file "$SERVER_ENV_FILE" DASHBOARD_USERNAME || true)"
   env_dashboard_password="$(load_kv_from_file "$SERVER_ENV_FILE" DASHBOARD_PASSWORD || true)"
+  env_conn_warning_threshold="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_CONN_WARNING_THRESHOLD || true)"
+  env_conn_critical_threshold="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_CONN_CRITICAL_THRESHOLD || true)"
+  env_connection_stop_threshold="$(load_kv_from_file "$SERVER_ENV_FILE" CONNECTION_STOP_THRESHOLD || true)"
+  env_connection_stop_duration_seconds="$(load_kv_from_file "$SERVER_ENV_FILE" CONNECTION_STOP_DURATION_SECONDS || true)"
+  env_connection_stop_max_gap_seconds="$(load_kv_from_file "$SERVER_ENV_FILE" CONNECTION_STOP_MAX_GAP_SECONDS || true)"
+  env_offline_host_purge_seconds="$(load_kv_from_file "$SERVER_ENV_FILE" OFFLINE_HOST_PURGE_SECONDS || true)"
   default_secret="${env_secret:-$default_secret}"
   default_th="${env_th:-$default_th}"
   default_alert_webhook_url="${env_alert_webhook_url:-$default_alert_webhook_url}"
   default_alert_webhook_min_severity="${env_alert_webhook_min_severity:-$default_alert_webhook_min_severity}"
   default_dashboard_username="${env_dashboard_username:-$default_dashboard_username}"
   default_dashboard_password="${env_dashboard_password:-$default_dashboard_password}"
+  default_conn_warning_threshold="${env_conn_warning_threshold:-$default_conn_warning_threshold}"
+  default_conn_critical_threshold="${env_conn_critical_threshold:-$default_conn_critical_threshold}"
+  default_connection_stop_threshold="${env_connection_stop_threshold:-$default_connection_stop_threshold}"
+  default_connection_stop_duration_seconds="${env_connection_stop_duration_seconds:-$default_connection_stop_duration_seconds}"
+  default_connection_stop_max_gap_seconds="${env_connection_stop_max_gap_seconds:-$default_connection_stop_max_gap_seconds}"
+  default_offline_host_purge_seconds="${env_offline_host_purge_seconds:-$default_offline_host_purge_seconds}"
 
   local image_source github_image port secret th tls_enable tls_host tls_email tls_cert_mode cloudflare_api_token caddy_image alert_webhook_url alert_webhook_min_severity
 
@@ -467,6 +486,12 @@ main() {
 NARWHAL_VERSION=$PROJECT_VERSION
 SHARED_SECRET=$secret
 ALERT_DISK_THRESHOLD_PERCENT=$th
+ALERT_CONN_WARNING_THRESHOLD=$default_conn_warning_threshold
+ALERT_CONN_CRITICAL_THRESHOLD=$default_conn_critical_threshold
+CONNECTION_STOP_THRESHOLD=$default_connection_stop_threshold
+CONNECTION_STOP_DURATION_SECONDS=$default_connection_stop_duration_seconds
+CONNECTION_STOP_MAX_GAP_SECONDS=$default_connection_stop_max_gap_seconds
+OFFLINE_HOST_PURGE_SECONDS=$default_offline_host_purge_seconds
 ALERT_WEBHOOK_URL=$alert_webhook_url
 ALERT_WEBHOOK_MIN_SEVERITY=$alert_webhook_min_severity
 DB_PATH=/data/monitor.db

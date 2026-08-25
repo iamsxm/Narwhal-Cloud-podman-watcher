@@ -18,9 +18,16 @@ DB_PATH = os.getenv("DB_PATH", "/data/monitor.db")
 SHARED_SECRET = os.getenv("SHARED_SECRET", "change-me")
 ALERT_DISK_THRESHOLD_PERCENT = int(os.getenv("ALERT_DISK_THRESHOLD_PERCENT", "80"))
 ALERT_CPU_THRESHOLD_PERCENT = float(os.getenv("ALERT_CPU_THRESHOLD_PERCENT", "80"))
-ALERT_CONN_THRESHOLD = int(os.getenv("ALERT_CONN_THRESHOLD", "500"))
+ALERT_CONN_WARNING_THRESHOLD = int(
+    os.getenv("ALERT_CONN_WARNING_THRESHOLD", os.getenv("ALERT_CONN_THRESHOLD", "500"))
+)
+ALERT_CONN_CRITICAL_THRESHOLD = int(os.getenv("ALERT_CONN_CRITICAL_THRESHOLD", "1000"))
+CONNECTION_STOP_THRESHOLD = int(os.getenv("CONNECTION_STOP_THRESHOLD", "1500"))
+CONNECTION_STOP_DURATION_SECONDS = int(os.getenv("CONNECTION_STOP_DURATION_SECONDS", "900"))
+CONNECTION_STOP_MAX_GAP_SECONDS = int(os.getenv("CONNECTION_STOP_MAX_GAP_SECONDS", "600"))
 STALE_SECONDS = int(os.getenv("STALE_SECONDS", "900"))
 OFFLINE_HIDE_SECONDS = int(os.getenv("OFFLINE_HIDE_SECONDS", str(24 * 3600)))
+OFFLINE_HOST_PURGE_SECONDS = int(os.getenv("OFFLINE_HOST_PURGE_SECONDS", str(24 * 3600)))
 PURGE_SECONDS = int(os.getenv("PURGE_SECONDS", str(30 * 24 * 3600)))
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 ALERT_WEBHOOK_MIN_SEVERITY = os.getenv("ALERT_WEBHOOK_MIN_SEVERITY", "warning").strip().lower()
@@ -113,6 +120,12 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_reports_host_ts ON reports(host_id, ts);
         CREATE INDEX IF NOT EXISTS idx_reports_host_container_ts ON reports(host_id, container_name, ts);
+        CREATE TABLE IF NOT EXISTS hosts (
+            host_id TEXT PRIMARY KEY,
+            last_seen INTEGER NOT NULL,
+            agent_version TEXT NOT NULL DEFAULT 'unknown'
+        );
+        CREATE INDEX IF NOT EXISTS idx_hosts_last_seen ON hosts(last_seen);
         CREATE TABLE IF NOT EXISTS security_alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fingerprint TEXT NOT NULL UNIQUE,
@@ -181,6 +194,19 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_security_alert_decisions_alert_created
             ON security_alert_decisions(alert_id, created_at);
+        CREATE TABLE IF NOT EXISTS connection_overloads (
+            host_id TEXT NOT NULL,
+            runtime TEXT NOT NULL,
+            project TEXT NOT NULL DEFAULT '',
+            container_name TEXT NOT NULL,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            sample_count INTEGER NOT NULL DEFAULT 1,
+            stop_action_id INTEGER,
+            PRIMARY KEY(host_id, runtime, project, container_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_connection_overloads_last_seen
+            ON connection_overloads(last_seen);
         """
     )
     cols = conn.execute("PRAGMA table_info(reports)").fetchall()
@@ -194,6 +220,12 @@ def init_db() -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_reports_host_runtime_project_container_ts "
         "ON reports(host_id, runtime, project, container_name, ts)"
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO hosts(host_id, last_seen, agent_version)
+        SELECT host_id, MAX(ts), 'unknown' FROM reports GROUP BY host_id
+        """
     )
     conn.commit()
     conn.close()
@@ -215,6 +247,30 @@ def cleanup_old_reports(now_ts: int | None = None) -> int:
     conn.execute("DELETE FROM host_security WHERE ts < ?", (cutoff,))
     conn.execute("DELETE FROM security_actions WHERE updated_at < ?", (cutoff,))
     conn.execute("DELETE FROM security_alert_decisions WHERE created_at < ?", (cutoff,))
+    inactive_host_cutoff = now - OFFLINE_HOST_PURGE_SECONDS
+    inactive_hosts = [
+        str(row["host_id"])
+        for row in conn.execute("SELECT host_id FROM hosts WHERE last_seen < ?", (inactive_host_cutoff,)).fetchall()
+    ]
+    for host_id in inactive_hosts:
+        conn.execute(
+            "DELETE FROM security_alert_decisions WHERE alert_id IN "
+            "(SELECT id FROM security_alerts WHERE host_id=?)",
+            (host_id,),
+        )
+        conn.execute(
+            "DELETE FROM security_alert_policies WHERE fingerprint IN "
+            "(SELECT fingerprint FROM security_alerts WHERE host_id=?)",
+            (host_id,),
+        )
+        conn.execute("DELETE FROM reports WHERE host_id=?", (host_id,))
+        conn.execute("DELETE FROM security_alerts WHERE host_id=?", (host_id,))
+        conn.execute("DELETE FROM host_security WHERE host_id=?", (host_id,))
+        conn.execute("DELETE FROM security_actions WHERE host_id=?", (host_id,))
+        conn.execute("DELETE FROM connection_overloads WHERE host_id=?", (host_id,))
+    if inactive_hosts:
+        placeholders = ",".join("?" for _ in inactive_hosts)
+        conn.execute(f"DELETE FROM hosts WHERE host_id IN ({placeholders})", inactive_hosts)
     conn.commit()
     deleted = int(cur.rowcount or 0)
     conn.close()
@@ -439,6 +495,134 @@ def send_alert_webhook(alert: Dict[str, Any]) -> None:
         print(f"alert webhook failed: {exc}")
 
 
+def process_connection_overloads(
+    conn: sqlite3.Connection,
+    host_id: str,
+    ts: int,
+    containers: List[Dict[str, Any]],
+) -> int:
+    """Track uninterrupted overload windows and queue one signed stop action."""
+    active_keys: set[tuple[str, str, str]] = set()
+    queued = 0
+    for container in containers:
+        runtime = str(container.get("runtime") or "podman")[:40].lower()
+        project = str(container.get("project") or "")[:100]
+        container_name = str(container.get("name") or "unknown")[:200]
+        key = (runtime, project, container_name)
+        active_keys.add(key)
+        try:
+            conn_count = int(container.get("conn_count") or 0)
+        except (TypeError, ValueError):
+            conn_count = 0
+        if conn_count <= CONNECTION_STOP_THRESHOLD or runtime not in ("podman", "docker", "incus"):
+            conn.execute(
+                "DELETE FROM connection_overloads WHERE host_id=? AND runtime=? AND project=? AND container_name=?",
+                (host_id, runtime, project, container_name),
+            )
+            continue
+
+        state = conn.execute(
+            """
+            SELECT first_seen, last_seen, sample_count, stop_action_id
+            FROM connection_overloads
+            WHERE host_id=? AND runtime=? AND project=? AND container_name=?
+            """,
+            (host_id, runtime, project, container_name),
+        ).fetchone()
+        continuous = (
+            state is not None
+            and int(state["last_seen"]) <= ts
+            and ts - int(state["last_seen"]) <= CONNECTION_STOP_MAX_GAP_SECONDS
+        )
+        first_seen = int(state["first_seen"]) if continuous else ts
+        sample_count = int(state["sample_count"]) + 1 if continuous else 1
+        stop_action_id = int(state["stop_action_id"] or 0) if continuous else 0
+        if stop_action_id:
+            previous_action = conn.execute(
+                "SELECT status FROM security_actions WHERE id=?", (stop_action_id,)
+            ).fetchone()
+            previous_status = str(previous_action["status"]) if previous_action is not None else "failed"
+            if previous_status == "failed":
+                stop_action_id = 0
+            elif previous_status == "succeeded":
+                first_seen = ts
+                sample_count = 1
+                stop_action_id = 0
+        conn.execute(
+            """
+            INSERT INTO connection_overloads(
+                host_id, runtime, project, container_name, first_seen, last_seen,
+                sample_count, stop_action_id
+            ) VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(host_id, runtime, project, container_name) DO UPDATE SET
+                first_seen=excluded.first_seen,
+                last_seen=excluded.last_seen,
+                sample_count=excluded.sample_count,
+                stop_action_id=excluded.stop_action_id
+            """,
+            (
+                host_id,
+                runtime,
+                project,
+                container_name,
+                first_seen,
+                ts,
+                sample_count,
+                stop_action_id or None,
+            ),
+        )
+        if stop_action_id or ts - first_seen < CONNECTION_STOP_DURATION_SECONDS:
+            continue
+        params = {
+            "reason": "sustained_connection_overload",
+            "connection_count": conn_count,
+            "threshold": CONNECTION_STOP_THRESHOLD,
+            "duration_seconds": ts - first_seen,
+            "required_duration_seconds": CONNECTION_STOP_DURATION_SECONDS,
+            "sample_count": sample_count,
+        }
+        cur = conn.execute(
+            """
+            INSERT INTO security_actions(
+                alert_id, host_id, runtime, project, container_name, action_type,
+                params_json, status, requested_by, created_at, updated_at
+            ) VALUES(0,?,?,?,?,?,?,'queued','system:connection-guard',?,?)
+            """,
+            (
+                host_id,
+                runtime,
+                project,
+                container_name,
+                "stop_container",
+                json.dumps(params, ensure_ascii=False),
+                ts,
+                ts,
+            ),
+        )
+        action_id = int(cur.lastrowid)
+        conn.execute(
+            """
+            UPDATE connection_overloads SET stop_action_id=?
+            WHERE host_id=? AND runtime=? AND project=? AND container_name=?
+            """,
+            (action_id, host_id, runtime, project, container_name),
+        )
+        queued += 1
+
+    existing = conn.execute(
+        "SELECT runtime, project, container_name FROM connection_overloads WHERE host_id=?",
+        (host_id,),
+    ).fetchall()
+    for row in existing:
+        key = (str(row["runtime"]), str(row["project"]), str(row["container_name"]))
+        if key not in active_keys:
+            conn.execute(
+                "DELETE FROM connection_overloads WHERE host_id=? AND runtime=? AND project=? AND container_name=?",
+                (host_id, *key),
+            )
+    return queued
+
+
 @app.post("/api/v1/report")
 async def report(
     request: Request,
@@ -459,6 +643,15 @@ async def report(
 
     containers: List[Dict[str, Any]] = data.get("containers", [])
     conn = db()
+    conn.execute(
+        """
+        INSERT INTO hosts(host_id, last_seen, agent_version) VALUES(?,?,?)
+        ON CONFLICT(host_id) DO UPDATE SET
+            last_seen=excluded.last_seen,
+            agent_version=excluded.agent_version
+        """,
+        (host_id, ts, agent_version),
+    )
     for c in containers:
         stored_payload = dict(c)
         stored_payload["_agent_version"] = agent_version
@@ -514,6 +707,7 @@ async def report(
                         str(c.get("name") or "")[:200],
                     ),
                 )
+    automatic_stops_queued = process_connection_overloads(conn, host_id, ts, containers)
     notifications: List[Dict[str, Any]] = []
     security = data.get("security")
     if isinstance(security, dict):
@@ -532,6 +726,7 @@ async def report(
         "server_version": APP_VERSION,
         "records": len(containers),
         "new_alerts": len(notifications),
+        "automatic_stops_queued": automatic_stops_queued,
     }
 
 
@@ -539,6 +734,10 @@ async def report(
 def latest(include_stale: bool = False) -> JSONResponse:
     cleanup_old_reports()
     conn = db()
+    host_heartbeats = {
+        str(row["host_id"]): int(row["last_seen"])
+        for row in conn.execute("SELECT host_id, last_seen FROM hosts").fetchall()
+    }
     rows = conn.execute(
         """
         SELECT r.* FROM reports r
@@ -579,10 +778,21 @@ def latest(include_stale: bool = False) -> JSONResponse:
         host_disk = host_disk_map.get(r["host_id"], {})
         alert_disk = (r["disk_used_percent"] or 0) >= ALERT_DISK_THRESHOLD_PERCENT
         alert_cpu = float(r["cpu_percent"] or 0) >= ALERT_CPU_THRESHOLD_PERCENT
-        alert_conn = int(r["conn_count"] or 0) >= ALERT_CONN_THRESHOLD
+        conn_count = int(r["conn_count"] or 0)
+        conn_severity = (
+            "critical"
+            if conn_count > ALERT_CONN_CRITICAL_THRESHOLD
+            else "warning"
+            if conn_count > ALERT_CONN_WARNING_THRESHOLD
+            else ""
+        )
         stale_seconds = max(0, now - r["ts"])
         stale = stale_seconds > STALE_SECONDS
         hidden_offline = stale_seconds > OFFLINE_HIDE_SECONDS
+        host_last_seen = host_heartbeats.get(str(r["host_id"]), int(r["ts"]))
+        host_stale = now - host_last_seen > STALE_SECONDS
+        if host_stale and not include_stale:
+            continue
         if hidden_offline and not include_stale:
             continue
         container_disk = payload.get("container_disk", {})
@@ -603,7 +813,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "cpu_effective_cpus": float(payload.get("cpu_effective_cpus") or 0),
             "net_rx_bps": r["net_rx_bps"],
             "net_tx_bps": r["net_tx_bps"],
-            "conn_count": int(r["conn_count"]),
+            "conn_count": conn_count,
             "tcp_country_stats": payload.get("tcp_country_stats", []),
             "udp_country_stats": payload.get("udp_country_stats", []),
             "security": payload.get("security", {}),
@@ -637,8 +847,12 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "alerts": {
                 "disk": alert_disk,
                 "cpu": alert_cpu,
-                "conn": alert_conn,
+                "conn": bool(conn_severity),
+                "conn_severity": conn_severity,
+                "conn_warning_threshold": ALERT_CONN_WARNING_THRESHOLD,
+                "conn_critical_threshold": ALERT_CONN_CRITICAL_THRESHOLD,
                 "stale": stale,
+                "host_stale": host_stale,
                 "hidden_offline": hidden_offline,
                 "network": (not r["podman_network_ok_v4"]) or (not r["podman_network_ok_v6"]),
             },
@@ -1843,7 +2057,10 @@ async function load(){
     grid.className='containers-grid';
     rows.forEach(x=>{
       const cpuCls=x.alerts.cpu?'bad':'';
-      const connCls=x.alerts.conn?'bad':'';
+      const connSeverity=x.alerts?.conn_severity||'';
+      const connCls=connSeverity==='critical'?'bad':(connSeverity==='warning'?'severity-warning':'');
+      const connWarningThreshold=Number(x.alerts?.conn_warning_threshold||500),connCriticalThreshold=Number(x.alerts?.conn_critical_threshold||1000);
+      const connHint=connSeverity==='critical'?`严重告警：连接数超过 ${connCriticalThreshold}`:(connSeverity==='warning'?`告警：连接数超过 ${connWarningThreshold}`:'连接数正常');
       const containerDiskText = formatCapacity(x.container_fs_root_total_bytes, x.container_fs_root_avail_bytes);
       const offlineText=x.alerts.stale?`离线 ${Number(x.offline_hours||0)} 小时`:'在线';
       const runtimeBase = x.project && x.runtime==='incus' ? `${x.runtime}/${x.project}` : (x.runtime||'podman');
@@ -1868,7 +2085,7 @@ async function load(){
         `<div class='metric'><span class='metric-label'>CPU</span><strong class='metric-value ${cpuCls}'>${formatSmallNumber(x.cpu_percent,2)}%</strong></div>`+
         `<div class='metric'><span class='metric-label'>内存</span><strong class='metric-value'>${formatSmallNumber(x.mem_percent,2)}%</strong></div>`+
         `<div class='metric'><span class='metric-label'>入站去重 IP</span><strong class='metric-value ${inboundCls}'>${inboundUniqueIps}</strong></div>`+
-        `<div class='metric'><span class='metric-label'>连接数</span><strong class='metric-value ${connCls}'>${Number(x.conn_count||0)}</strong></div>`+
+        `<div class='metric' title='${escapeHtml(connHint)}'><span class='metric-label'>连接数${connSeverity==='critical'?' · 严重':(connSeverity==='warning'?' · 告警':'')}</span><strong class='metric-value ${connCls}'>${Number(x.conn_count||0)}</strong></div>`+
         `<div class='metric'><span class='metric-label'>进程数</span><strong class='metric-value'>${Number(security.process_count||0)}</strong></div>`+
         `<div class='metric'><span class='metric-label'>RX</span><strong class='metric-value'>${formatSmallNumber(bpsToMbps(x.net_rx_bps),2)} Mbps</strong></div>`+
         `<div class='metric'><span class='metric-label'>TX</span><strong class='metric-value'>${formatSmallNumber(bpsToMbps(x.net_tx_bps),2)} Mbps</strong></div>`+

@@ -313,6 +313,8 @@ SECURITY_HOST_PROXY_SOCKET_MAX=5000
 ALERT_DDOS_RX_BPS=100000000
 ALERT_DDOS_RX_PPS=50000
 ALERT_DDOS_SYN_RECV=200
+ALERT_CONN_WARNING_THRESHOLD=500
+ALERT_CONN_CRITICAL_THRESHOLD=1000
 ALERT_INBOUND_UNIQUE_IPS=10
 ALERT_CC_TOTAL_RPS=100
 ALERT_CC_IP_RPS=30
@@ -342,6 +344,8 @@ ACTION_POLL_INTERVAL=10
 ALERT_WEB_SCAN_REQUESTS=10
 ALERT_AUTH_FAILURES_PER_IP=20
 ```
+
+连接数严格大于 `500` 时产生 warning，严格大于 `1000` 时升级为 critical。Server 会独立记录每个容器的连续超限窗口；连接数严格大于 `1500` 且连续满 15 分钟时，经 HMAC 签名动作通道自动停止该容器。若相邻超限样本间隔超过 600 秒，连续计时会重新开始，避免把上报中断误判为持续超限。
 
 Agent 会同时读取宿主机 `SECURITY_ACCESS_LOG_PATHS`，并通过对应的 Podman/Docker/Incus 运行时进入每个容器读取 `SECURITY_CONTAINER_ACCESS_LOG_PATHS`。因此面板或反代日志既可以位于宿主机，也可以只存在于容器内部；文件不存在的容器会自动跳过。也可以把容器日志只读挂载到宿主机后，仅保留宿主机路径。日志不可读时网络层检测仍正常运行，但该容器不会产生 HTTP/CC 日志告警。
 
@@ -389,6 +393,12 @@ Server 的 `/opt/narwhal-monitor/server.env` 可配置：
 ```dotenv
 ALERT_WEBHOOK_URL=https://example.com/your-webhook
 ALERT_WEBHOOK_MIN_SEVERITY=warning
+ALERT_CONN_WARNING_THRESHOLD=500
+ALERT_CONN_CRITICAL_THRESHOLD=1000
+CONNECTION_STOP_THRESHOLD=1500
+CONNECTION_STOP_DURATION_SECONDS=900
+CONNECTION_STOP_MAX_GAP_SECONDS=600
+OFFLINE_HOST_PURGE_SECONDS=86400
 DASHBOARD_USERNAME=安装时随机生成
 DASHBOARD_PASSWORD=安装时随机生成
 ```
@@ -410,7 +420,7 @@ curl -su "$dashboard_user:$dashboard_password" http://127.0.0.1:8080/api/v1/secu
 curl -su "$dashboard_user:$dashboard_password" http://127.0.0.1:8080/api/v1/security/actions | jq
 ```
 
-> 阈值必须按机器带宽、正常高峰 RPS 和业务连接模型校准。除管理员在页面二次确认的机场对接“快速清理”外，其余配置风险只告警，不会自动修改 Incus/Podman 配置或封禁流量。扫描检测基于内核累计计数器与采样时仍存在的 socket，是轻量级异常检测；如果需要逐次 `execve/connect/open` 事件、反弹 Shell、落地新二进制和容器逃逸检测，应在节点额外部署 Falco/eBPF 运行时安全组件。“滥用”表示行为异常线索，最终定性仍需结合供应商投诉、认证日志和业务审计。
+> 阈值必须按机器带宽、正常高峰 RPS 和业务连接模型校准。除连接数严格大于 1500 持续 15 分钟会自动停止目标容器，以及管理员在页面二次确认的机场对接“快速清理”外，其余配置风险只告警，不会自动修改 Incus/Podman 配置或封禁流量。扫描检测基于内核累计计数器与采样时仍存在的 socket，是轻量级异常检测；如果需要逐次 `execve/connect/open` 事件、反弹 Shell、落地新二进制和容器逃逸检测，应在节点额外部署 Falco/eBPF 运行时安全组件。“滥用”表示行为异常线索，最终定性仍需结合供应商投诉、认证日志和业务审计。
 
 ## HTTPS 配置指引
 
@@ -558,7 +568,7 @@ sudo bash scripts/collect-podman-raw.sh
 - 容器连接数（按容器 PID 统计 socket）
 - 网络速度（RX/TX）
 - 容器内当前 CPU 占用最高进程（PID / CPU% / 命令）
-- 离线容器生命周期管理：离线后默认保留 1 天并标记离线时长（按小时刷新），超过 1 天默认隐藏，超过 30 天自动删除历史数据
+- 离线生命周期管理：整台主机失联超过 15 分钟即从总览隐藏，超过 1 天自动清理其关联数据；主机仍在线时，消失的单个容器保留 1 天后隐藏，历史样本最长保留 30 天
 - 容器根盘容量，以及优先 `/data`、不存在时回退 `/` 的宿主机主盘容量与挂载点
 - 容器网络健康（IPv4 / IPv6，跨 Podman/Docker/Incus 探测）
 - 运行时与 Incus 项目维度，支持同主机同名容器隔离展示和历史统计

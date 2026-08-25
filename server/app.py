@@ -490,6 +490,30 @@ async def report(
                 json.dumps(stored_payload, ensure_ascii=False),
             ),
         )
+        deep_sample = c.get("deep_sample") if isinstance(c.get("deep_sample"), dict) else None
+        if deep_sample is not None:
+            try:
+                deep_action_id = int(deep_sample.get("action_id") or 0)
+            except (TypeError, ValueError):
+                deep_action_id = 0
+            if deep_action_id > 0:
+                conn.execute(
+                    """
+                    UPDATE security_actions
+                    SET status='succeeded', result_message='deep sample received', updated_at=?
+                    WHERE id=? AND alert_id=0 AND action_type='request_deep_sample'
+                      AND host_id=? AND runtime=? AND project=? AND container_name=?
+                      AND status IN ('queued','dispatched')
+                    """,
+                    (
+                        ts,
+                        deep_action_id,
+                        host_id,
+                        str(c.get("runtime") or "")[:40],
+                        str(c.get("project") or "")[:100],
+                        str(c.get("name") or "")[:200],
+                    ),
+                )
     notifications: List[Dict[str, Any]] = []
     security = data.get("security")
     if isinstance(security, dict):
@@ -665,6 +689,128 @@ def history(host_id: str, container_name: str, runtime: str = "", project: str =
             ]
         }
     )
+
+
+def _latest_deep_sample(
+    conn: sqlite3.Connection,
+    host_id: str,
+    runtime: str,
+    project: str,
+    container_name: str,
+) -> Dict[str, Any] | None:
+    rows = conn.execute(
+        """
+        SELECT ts, payload_json FROM reports
+        WHERE host_id=? AND runtime=? AND project=? AND container_name=?
+        ORDER BY ts DESC LIMIT 100
+        """,
+        (host_id, runtime, project, container_name),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        sample = payload.get("deep_sample") if isinstance(payload, dict) else None
+        if isinstance(sample, dict):
+            result = dict(sample)
+            result["report_timestamp"] = int(row["ts"])
+            result["report_timestamp_utc8"] = format_utc8(int(row["ts"]))
+            result["agent_version"] = str(payload.get("_agent_version") or "unknown")
+            return result
+    return None
+
+
+@app.post("/api/v1/containers/diagnostics")
+async def request_container_diagnostic(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    host_id = str(payload.get("host_id") or "")[:200]
+    runtime = str(payload.get("runtime") or "")[:40].lower()
+    project = str(payload.get("project") or "")[:100]
+    container_name = str(payload.get("container_name") or "")[:200]
+    if not host_id or not container_name or runtime not in ("incus", "podman"):
+        raise HTTPException(status_code=400, detail="Incus or Podman container identity is required")
+
+    conn = db()
+    latest = conn.execute(
+        """
+        SELECT payload_json FROM reports
+        WHERE host_id=? AND runtime=? AND project=? AND container_name=?
+        ORDER BY ts DESC LIMIT 1
+        """,
+        (host_id, runtime, project, container_name),
+    ).fetchone()
+    if latest is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="container not found")
+    try:
+        latest_payload = json.loads(latest["payload_json"] or "{}")
+    except (TypeError, ValueError):
+        latest_payload = {}
+    if str(latest_payload.get("monitor_mode") or "full") != "full":
+        conn.close()
+        raise HTTPException(status_code=409, detail="container is not in full monitoring mode")
+
+    existing = conn.execute(
+        """
+        SELECT * FROM security_actions
+        WHERE alert_id=0 AND host_id=? AND runtime=? AND project=? AND container_name=?
+          AND action_type='request_deep_sample' AND status IN ('queued','dispatched')
+        ORDER BY id DESC LIMIT 1
+        """,
+        (host_id, runtime, project, container_name),
+    ).fetchone()
+    queued = existing is None
+    if existing is None:
+        now = int(time.time())
+        cur = conn.execute(
+            """
+            INSERT INTO security_actions(
+                alert_id, host_id, runtime, project, container_name, action_type, params_json,
+                status, requested_by, created_at, updated_at
+            ) VALUES(0,?,?,?,?,?,?,'queued',?,?,?)
+            """,
+            (
+                host_id,
+                runtime,
+                project,
+                container_name,
+                "request_deep_sample",
+                json.dumps({"sample_seconds": 1.0, "process_limit": 100, "socket_limit": 250}),
+                str(getattr(request.state, "dashboard_user", "dashboard"))[:100],
+                now,
+                now,
+            ),
+        )
+        existing = conn.execute("SELECT * FROM security_actions WHERE id=?", (cur.lastrowid,)).fetchone()
+        conn.commit()
+    result = _action_item(existing)
+    conn.close()
+    return JSONResponse(status_code=202 if queued else 200, content={"ok": True, "queued": queued, "action": result})
+
+
+@app.get("/api/v1/containers/diagnostics")
+def container_diagnostic_status(
+    host_id: str, runtime: str, container_name: str, project: str = ""
+) -> JSONResponse:
+    conn = db()
+    action = conn.execute(
+        """
+        SELECT * FROM security_actions
+        WHERE alert_id=0 AND host_id=? AND runtime=? AND project=? AND container_name=?
+          AND action_type='request_deep_sample'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (host_id[:200], runtime[:40].lower(), project[:100], container_name[:200]),
+    ).fetchone()
+    sample = _latest_deep_sample(conn, host_id[:200], runtime[:40].lower(), project[:100], container_name[:200])
+    conn.close()
+    return JSONResponse(content={"action": _action_item(action) if action is not None else None, "sample": sample})
 
 
 def _action_item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -1877,8 +2023,8 @@ def container_detail_page() -> str:
 body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}.skip-link{position:fixed;left:12px;top:-60px;z-index:10;background:var(--accent);color:#082f49;padding:10px 14px;border-radius:8px;font-weight:700}.skip-link:focus{top:12px}
 .page{width:min(1500px,100%);margin:auto;padding:20px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:16px;padding:17px 18px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(135deg,var(--surface),#111d34)}
 h1{margin:0;font-size:24px;overflow-wrap:anywhere}.subtitle{color:var(--muted);margin-top:4px;overflow-wrap:anywhere}.actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
-.btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);text-decoration:none}
-.btn:hover{filter:brightness(1.12)}.btn:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.status{border:1px solid var(--border);border-radius:10px;background:var(--surface-2);padding:10px 12px;margin-bottom:14px;color:#cbd5e1}
+    .btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);text-decoration:none;cursor:pointer;font:inherit}.btn.primary{border-color:#0284c7;background:#075985}.btn:disabled{cursor:not-allowed;opacity:.58}
+    .btn:not(:disabled):hover{filter:brightness(1.12)}.btn:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.status{border:1px solid var(--border);border-radius:10px;background:var(--surface-2);padding:10px 12px;margin-bottom:14px;color:#cbd5e1}
 .status.bad{border-color:#a84655;color:#ffadb8}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
 .metric,.panel{min-width:0;border:1px solid var(--border);border-radius:12px;background:var(--surface);padding:13px}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{display:block;margin-top:4px;font-size:20px;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
 .metric.metric-alert{border-color:#b91c1c;background:#2b0b12}.metric.metric-alert strong{color:#fca5a5}
@@ -1887,12 +2033,14 @@ h1{margin:0;font-size:24px;overflow-wrap:anywhere}.subtitle{color:var(--muted);m
 svg{width:100%;height:220px;border-top:1px solid #29466f}.kv{display:grid;grid-template-columns:minmax(115px,auto) minmax(0,1fr);gap:6px 10px;margin:0}.kv dt{color:#91a9cb}.kv dd{margin:0;text-align:right;overflow-wrap:anywhere}
 .list{margin:6px 0 0 18px;padding:0}.ok{color:#72dfa7}.bad-text{color:#ff6b78}.samples{display:grid;gap:7px}.sample{display:grid;grid-template-columns:1.4fr repeat(5,minmax(75px,1fr));gap:8px;padding:8px;border:1px solid #274365;border-radius:8px;background:#101e36;font-size:12px}.sample span{overflow-wrap:anywhere}
 .source,.version-pill{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:999px;padding:3px 9px;background:#111827;color:#cbd5e1;font-size:12px}.version-pill.ok{border-color:#166534;background:#052e16;color:#86efac}.version-pill.bad{border-color:#991b1b;background:#450a0a;color:#fca5a5}.version-pill.warn{border-color:#92400e;background:#451a03;color:#fcd34d}
-.comm-process-grid,.socket-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr));gap:9px}.comm-process,.socket-card{min-width:0;border:1px solid #274365;border-radius:9px;background:#0b1220;padding:10px}.comm-process strong,.socket-head strong{overflow-wrap:anywhere}.comm-meta,.socket-meta{margin-top:4px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.socket-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}.direction{display:inline-flex;border-radius:999px;padding:2px 7px;font-size:11px;border:1px solid var(--border)}.direction.inbound{border-color:#b91c1c;background:#450a0a;color:#fca5a5}.direction.outbound{border-color:#075985;background:#082f49;color:#7dd3fc}.comm-note{margin:0 0 10px;color:var(--muted);font-size:12px}
-@media(max-width:900px){.top{flex-direction:column}.charts,.details{grid-template-columns:1fr}.sample{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    .comm-process-grid,.socket-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr));gap:9px}.comm-process,.socket-card{min-width:0;border:1px solid #274365;border-radius:9px;background:#0b1220;padding:10px}.comm-process strong,.socket-head strong{overflow-wrap:anywhere}.comm-meta,.socket-meta{margin-top:4px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.socket-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}.direction{display:inline-flex;border-radius:999px;padding:2px 7px;font-size:11px;border:1px solid var(--border)}.direction.inbound{border-color:#b91c1c;background:#450a0a;color:#fca5a5}.direction.outbound{border-color:#075985;background:#082f49;color:#7dd3fc}.comm-note{margin:0 0 10px;color:var(--muted);font-size:12px}
+    .diagnostic{margin-bottom:14px;border-color:#315574;background:linear-gradient(135deg,#0f172a,#0b1d31)}.diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.diagnostic-head p{margin:3px 0 0;color:var(--muted);font-size:12px}.diagnostic-state{margin:12px 0;padding:9px 11px;border:1px solid var(--border);border-radius:8px;background:#0b1220;color:#cbd5e1}.diagnostic-state.ok{border-color:#166534}.diagnostic-state.warn{border-color:#92400e;color:#fcd34d}.diagnostic-state.bad{border-color:#991b1b;color:#fca5a5}.deep-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px}.deep-metric{min-width:0;padding:9px;border:1px solid #274365;border-radius:8px;background:#101e36}.deep-metric span{display:block;color:var(--muted);font-size:11px}.deep-metric strong{display:block;margin-top:3px;overflow-wrap:anywhere}.deep-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.deep-section{min-width:0;border-top:1px solid #274365;padding-top:9px}.deep-section h3{margin:0 0 7px}.deep-list{display:grid;gap:6px}.deep-row{min-width:0;padding:8px;border:1px solid #253b59;border-radius:7px;background:#0b1220;font-size:12px;overflow-wrap:anywhere}.deep-row strong{color:#dbeafe}.deep-errors{margin-top:9px;color:#fca5a5;font-size:12px}
+    @media(max-width:900px){.top{flex-direction:column}.charts,.details,.deep-grid{grid-template-columns:1fr}.sample{grid-template-columns:repeat(2,minmax(0,1fr))}.diagnostic-head{flex-direction:column}}
 @media(max-width:520px){.page{padding:10px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metric strong{font-size:17px}.kv{grid-template-columns:1fr}.kv dd{text-align:left}.actions{width:100%}.btn{flex:1}}
 </style></head><body><a class='skip-link' href='#detail-main'>跳到主要内容</a><main id='detail-main' class='page'>
-<header class='top'><div><h1 id='title'>容器详情</h1><div id='subtitle' class='subtitle'>正在读取容器内部指标…</div></div><nav class='actions'><span id='detail-version' class='version-pill warn'>版本检查中</span><a class='btn' href='/stats'>返回统计页</a><a class='btn' href='/'>返回总览</a></nav></header>
-<div id='status' class='status'>正在加载最新采样与历史数据…</div>
+    <header class='top'><div><h1 id='title'>容器详情</h1><div id='subtitle' class='subtitle'>正在读取容器内部指标…</div></div><nav class='actions'><span id='detail-version' class='version-pill warn'>版本检查中</span><a class='btn' href='/stats'>返回统计页</a><a class='btn' href='/'>返回总览</a></nav></header>
+    <div id='status' class='status'>正在加载最新采样与历史数据…</div>
+    <section class='panel diagnostic' aria-labelledby='diagnostic-title'><div class='diagnostic-head'><div><h2 id='diagnostic-title'>按需深度上报</h2><p>仅在下一周期对当前 Incus/Podman 容器做一次有界快照；不抓包、不扫描文件，上报成功后自动恢复普通采集。</p></div><button id='request-diagnostic' class='btn primary' type='button' aria-label='请求当前容器在下一周期上报深度详情' onclick='requestDeepSample()'>请求深度上报</button></div><div id='diagnostic-state' class='diagnostic-state'>尚未请求深度上报。</div><div id='diagnostic-report'><div class='comm-note'>收到报告后将在这里显示瞬时流量、详细进程、连接 IP 和进程归属。</div></div></section>
 <section id='metrics' class='metrics'></section>
 <section class='charts'><article class='panel'><h2>容器 CPU / 内存历史</h2><div class='legend'><span><i class='dot' style='background:#4a90e2'></i>CPU%</span><span><i class='dot' style='background:#16a085'></i>内存%</span></div><svg id='resource-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article><article class='panel'><h2>容器网络速率历史</h2><div class='legend'><span><i class='dot' style='background:#2ecc71'></i>RX Mbps</span><span><i class='dot' style='background:#f39c12'></i>TX Mbps</span></div><svg id='network-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article></section>
 <section class='details'><article class='panel'><h2>容器内部进程</h2><div id='processes'></div></article><article class='panel'><h2>容器网络命名空间</h2><dl id='network' class='kv'></dl></article><article class='panel'><h2>安全与面板检查</h2><div id='security'></div></article><article class='panel'><h2>容器文件系统</h2><dl id='filesystem' class='kv'></dl></article></section>
@@ -1904,21 +2052,48 @@ function fmtBytes(n){const x=Number(n||0);if(x<=0)return '0 B';const u=['B','KB'
 function mbps(v){return Number(v||0)*8/1000000}function num(v,d=2){const n=Number(v||0);return Number.isFinite(n)?n.toFixed(d):'0.00'}
 function linePoints(values,max,w=900,h=220,pad=18){return values.map((v,i)=>`${i*(w/Math.max(1,values.length-1))},${(h-pad)-(Number(v||0)/Math.max(1,max))*(h-pad*2)}`).join(' ')}
 function drawChart(id,series){const svg=document.getElementById(id);const values=series.flatMap(x=>x.values);const max=Math.max(1,...values);let grid='';for(let i=0;i<=4;i++){const y=18+i*46;grid+=`<line x1='0' y1='${y}' x2='900' y2='${y}' stroke='#29466f' stroke-width='1'/>`}svg.innerHTML=grid+series.map(x=>`<polyline fill='none' stroke='${x.color}' stroke-width='2.5' points='${linePoints(x.values,max)}'/>`).join('')}
-function sourceText(runtime){if(runtime==='incus')return 'Incus 容器级 cgroup/OpenMetrics 与网络命名空间';if(runtime==='podman')return 'Podman 容器 stats 与网络命名空间';return 'Docker 仅提醒模式（不执行深度采集）'}
-function listHtml(items,empty,mapper){return items.length?`<ul class='list'>${items.map(mapper).join('')}</ul>`:`<div class='ok'>${esc(empty)}</div>`}
-async function loadDetail(){
+    function sourceText(runtime){if(runtime==='incus')return 'Incus 容器级 cgroup/OpenMetrics 与网络命名空间';if(runtime==='podman')return 'Podman 容器 stats 与网络命名空间';return 'Docker 仅提醒模式（不执行深度采集）'}
+    function listHtml(items,empty,mapper){return items.length?`<ul class='list'>${items.map(mapper).join('')}</ul>`:`<div class='ok'>${esc(empty)}</div>`}
+    let diagnosticSubmitting=false;
+    function detailIdentity(){const q=new URLSearchParams(location.search);return {host_id:q.get('host')||'',runtime:q.get('runtime')||'',project:q.get('project')||'',container_name:q.get('container')||''}}
+    function renderDiagnostic(data,runtime){
+     const action=data?.action||null,sample=data?.sample||null,state=document.getElementById('diagnostic-state'),button=document.getElementById('request-diagnostic');
+     const active=action&&['queued','dispatched'].includes(action.status);button.disabled=diagnosticSubmitting||active||!['incus','podman'].includes(runtime);
+     button.innerText=diagnosticSubmitting?'正在提交…':active?'等待上报中':'请求深度上报';
+     if(!['incus','podman'].includes(runtime)){state.className='diagnostic-state warn';state.innerText='Docker 默认仅提醒，不执行深度采集。'}
+     else if(diagnosticSubmitting){state.className='diagnostic-state warn';state.innerText='正在提交一次性采样任务，请稍候…'}
+     else if(action?.status==='queued'){state.className='diagnostic-state warn';state.innerText=`任务 #${action.id} 已排队，等待节点领取（通常 10 秒内）。`}
+     else if(action?.status==='dispatched'){state.className='diagnostic-state warn';state.innerText=`任务 #${action.id} 已由节点领取，正在等待下一次上报。`}
+     else if(action?.status==='succeeded'){state.className='diagnostic-state ok';state.innerText=`任务 #${action.id} 已完成 · ${action.updated_at_utc8||'-'}`}
+     else if(action?.status==='failed'){state.className='diagnostic-state bad';state.innerText=`任务 #${action.id} 失败：${action.result_message||'节点未返回报告，可重试。'}`}
+     else{state.className='diagnostic-state';state.innerText='尚未请求深度上报。'}
+     const target=document.getElementById('diagnostic-report');if(!sample){target.innerHTML=`<div class='comm-note'>收到报告后将在这里显示瞬时流量、详细进程、连接 IP 和进程归属。</div>`;return}
+     const rates=sample.network_rates||{},processes=sample.processes?.items||[],ips=sample.connection_ips||[],sockets=sample.communication_sockets||[],errors=sample.errors||[];
+     const metrics=[['报告时间',sample.report_timestamp_utc8||'-'],['瞬时 RX',`${num(mbps(rates.rx_bps))} Mbps`],['瞬时 TX',`${num(mbps(rates.tx_bps))} Mbps`],['RX / TX pps',`${num(rates.rx_pps,1)} / ${num(rates.tx_pps,1)}`],['进程数',Number(sample.process_count||0)],['连接 IP',Number(sample.unique_connection_ips||0)],['连接明细',Number(sample.connection_count||0)],['采样窗口',`${num(rates.sample_seconds,2)} 秒`]];
+     const processRows=processes.length?processes.map(x=>`<div class='deep-row'><strong>${esc(x.process||'unknown')} · PID ${Number(x.pid||0)}</strong><br/>用户 ${esc(x.user||'-')} · CPU ${num(x.cpu_percent)}% · RSS ${fmtBytes(x.rss_bytes)} · 状态 ${esc(x.state||'-')}<br/>${esc(x.command||'-')}</div>`).join(''):`<div class='deep-row'>未采集到进程明细。</div>`;
+     const ipRows=ips.length?ips.map(x=>`<div class='deep-row'><strong>${esc(x.ip||'-')}</strong> · 连接 ${Number(x.connections||0)} · 入站 ${Number(x.inbound||0)} · 出站 ${Number(x.outbound||0)}<br/>进程：${esc((x.processes||[]).join('、')||'unknown')}</div>`).join(''):`<div class='deep-row'>采样瞬间没有可见的公网连接 IP。</div>`;
+     const socketRows=sockets.length?sockets.slice(0,250).map(x=>`<div class='deep-row'><strong>${esc(x.process||'unknown')} · PID ${Number(x.pid||0)||'-'}</strong> · ${esc(String(x.proto||'').toUpperCase())} · ${x.direction==='inbound'?'入站':'出站'}<br/>本地 ${esc(x.local||'-')} → 远端 ${esc(x.remote||'-')}</div>`).join(''):`<div class='deep-row'>采样瞬间没有活动连接明细。</div>`;
+     target.innerHTML=`<div class='deep-metrics'>${metrics.map(x=>`<div class='deep-metric'><span>${esc(x[0])}</span><strong>${esc(x[1])}</strong></div>`).join('')}</div><div class='deep-grid'><section class='deep-section'><h3>进程快照（${processes.length}）</h3><div class='deep-list'>${processRows}</div></section><section class='deep-section'><h3>连接 IP（${ips.length}）</h3><div class='deep-list'>${ipRows}</div></section></div><section class='deep-section'><h3>连接与进程归属（${sockets.length}）</h3><div class='deep-list'>${socketRows}</div></section>${errors.length?`<div class='deep-errors'>部分数据不可用：${esc(errors.join('；'))}</div>`:''}<p class='comm-note'>报告为单次有界元数据快照，进程最多 100 条、连接最多 250 条；命令行中的常见凭据字段已脱敏。</p>`;
+    }
+    async function requestDeepSample(){
+     if(diagnosticSubmitting)return;const identity=detailIdentity(),button=document.getElementById('request-diagnostic'),state=document.getElementById('diagnostic-state');diagnosticSubmitting=true;button.disabled=true;button.innerText='正在提交…';state.className='diagnostic-state warn';state.innerText='正在提交一次性采样任务，请稍候…';
+     try{const response=await fetch('/api/v1/containers/diagnostics',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(identity)});const data=await response.json();if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);diagnosticSubmitting=false;renderDiagnostic({action:data.action,sample:null},identity.runtime);await loadDetail()}
+     catch(error){diagnosticSubmitting=false;button.disabled=false;button.innerText='重试深度上报';state.className='diagnostic-state bad';state.innerText=`提交失败：${error.message||error}`}
+    }
+    async function loadDetail(){
  const q=new URLSearchParams(location.search),host=q.get('host')||'',runtime=q.get('runtime')||'',project=q.get('project')||'',container=q.get('container')||'';
  if(!host||!runtime||!container){document.getElementById('status').className='status bad';document.getElementById('status').innerText='详情参数不完整，请从总览或统计页重新进入。';return}
  document.getElementById('title').innerText=container;document.getElementById('subtitle').innerText=`${host} · ${project?`${runtime}/${project}`:runtime}`;
- const params=new URLSearchParams({host_id:host,runtime,project,container_name:container,minutes:'1440'});
- try{
-  const [latestData,historyData]=await Promise.all([fetch('/api/v1/latest?include_stale=true').then(r=>r.json()),fetch(`/api/v1/history?${params}`).then(r=>r.json())]);
+     const params=new URLSearchParams({host_id:host,runtime,project,container_name:container,minutes:'1440'}),diagnosticParams=new URLSearchParams({host_id:host,runtime,project,container_name:container});
+     try{
+      const [latestData,historyData,diagnosticData]=await Promise.all([fetch('/api/v1/latest?include_stale=true').then(r=>r.json()),fetch(`/api/v1/history?${params}`).then(r=>r.json()),fetch(`/api/v1/containers/diagnostics?${diagnosticParams}`).then(r=>r.json())]);
   const current=(latestData.items||[]).find(x=>x.host_id===host&&x.runtime===runtime&&(x.project||'')===project&&x.container_name===container);const allPts=historyData.items||[];const currentVersion=String(current?.agent_version||'unknown');const pts=currentVersion==='unknown'?allPts:allPts.filter(x=>String(x.agent_version||'unknown')===currentVersion);const excludedSamples=allPts.length-pts.length;
   const status=document.getElementById('status'),version=document.getElementById('detail-version');
   const clientVersion=String(current?.agent_version||'unknown'),serverVersion=String(latestData.server_version||'dev');
   if(clientVersion!=='unknown'&&clientVersion!=='dev'&&clientVersion===serverVersion){version.className='version-pill ok';version.innerText=`Client / Server v${serverVersion}`}
   else if(clientVersion==='unknown'||clientVersion==='dev'){version.className='version-pill warn';version.innerText=`Client 版本未知 · Server ${serverVersion==='dev'?'dev':`v${serverVersion}`}`}
-  else{version.className='version-pill bad';version.innerText=`Client v${clientVersion} · Server v${serverVersion}`}
+      else{version.className='version-pill bad';version.innerText=`Client v${clientVersion} · Server v${serverVersion}`}
+      renderDiagnostic(diagnosticData,runtime);
   if(current){status.innerHTML=`<span class='source'>${esc(sourceText(runtime))}</span>　最新采样 ${esc(current.timestamp_iso_utc8||'-')}${excludedSamples?`　已忽略 ${excludedSamples} 条旧版本口径样本`:''}${current.alerts?.stale?'　<span class="bad-text">当前离线或上报已过期</span>':''}`}
   else{status.className='status bad';status.innerText='未找到该容器的当前采样，仅显示保留的历史数据。'}
   const sec=current?.security||{},limit=Number(current?.mem_limit_bytes||0),used=Number(current?.mem_bytes||0),rootTotal=Number(current?.container_fs_root_total_bytes||0),rootAvail=Number(current?.container_fs_root_avail_bytes||0);

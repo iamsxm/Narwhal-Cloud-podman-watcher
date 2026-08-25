@@ -707,6 +707,44 @@ class SecurityTelemetryTests(unittest.TestCase):
             )
             self.assertEqual(panel_alert["unapproved_domains"], ["new.example.net"])
 
+    def test_deep_sample_action_is_scheduled_without_premature_result(self):
+        action = {
+            "id": 42,
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node1",
+            "action_type": "request_deep_sample",
+            "params": {"sample_seconds": 1, "process_limit": 100, "socket_limit": 250},
+        }
+        agent._pending_deep_samples.clear()
+        with mock.patch.object(
+            agent, "signed_post_json", return_value={"actions": [action]}
+        ) as post:
+            changed = agent.process_security_actions("https://server", "secret", "host1")
+        self.assertTrue(changed)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(agent._pending_deep_samples[42]["container_name"], "node1")
+        self.assertEqual(
+            agent._pending_deep_sample_for(
+                {"runtime": "incus", "project": "default", "name": "node1"}
+            )["id"],
+            42,
+        )
+        agent._pending_deep_samples.clear()
+
+    def test_deep_process_snapshot_redacts_common_credentials(self):
+        output = (
+            "12 1 root S 3.5 2048 app /usr/bin/app --token=abc123 "
+            "--password=hunter2 https://user:pass@example.net/api\n"
+        )
+        with mock.patch.object(agent, "run", return_value=output):
+            result = agent._collect_deep_process_snapshot("incus", "node1", "default", 100)
+        command = result["items"][0]["command"]
+        self.assertNotIn("abc123", command)
+        self.assertNotIn("hunter2", command)
+        self.assertNotIn("user:pass", command)
+        self.assertGreater(result["items"][0]["rss_bytes"], 0)
+
     def test_parses_caddy_and_nginx_access_logs(self):
         caddy = agent._parse_access_log_line(
             json.dumps(

@@ -656,6 +656,74 @@ class ServerRuntimeTests(unittest.TestCase):
         conn.close()
         self.assertEqual(row, ("podman", ""))
 
+    def test_container_diagnostic_is_deduplicated_and_completed_by_report(self):
+        self._insert("incus", 2, "default")
+
+        class State:
+            dashboard_user = "operator"
+
+        class DiagnosticRequest:
+            state = State()
+
+            async def json(self):
+                return {
+                    "host_id": "host",
+                    "runtime": "incus",
+                    "project": "default",
+                    "container_name": "same-name",
+                }
+
+        first = json.loads(asyncio.run(server.request_container_diagnostic(DiagnosticRequest())).body)
+        second = json.loads(asyncio.run(server.request_container_diagnostic(DiagnosticRequest())).body)
+        self.assertTrue(first["queued"])
+        self.assertFalse(second["queued"])
+        self.assertEqual(first["action"]["id"], second["action"]["id"])
+
+        now = int(time.time())
+        payload = {
+            "host_id": "host",
+            "agent_version": "1.1.0",
+            "timestamp": now,
+            "container_network": {"ipv4_ok": True, "ipv6_ok": True},
+            "containers": [
+                {
+                    "name": "same-name",
+                    "runtime": "incus",
+                    "project": "default",
+                    "deep_sample": {
+                        "action_id": first["action"]["id"],
+                        "sampled_at": now,
+                        "process_count": 7,
+                        "network_rates": {"rx_bps": 123, "tx_bps": 456},
+                    },
+                }
+            ],
+            "security": {"alerts": []},
+        }
+        body = json.dumps(payload).encode()
+
+        class ReportRequest:
+            async def body(self):
+                return body
+
+        timestamp = str(now)
+        signature = hmac.new(
+            server.SHARED_SECRET.encode(), body + timestamp.encode(), hashlib.sha256
+        ).hexdigest()
+        asyncio.run(server.report(ReportRequest(), timestamp, signature))
+        status = json.loads(
+            server.container_diagnostic_status("host", "incus", "same-name", "default").body
+        )
+        self.assertEqual(status["action"]["status"], "succeeded")
+        self.assertEqual(status["sample"]["process_count"], 7)
+        self.assertEqual(status["sample"]["agent_version"], "1.1.0")
+
+    def test_container_detail_includes_on_demand_diagnostic_controls(self):
+        html = server.container_detail_page()
+        self.assertIn("请求深度上报", html)
+        self.assertIn("/api/v1/containers/diagnostics", html)
+        self.assertIn("不抓包、不扫描文件", html)
+
 
 if __name__ == "__main__":
     unittest.main()

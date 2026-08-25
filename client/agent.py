@@ -33,6 +33,7 @@ _packet_counters: Dict[str, Dict[str, float]] = {}
 _protocol_counters: Dict[str, Dict[str, float]] = {}
 _access_log_states: Dict[str, Dict[str, object]] = {}
 _security_last_sample_ts = 0.0
+_pending_deep_samples: Dict[int, Dict[str, object]] = {}
 
 
 def _is_containerized_runtime() -> bool:
@@ -777,11 +778,24 @@ def _parse_socket_endpoint(endpoint: str) -> Tuple[str, int]:
 
 
 def _collect_socket_process_details(
-    runtime: str, name: str, project: str, listening_ports: List[int]
+    runtime: str,
+    name: str,
+    project: str,
+    listening_ports: List[int],
+    snapshot_limit_override: int = 0,
+    detail_limit_override: int = 0,
 ) -> Dict[str, object]:
     """Collect one bounded socket snapshot and reuse it for process attribution."""
-    snapshot_limit = max(50, min(2000, int(_env_float("SECURITY_SOCKET_SNAPSHOT_MAX", 500))))
-    detail_limit = max(10, min(500, int(_env_float("SECURITY_COMMUNICATION_DETAIL_MAX", 100))))
+    snapshot_limit = (
+        max(50, min(2000, int(snapshot_limit_override)))
+        if snapshot_limit_override
+        else max(50, min(2000, int(_env_float("SECURITY_SOCKET_SNAPSHOT_MAX", 500))))
+    )
+    detail_limit = (
+        max(10, min(500, int(detail_limit_override)))
+        if detail_limit_override
+        else max(10, min(500, int(_env_float("SECURITY_COMMUNICATION_DETAIL_MAX", 100))))
+    )
     command = (
         "if command -v ss >/dev/null 2>&1; then "
         "echo @@SS_AVAILABLE@@; "
@@ -3525,6 +3539,158 @@ def collect_container(
     }
 
 
+def _redact_process_command(command: str) -> str:
+    """Remove common inline credentials before a process command is reported."""
+    value = re.sub(
+        r"(?i)(password|passwd|token|secret|api[_-]?key|authorization)(\s*[=:]\s*|\s+)([^\s]{1,300})",
+        r"\1\2[REDACTED]",
+        command or "",
+    )
+    value = re.sub(r"(?i)(https?://[^\s:/]+:)[^@\s]+@", r"\1[REDACTED]@", value)
+    return value[:500]
+
+
+def _collect_deep_process_snapshot(
+    runtime: str, name: str, project: str, process_limit: int
+) -> Dict[str, object]:
+    capture_limit = max(20, min(200, int(process_limit)))
+    command = (
+        "(ps -eo pid=,ppid=,user=,stat=,pcpu=,rss=,comm=,args= --sort=-pcpu 2>/dev/null || "
+        "ps -eo pid=,ppid=,user=,stat=,pcpu=,rss=,comm=,args= 2>/dev/null) "
+        f"| head -n {capture_limit + 1}"
+    )
+    output = run(_runtime_exec_cmd(runtime, name, command, project))
+    processes: List[Dict[str, object]] = []
+    for raw_line in output.splitlines():
+        parts = raw_line.strip().split(None, 7)
+        if len(parts) < 7 or not parts[0].isdigit():
+            continue
+        try:
+            processes.append(
+                {
+                    "pid": int(parts[0]),
+                    "ppid": int(parts[1]) if parts[1].isdigit() else 0,
+                    "user": parts[2][:80],
+                    "state": parts[3][:20],
+                    "cpu_percent": max(0.0, float(parts[4].replace(",", "."))),
+                    "rss_bytes": max(0, int(parts[5])) * 1024,
+                    "process": parts[6][:120],
+                    "command": _redact_process_command(parts[7] if len(parts) > 7 else parts[6]),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    processes.sort(key=lambda item: float(item.get("cpu_percent") or 0), reverse=True)
+    return {
+        "available": bool(output.strip()),
+        "captured": min(len(processes), capture_limit),
+        "truncated": len(processes) > capture_limit,
+        "items": processes[:capture_limit],
+    }
+
+
+def collect_container_deep_sample(
+    name: str,
+    runtime: str,
+    runtime_name: str,
+    project: str,
+    pid: int,
+    action: Dict[str, object],
+    base_report: Dict[str, object],
+) -> Dict[str, object]:
+    """Collect a single bounded diagnostic snapshot for an explicitly requested container."""
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    sample_seconds = max(0.5, min(2.0, float(params.get("sample_seconds") or 1.0)))
+    process_limit = max(20, min(200, int(params.get("process_limit") or 100)))
+    socket_limit = max(50, min(500, int(params.get("socket_limit") or 250)))
+    started = time.monotonic()
+    errors: List[str] = []
+
+    first = _read_net_stats_from_pid(pid)
+    time.sleep(sample_seconds)
+    second = _read_net_stats_from_pid(pid)
+    elapsed = max(0.001, time.monotonic() - started)
+    if pid <= 0:
+        errors.append("container init pid unavailable; instantaneous network counters are unavailable")
+    rates = {
+        "sample_seconds": round(elapsed, 3),
+        "rx_bps": max(0.0, float(second[0] - first[0]) / elapsed),
+        "tx_bps": max(0.0, float(second[1] - first[1]) / elapsed),
+        "rx_pps": max(0.0, float(second[2] - first[2]) / elapsed),
+        "tx_pps": max(0.0, float(second[3] - first[3]) / elapsed),
+    }
+
+    process_snapshot = _collect_deep_process_snapshot(runtime, name, project, process_limit)
+    if not process_snapshot.get("available"):
+        errors.append("ps is unavailable inside the container")
+    security = base_report.get("security") if isinstance(base_report.get("security"), dict) else {}
+    listening_ports = security.get("listening_ports") if isinstance(security.get("listening_ports"), list) else []
+    communication = _collect_socket_process_details(
+        runtime,
+        name,
+        project,
+        listening_ports,
+        snapshot_limit_override=max(500, socket_limit * 2),
+        detail_limit_override=socket_limit,
+    )
+    _enrich_communication_with_original_sources(
+        communication,
+        security.get("inbound_public_flows", [])
+        if isinstance(security.get("inbound_public_flows"), list)
+        else [],
+    )
+    sockets = communication.get("communication_sockets")
+    sockets = sockets if isinstance(sockets, list) else []
+    ip_totals: Dict[str, Dict[str, object]] = {}
+    for item in sockets:
+        if not isinstance(item, dict):
+            continue
+        remote_ip = str(item.get("remote_ip") or "")
+        original_ips = item.get("original_remote_ips") if isinstance(item.get("original_remote_ips"), list) else []
+        candidates = original_ips if item.get("direction") == "inbound" and original_ips else [remote_ip]
+        for ip in candidates:
+            normalized = str(ip or "")
+            if not _is_trackable_ip(normalized):
+                continue
+            entry = ip_totals.setdefault(
+                normalized,
+                {"ip": normalized, "connections": 0, "inbound": 0, "outbound": 0, "processes": set()},
+            )
+            entry["connections"] = int(entry["connections"]) + 1
+            direction = "inbound" if item.get("direction") == "inbound" else "outbound"
+            entry[direction] = int(entry[direction]) + 1
+            processes = entry.get("processes")
+            if isinstance(processes, set):
+                processes.add(str(item.get("process") or "unknown")[:120])
+    connection_ips = []
+    for entry in ip_totals.values():
+        processes = entry.pop("processes", set())
+        entry["processes"] = sorted(processes)[:20] if isinstance(processes, set) else []
+        connection_ips.append(entry)
+    connection_ips.sort(key=lambda item: int(item.get("connections") or 0), reverse=True)
+
+    return {
+        "action_id": int(action.get("id") or 0),
+        "sampled_at": int(time.time()),
+        "runtime": runtime_name,
+        "project": project,
+        "container_name": name,
+        "network_rates": rates,
+        "process_count": int(security.get("process_count") or process_snapshot.get("captured") or 0),
+        "processes": process_snapshot,
+        "connection_count": max(int(base_report.get("conn_count") or 0), len(sockets)),
+        "unique_connection_ips": len(connection_ips),
+        "inbound_unique_ips": int(security.get("inbound_unique_ips") or 0),
+        "outbound_unique_ips": int(security.get("outbound_unique_ips") or 0),
+        "connection_ips": connection_ips[:100],
+        "communication_processes": communication.get("communication_processes", []),
+        "communication_sockets": sockets,
+        "socket_snapshot_count": int(communication.get("communication_snapshot_count") or 0),
+        "socket_snapshot_truncated": bool(communication.get("communication_snapshot_truncated")),
+        "errors": errors,
+    }
+
+
 _disk_alert_cache: Dict[str, object] = {}
 _disk_alert_cache_at = 0.0
 
@@ -3951,6 +4117,45 @@ def execute_security_action(action: Dict) -> Tuple[bool, str]:
     return False, "unsupported action type"
 
 
+def _schedule_deep_sample(action: Dict) -> Tuple[bool, str]:
+    action_id = int(action.get("id") or 0)
+    runtime = str(action.get("runtime") or "").strip().lower()
+    container_name = str(action.get("container_name") or "").strip()
+    if action_id <= 0 or not container_name:
+        return False, "invalid deep sample request"
+    if runtime not in ("incus", "podman"):
+        return False, "deep sampling is limited to Incus and Podman containers"
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    try:
+        normalized_params = {
+            "sample_seconds": max(0.5, min(2.0, float(params.get("sample_seconds") or 1.0))),
+            "process_limit": max(20, min(200, int(params.get("process_limit") or 100))),
+            "socket_limit": max(50, min(500, int(params.get("socket_limit") or 250))),
+        }
+    except (TypeError, ValueError):
+        return False, "invalid deep sample limits"
+    scheduled = dict(action)
+    scheduled["params"] = normalized_params
+    _pending_deep_samples[action_id] = scheduled
+    return True, "scheduled for the next report cycle"
+
+
+def _pending_deep_sample_for(container: Dict[str, object]) -> Dict[str, object] | None:
+    runtime = str(container.get("runtime") or "")
+    project = str(container.get("project") or "")
+    name = str(container.get("name") or "")
+    return next(
+        (
+            action
+            for action in _pending_deep_samples.values()
+            if str(action.get("runtime") or "") == runtime
+            and str(action.get("project") or "") == project
+            and str(action.get("container_name") or "") == name
+        ),
+        None,
+    )
+
+
 def process_security_actions(server: str, secret: str, host_id: str) -> bool:
     response = signed_post_json(server, secret, "/api/v1/actions/poll", {"host_id": host_id})
     actions = response.get("actions") if isinstance(response.get("actions"), list) else []
@@ -3958,8 +4163,15 @@ def process_security_actions(server: str, secret: str, host_id: str) -> bool:
     for action in actions:
         if not isinstance(action, dict):
             continue
-        ok, message = execute_security_action(action)
         action_id = int(action.get("id") or 0)
+        if str(action.get("action_type") or "") == "request_deep_sample":
+            ok, message = _schedule_deep_sample(action)
+            if ok:
+                print(f"diagnostic action {action_id} accepted: {message}")
+                changed = True
+                continue
+        else:
+            ok, message = execute_security_action(action)
         signed_post_json(
             server,
             secret,
@@ -4027,6 +4239,7 @@ def main() -> None:
         if security_enabled:
             _augment_conntrack_with_host_proxy_sockets(host_conntrack, containers)
         collected = []
+        included_deep_sample_ids: List[int] = []
         for c in containers:
             if c.get("runtime") == "docker" and docker_mode == "notice":
                 collected.append(collect_docker_notice(c))
@@ -4054,6 +4267,21 @@ def main() -> None:
             container_security = container_report.get("security")
             if security_enabled and isinstance(container_security, dict):
                 container_security["access_log"] = _collect_container_access_log_stats(c, security_interval)
+            pending_deep_sample = _pending_deep_sample_for(c)
+            if pending_deep_sample is not None:
+                try:
+                    container_report["deep_sample"] = collect_container_deep_sample(
+                        c["name"],
+                        str(c.get("runtime_bin") or ""),
+                        str(c.get("runtime") or ""),
+                        str(c.get("project") or ""),
+                        pid_hint,
+                        pending_deep_sample,
+                        container_report,
+                    )
+                    included_deep_sample_ids.append(int(pending_deep_sample.get("id") or 0))
+                except Exception as deep_error:
+                    print(f"deep sample failed for {c.get('name')}: {deep_error}")
             collected.append(container_report)
         security = collect_security_summary(collected, security_interval)
         payload = {
@@ -4067,6 +4295,8 @@ def main() -> None:
         }
         try:
             push(args.server, args.secret, payload)
+            for action_id in included_deep_sample_ids:
+                _pending_deep_samples.pop(action_id, None)
             print(f"reported {len(containers)} containers and {len(security.get('alerts', []))} security alerts to {args.server}")
         except Exception as e:
             print(f"report failed: {e}")

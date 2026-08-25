@@ -1293,24 +1293,26 @@ def stats(minutes: int = 720) -> JSONResponse:
 def dashboard() -> str:
     return """
 <!doctype html>
-<html><head><meta charset='utf-8'><title>Narwhal Container Monitor</title>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Narwhal Container Monitor</title>
 <style>
-body{font-family:sans-serif;margin:1rem;background:#0f1a2e;color:#dbe7ff}
-table{border-collapse:collapse;width:100%;background:#13213b;color:#dbe7ff}
-th,td{border:1px solid #233b61;padding:8px;vertical-align:middle;text-align:center}
+*{box-sizing:border-box}
+html,body{max-width:100%;overflow-x:hidden}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:1rem;background:#0f1a2e;color:#dbe7ff;line-height:1.5}
+table{border-collapse:collapse;width:100%;max-width:100%;table-layout:fixed;background:#13213b;color:#dbe7ff}
+th,td{border:1px solid #233b61;padding:8px;vertical-align:middle;text-align:center;overflow-wrap:anywhere;word-break:break-word}
 th{background:#1a2c4e}
-.bad{color:#b00020;font-weight:bold}
-.ok{color:#0a8f08}
+.bad{color:#ff6b78;font-weight:bold}
+.ok{color:#72dfa7}
 .severity-critical{color:#ff5f6d;font-weight:bold}
 .severity-warning{color:#ffbf4b;font-weight:bold}
-.btn{border:1px solid #4b6fa8;padding:4px 8px;border-radius:6px;background:#1a2c4e;color:#dbe7ff;cursor:pointer}
+.btn{border:1px solid #4b6fa8;min-height:44px;padding:7px 11px;border-radius:8px;background:#1a2c4e;color:#dbe7ff;cursor:pointer;touch-action:manipulation}
 .btn-danger{background:#7c2330;border-color:#d94b61;margin-right:6px}
 .btn-allow{background:#185d4a;border-color:#36a77f;margin-right:6px}
 .btn-dismiss{background:#34445e;border-color:#6e85a8}
 .btn:disabled{opacity:.55;cursor:not-allowed}
 .action-status{font-size:12px;margin-top:5px;color:#a9bddc;max-width:260px}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center}
-#card{background:#0d1730;border-radius:12px;padding:16px;width:min(1380px,96vw)}
+#card{background:#0d1730;border-radius:12px;padding:16px;width:min(1380px,96vw);max-height:94vh;overflow-y:auto}
 .legend{display:flex;gap:14px;align-items:center;margin:8px 0 4px 0;font-size:14px}
 .legend-item{display:flex;align-items:center;gap:6px}
 .dot{width:10px;height:10px;border-radius:50%}
@@ -1321,6 +1323,60 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 #traffic{height:280px}
 .snapshot-grid{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:10px;margin-top:12px}
 .snapshot-list{margin:6px 0 0 18px;padding:0;text-align:left;max-height:180px;overflow:auto}
+#security-alerts th:nth-child(6){width:28%}
+#security-alerts th:nth-child(9){width:25%}
+.host-list{display:grid;gap:12px;width:100%;min-width:0}
+.host-group{min-width:0;overflow:hidden;border:1px solid #29466f;border-radius:14px;background:#111f38;box-shadow:0 8px 24px rgba(3,10,24,.18)}
+.host-toggle{width:100%;min-height:76px;border:0;background:#172844;color:#dbe7ff;display:grid;grid-template-columns:24px minmax(0,1fr) minmax(240px,auto);align-items:center;gap:12px;padding:14px 16px;text-align:left;cursor:pointer;touch-action:manipulation}
+.host-toggle:hover{background:#1b3153}
+.host-toggle:focus-visible,.btn:focus-visible{outline:3px solid #8cc7ff;outline-offset:-3px}
+.host-chevron{width:20px;height:20px;transition:transform 180ms ease;color:#8cc7ff}
+.host-group.is-open .host-chevron{transform:rotate(90deg)}
+.host-title{min-width:0}
+.host-name{font-size:18px;font-weight:750;overflow-wrap:anywhere}
+.host-subtitle{display:block;margin-top:3px;color:#9fb5d5;font-size:13px}
+.host-summary{display:flex;justify-content:flex-end;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
+.pill{display:inline-flex;align-items:center;min-height:28px;padding:3px 9px;border:1px solid #365680;border-radius:999px;background:#10213c;color:#c9dbf5;font-size:12px;white-space:normal}
+.pill-ok{border-color:#2f8568;background:#123e35;color:#8ee6c2}
+.pill-warn{border-color:#b78035;background:#49371b;color:#ffd58c}
+.pill-bad{border-color:#a84655;background:#4f202a;color:#ffadb8}
+.host-panel{padding:14px;border-top:1px solid #29466f}
+.host-panel[hidden]{display:none}
+.containers-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(520px,100%),1fr));gap:14px;min-width:0}
+.container-card{min-width:0;border:1px solid #2a456d;border-radius:12px;background:#13213b;padding:14px;box-shadow:0 5px 16px rgba(4,11,26,.16)}
+.container-card:hover{border-color:#4472aa;box-shadow:0 8px 24px rgba(4,11,26,.26)}
+.container-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
+.container-name{font-size:17px;font-weight:750;overflow-wrap:anywhere}
+.container-meta{margin-top:2px;color:#9fb5d5;font-size:12px;overflow-wrap:anywhere}
+.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:10px}
+.metric{min-width:0;border:1px solid #274365;border-radius:9px;background:#0f1c33;padding:8px}
+.metric-label{display:block;color:#91a9cb;font-size:11px;line-height:1.25}
+.metric-value{display:block;margin-top:4px;font-size:15px;font-weight:700;overflow-wrap:anywhere}
+.container-info-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
+.info-block{min-width:0;border:1px solid #274365;border-radius:9px;background:#101e36;padding:10px}
+.info-block h4{margin:0 0 7px;font-size:13px;color:#9fc8ff}
+.kv{display:grid;grid-template-columns:minmax(76px,auto) minmax(0,1fr);gap:5px 8px;margin:0;font-size:12px}
+.kv dt{color:#8fa8ca}
+.kv dd{min-width:0;margin:0;text-align:right;overflow-wrap:anywhere}
+.container-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-top:12px}
+.empty-state{border:1px dashed #365680;border-radius:12px;padding:22px;text-align:center;color:#9fb5d5}
+@media (max-width:1000px){
+  .host-toggle{grid-template-columns:24px minmax(0,1fr)}
+  .host-summary{grid-column:2;justify-content:flex-start}
+  .container-info-grid{grid-template-columns:1fr}
+  .snapshot-grid,.detail-grid{grid-template-columns:1fr}
+}
+@media (max-width:680px){
+  body{margin:8px}
+  th,td{padding:6px;font-size:12px}
+  .host-toggle{padding:12px 10px;gap:8px}
+  .host-panel{padding:9px}
+  .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .container-head{flex-direction:column}
+  .host-summary{gap:5px}
+  #security-alerts th:nth-child(4),#security-alerts td:nth-child(4),#security-alerts th:nth-child(7),#security-alerts td:nth-child(7),#security-alerts th:nth-child(8),#security-alerts td:nth-child(8){display:none}
+}
+@media (prefers-reduced-motion:reduce){.host-chevron{transition:none}}
 </style>
 </head><body>
 <h2>Narwhal Container Monitor Dashboard</h2>
@@ -1330,7 +1386,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 <h3>主机安全遥测</h3>
 <table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table>
 <h3>容器状态</h3>
-  <table id='t'><thead><tr><th>主机</th><th>运行时</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>内存%</th><th>连接数</th><th>进程数</th><th>RX pps</th><th>SYN_RECV</th><th>出站IP</th><th>监听端口</th><th>NAT/代理映射</th><th>TCP建连/s</th><th>TCP失败/s</th><th>可疑进程</th><th>配置风险</th><th>面板对接</th><th>国家Top3(TCP/UDP)</th><th>RX Mbps</th><th>TX Mbps</th><th>容器根盘(/ 总量/可用)</th><th>宿主机主盘(挂载点/总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
+<div id='host-containers' class='host-list' aria-live='polite'></div>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
   <div class='detail-grid'>
@@ -1487,23 +1543,59 @@ function groupByHost(items){
   }
   return [...m.entries()];
 }
+const expandedHosts=new Set();
+function setHostExpanded(host, group, button, panel, expanded){
+  if(expanded)expandedHosts.add(host);else expandedHosts.delete(host);
+  group.classList.toggle('is-open',expanded);
+  button.setAttribute('aria-expanded',String(expanded));
+  panel.hidden=!expanded;
+}
 async function load(){
   const r=await fetch('/api/v1/latest'); const d=await r.json();
-  const b=document.querySelector('#t tbody'); b.innerHTML='';
-  for(const [host, rows] of groupByHost(d.items)){
+  const hostList=document.getElementById('host-containers'); hostList.innerHTML='';
+  const groups=groupByHost(d.items||[]);
+  if(!groups.length){
+    hostList.innerHTML="<div class='empty-state'>暂未收到容器上报</div>";
+    return;
+  }
+  groups.forEach(([host, rows],hostIndex)=>{
     rows.sort((a,b)=>a.container_name.localeCompare(b.container_name));
-    rows.forEach((x,idx)=>{
-      const tr=document.createElement('tr');
+    const latest=rows.reduce((best,item)=>Number(item.timestamp||0)>Number(best.timestamp||0)?item:best,rows[0]);
+    const offlineCount=rows.filter(x=>x.alerts?.stale).length;
+    const runtimeCounts=new Map();
+    rows.forEach(x=>{
+      const runtimeBase=x.project&&x.runtime==='incus'?`${x.runtime}/${x.project}`:(x.runtime||'podman');
+      runtimeCounts.set(runtimeBase,(runtimeCounts.get(runtimeBase)||0)+1);
+    });
+    const hostMount=latest.disk_data_mountpoint||latest.disk_data_requested_path||'/';
+    const hostDiskText=`${hostMount}: ${formatCapacity(latest.disk_data_total_bytes,latest.disk_data_avail_bytes)}`;
+    const panelId=`host-panel-${hostIndex}`;
+    const toggleId=`host-toggle-${hostIndex}`;
+    const group=document.createElement('section');
+    group.className='host-group';
+    const toggle=document.createElement('button');
+    toggle.type='button';
+    toggle.id=toggleId;
+    toggle.className='host-toggle';
+    toggle.setAttribute('aria-controls',panelId);
+    toggle.innerHTML=`<svg class='host-chevron' viewBox='0 0 24 24' aria-hidden='true'><path d='m9 5 7 7-7 7' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/></svg>`+
+      `<span class='host-title'><span class='host-name'>${escapeHtml(host)}</span><span class='host-subtitle'>${rows.length} 个容器 · 主盘 ${escapeHtml(hostDiskText)} · 最近上报 ${escapeHtml(latest.timestamp_iso_utc8||'-')}</span></span>`+
+      `<span class='host-summary'>${[...runtimeCounts.entries()].map(([name,count])=>`<span class='pill'>${escapeHtml(name)} ${count}</span>`).join('')}`+
+      `<span class='pill ${offlineCount?'pill-bad':'pill-ok'}'>${offlineCount?`${offlineCount} 个离线`:'全部在线'}</span>`+
+      `<span class='pill ${latest.container_network_ok_v4?'pill-ok':'pill-bad'}'>IPv4 ${latest.container_network_ok_v4?'正常':'异常'}</span>`+
+      `<span class='pill ${latest.container_network_ok_v6?'pill-ok':'pill-warn'}'>IPv6 ${latest.container_network_ok_v6?'正常':'不可用'}</span></span>`;
+    const panel=document.createElement('div');
+    panel.id=panelId;
+    panel.className='host-panel';
+    panel.setAttribute('role','region');
+    panel.setAttribute('aria-labelledby',toggleId);
+    const grid=document.createElement('div');
+    grid.className='containers-grid';
+    rows.forEach(x=>{
       const cpuCls=x.alerts.cpu?'bad':'';
       const connCls=x.alerts.conn?'bad':'';
-      const hostMount=x.disk_data_mountpoint||x.disk_data_requested_path||'/';
-      const hostDiskText = `${hostMount}: ${formatCapacity(x.disk_data_total_bytes, x.disk_data_avail_bytes)}`;
       const containerDiskText = formatCapacity(x.container_fs_root_total_bytes, x.container_fs_root_avail_bytes);
-      let html='';
-      if(idx===0){
-        html += `<td rowspan='${rows.length}'>${host}</td>`;
-      }
-      const offlineTag = x.alerts.stale ? ` <span class='bad'>(离线 ${x.offline_hours} 小时)</span>` : '';
+      const offlineText=x.alerts.stale?`离线 ${Number(x.offline_hours||0)} 小时`:'在线';
       const runtimeBase = x.project && x.runtime==='incus' ? `${x.runtime}/${x.project}` : (x.runtime||'podman');
       const runtimeText = x.monitor_mode==='notice' ? `${runtimeBase}（仅提醒）` : runtimeBase;
       const security=x.security||{};
@@ -1512,18 +1604,37 @@ async function load(){
       const pairingText=panelPairing.detected?(panelPairing.approved?'白名单':((panelPairing.unapproved_domains||[]).join(',')||'发现特征')):'-';
       const listeningPorts=Array.isArray(security.listening_ports)?security.listening_ports.slice(0,8).join(','):'-';
       const exposureText=Array.isArray(security.network_exposure)&&security.network_exposure.length?security.network_exposure.slice(0,6).map(item=>`${item.listen||'?'}→${item.target||'?'}`).join(', '):'-';
-      html += `<td>${runtimeText}</td><td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cpuCls}'>${formatSmallNumber(x.cpu_percent, 2)}</td><td>${formatSmallNumber(x.mem_percent, 2)}</td><td class='${connCls}'>${x.conn_count}</td><td>${Number(security.process_count||0)}</td><td>${formatSmallNumber(security.net_rx_pps, 1)}</td><td>${Number(security.syn_recv_count||0)}</td><td>${Number(security.outbound_unique_ips||0)}</td><td>${escapeHtml(listeningPorts||'-')}</td><td>${escapeHtml(exposureText)}</td><td>${formatSmallNumber(protocolRates.Tcp_ActiveOpens_per_second,1)}</td><td>${formatSmallNumber(protocolRates.Tcp_AttemptFails_per_second,1)}</td><td>${Array.isArray(security.suspicious_processes)?security.suspicious_processes.length:0}</td><td>${Array.isArray(security.configuration_risks)?security.configuration_risks.length:0}</td><td class='${panelPairing.detected&&!panelPairing.approved?'bad':''}'>${escapeHtml(pairingText)}</td><td>${formatCountryStats(x.tcp_country_stats, x.udp_country_stats)}</td><td>${formatSmallNumber(bpsToMbps(x.net_rx_bps), 2)}</td><td>${formatSmallNumber(bpsToMbps(x.net_tx_bps), 2)}</td><td>${containerDiskText}</td>`;
-      if(idx===0){
-        html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${hostDiskText}</td>`;
-        html += `<td rowspan='${rows.length}' class='${x.container_network_ok_v4?'ok':'bad'}'>${x.container_network_ok_v4?'✅️':'❌️'}</td>`;
-        html += `<td rowspan='${rows.length}' class='${x.container_network_ok_v6?'ok':'bad'}'>${x.container_network_ok_v6?'✅️':'❌️'}</td>`;
-        html += `<td rowspan='${rows.length}' class='${x.alerts.stale?'bad':''}'>${x.timestamp_iso_utc8}</td>`;
-      }
-      html += `<td><button class='btn' onclick='openDetail(${JSON.stringify(host)}, ${JSON.stringify(x.runtime)}, ${JSON.stringify(x.project||'')}, ${JSON.stringify(x.container_name)})'>详情</button></td>`;
-      tr.innerHTML=html;
-      b.appendChild(tr);
+      const suspiciousCount=Array.isArray(security.suspicious_processes)?security.suspicious_processes.length:0;
+      const riskCount=Array.isArray(security.configuration_risks)?security.configuration_risks.length:0;
+      const card=document.createElement('article');
+      card.className='container-card';
+      card.innerHTML=`<div class='container-head'><div><div class='container-name'>${escapeHtml(x.container_name||'-')}</div>`+
+        `<div class='container-meta'>${escapeHtml(runtimeText)} · ID ${escapeHtml(x.container_id||'-')}</div></div>`+
+        `<span class='pill ${x.alerts.stale?'pill-bad':'pill-ok'}'>${escapeHtml(offlineText)}</span></div>`+
+        `<div class='metric-grid'>`+
+        `<div class='metric'><span class='metric-label'>CPU</span><strong class='metric-value ${cpuCls}'>${formatSmallNumber(x.cpu_percent,2)}%</strong></div>`+
+        `<div class='metric'><span class='metric-label'>内存</span><strong class='metric-value'>${formatSmallNumber(x.mem_percent,2)}%</strong></div>`+
+        `<div class='metric'><span class='metric-label'>连接数</span><strong class='metric-value ${connCls}'>${Number(x.conn_count||0)}</strong></div>`+
+        `<div class='metric'><span class='metric-label'>进程数</span><strong class='metric-value'>${Number(security.process_count||0)}</strong></div>`+
+        `<div class='metric'><span class='metric-label'>RX</span><strong class='metric-value'>${formatSmallNumber(bpsToMbps(x.net_rx_bps),2)} Mbps</strong></div>`+
+        `<div class='metric'><span class='metric-label'>TX</span><strong class='metric-value'>${formatSmallNumber(bpsToMbps(x.net_tx_bps),2)} Mbps</strong></div>`+
+        `<div class='metric'><span class='metric-label'>容器根盘 总量/可用</span><strong class='metric-value'>${escapeHtml(containerDiskText)}</strong></div></div>`+
+        `<div class='container-info-grid'>`+
+        `<section class='info-block'><h4>流量与连接</h4><dl class='kv'><dt>RX pps</dt><dd>${formatSmallNumber(security.net_rx_pps,1)}</dd><dt>SYN_RECV</dt><dd>${Number(security.syn_recv_count||0)}</dd><dt>出站 IP</dt><dd>${Number(security.outbound_unique_ips||0)}</dd><dt>TCP 建连/s</dt><dd>${formatSmallNumber(protocolRates.Tcp_ActiveOpens_per_second,1)}</dd><dt>TCP 失败/s</dt><dd>${formatSmallNumber(protocolRates.Tcp_AttemptFails_per_second,1)}</dd></dl></section>`+
+        `<section class='info-block'><h4>端口与网络</h4><dl class='kv'><dt>监听端口</dt><dd>${escapeHtml(listeningPorts||'-')}</dd><dt>NAT/代理</dt><dd>${escapeHtml(exposureText)}</dd><dt>来源 Top3</dt><dd>${formatCountryStats(x.tcp_country_stats,x.udp_country_stats)}</dd></dl></section>`+
+        `<section class='info-block'><h4>安全检查</h4><dl class='kv'><dt>面板对接</dt><dd class='${panelPairing.detected&&!panelPairing.approved?'bad':''}'>${escapeHtml(pairingText)}</dd><dt>可疑进程</dt><dd class='${suspiciousCount?'bad':''}'>${suspiciousCount}</dd><dt>配置风险</dt><dd class='${riskCount?'bad':''}'>${riskCount}</dd><dt>采样时间</dt><dd>${escapeHtml(x.timestamp_iso_utc8||'-')}</dd></dl></section></div>`+
+        `<div class='container-actions'><button type='button' class='btn detail-button'>查看容器详情</button></div>`;
+      card.querySelector('.detail-button').addEventListener('click',()=>openDetail(host,x.runtime,x.project||'',x.container_name));
+      grid.appendChild(card);
     });
-  }
+    panel.appendChild(grid);
+    group.appendChild(toggle);
+    group.appendChild(panel);
+    hostList.appendChild(group);
+    const isExpanded=expandedHosts.has(host);
+    setHostExpanded(host,group,toggle,panel,isExpanded);
+    toggle.addEventListener('click',()=>setHostExpanded(host,group,toggle,panel,!expandedHosts.has(host)));
+  });
 }
 function closeDetail(){ document.getElementById('modal').style.display='none'; }
 function buildPolyline(vals,maxv,w,h,pad){

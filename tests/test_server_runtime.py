@@ -173,6 +173,17 @@ class ServerRuntimeTests(unittest.TestCase):
             server.DASHBOARD_USERNAME = original_user
             server.DASHBOARD_PASSWORD = original_password
 
+    def test_dashboard_groups_containers_into_collapsed_responsive_host_cards(self):
+        html = server.dashboard()
+        self.assertIn("id='host-containers'", html)
+        self.assertIn("const expandedHosts=new Set();", html)
+        self.assertIn("className='host-group'", html)
+        self.assertIn("className='container-card'", html)
+        self.assertIn("panel.hidden=!expanded", html)
+        self.assertIn("overflow-x:hidden", html)
+        self.assertIn("aria-labelledby", html)
+        self.assertNotIn("<table id='t'", html)
+
     def test_panel_action_queue_and_agent_poll_are_signed(self):
         now = int(time.time())
         alert = {

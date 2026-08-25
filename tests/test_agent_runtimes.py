@@ -254,8 +254,8 @@ class SecurityTelemetryTests(unittest.TestCase):
 
     def test_detects_panel_pairing_without_returning_api_keys(self):
         def fake_run(cmd):
-            if "ps -eo comm,args" in cmd[-1]:
-                return "xboard-node --config /etc/xboard-node/config.yml\n"
+            if "ps -eo pid=,stat=,comm=,args=" in cmd[-1]:
+                return "123 S xboard-node xboard-node --config /etc/xboard-node/config.yml\n"
             return (
                 "@@FILE:/etc/xboard-node/config.yml\n"
                 "https://panel.example.net/api\n"
@@ -272,9 +272,39 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertTrue(result["detected"])
         self.assertEqual(result["panel_domains"], ["panel.example.net"])
         self.assertEqual(result["unapproved_domains"], ["panel.example.net"])
+        self.assertEqual(result["process_matches"], [{"pid": 123, "pattern": "xboard-node"}])
         self.assertNotIn("secret", json.dumps(result))
         self.assertTrue(agent._panel_domain_allowed("api.trusted.example.com", ["trusted.example.com"]))
         self.assertFalse(agent._panel_domain_allowed("trusted.example.com.evil.test", ["trusted.example.com"]))
+
+    def test_panel_detection_ignores_zombie_processes(self):
+        def fake_run(cmd):
+            if "ps -eo pid=,stat=,comm=,args=" in cmd[-1]:
+                return "456 Z v2bx [v2bx] <defunct>\n"
+            return "@@ENV\n"
+
+        with mock.patch.dict(
+            os.environ,
+            {"SECURITY_PANEL_PROCESS_PATTERNS": "v2bx", "SECURITY_PANEL_CONFIG_PATHS": ""},
+            clear=False,
+        ), mock.patch.object(agent, "run", side_effect=fake_run):
+            result = agent.collect_panel_pairing_indicators("node", "incus")
+        self.assertFalse(result["detected"])
+        self.assertEqual(result["process_matches"], [])
+
+    def test_panel_detection_does_not_treat_config_path_as_process(self):
+        def fake_run(cmd):
+            if "ps -eo pid=,stat=,comm=,args=" in cmd[-1]:
+                return "789 S cat cat /etc/V2bX/config.json\n"
+            return "@@ENV\n"
+
+        with mock.patch.dict(
+            os.environ,
+            {"SECURITY_PANEL_PROCESS_PATTERNS": "v2bx", "SECURITY_PANEL_CONFIG_PATHS": ""},
+            clear=False,
+        ), mock.patch.object(agent, "run", side_effect=fake_run):
+            result = agent.collect_panel_pairing_indicators("node", "incus")
+        self.assertFalse(result["detected"])
 
     def test_persistent_panel_allowlist_merges_exact_domains(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -297,6 +327,7 @@ class SecurityTelemetryTests(unittest.TestCase):
             "container_name": "node1",
             "params": {
                 "process_patterns": ["v2bx"],
+                "process_pids": [4321],
                 "config_files": ["/etc/V2bX/config.json"],
             },
         }
@@ -312,7 +343,26 @@ class SecurityTelemetryTests(unittest.TestCase):
         command = runner.call_args.args[0]
         self.assertEqual(command[:5], ["incus", "--project", "default", "exec", "node1"])
         self.assertIn("/etc/V2bX/config.json", command[-1])
+        self.assertIn("/proc/4321", command[-1])
         self.assertNotIn(" stop node1", " ".join(command))
+
+    def test_panel_remediation_reports_zero_changes_as_failure(self):
+        action = {
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node1",
+            "params": {"process_patterns": ["v2bx"], "process_pids": [4321]},
+        }
+        with mock.patch.dict(
+            os.environ, {"SECURITY_PANEL_PROCESS_PATTERNS": "v2bx"}, clear=False
+        ), mock.patch.object(agent, "get_runtime_bins", return_value={"incus": "incus"}), mock.patch.object(
+            agent,
+            "_run_action_command",
+            return_value=(False, "killed_processes=0 removed_services=0 removed_configs=0 cleanup_errors=0"),
+        ):
+            ok, message = agent.remediate_panel_pairing(action)
+        self.assertFalse(ok)
+        self.assertIn("killed_processes=0", message)
 
     def test_confirmed_panel_domain_is_silently_auto_remediated(self):
         with tempfile.TemporaryDirectory() as tmp:

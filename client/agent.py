@@ -1654,6 +1654,9 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
         process_patterns = (
             panel_pairing.get("process_patterns") if isinstance(panel_pairing.get("process_patterns"), list) else []
         )
+        process_matches = (
+            panel_pairing.get("process_matches") if isinstance(panel_pairing.get("process_matches"), list) else []
+        )
         identity_patterns = (
             panel_pairing.get("identity_patterns") if isinstance(panel_pairing.get("identity_patterns"), list) else []
         )
@@ -1675,6 +1678,11 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
                     "container_name": container.get("name"),
                     "params": {
                         "process_patterns": process_patterns,
+                        "process_pids": [
+                            int(item.get("pid") or 0)
+                            for item in process_matches[:20]
+                            if isinstance(item, dict) and int(item.get("pid") or 0) > 1
+                        ],
                         "config_files": config_files,
                     },
                 }
@@ -1719,6 +1727,11 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
                 {
                     "unapproved_domains": [str(item) for item in unapproved_domains[:20]],
                     "process_patterns": [str(item) for item in process_patterns[:20]],
+                    "process_pids": [
+                        int(item.get("pid") or 0)
+                        for item in process_matches[:20]
+                        if isinstance(item, dict) and int(item.get("pid") or 0) > 1
+                    ],
                     "identity_patterns": [str(item) for item in identity_patterns[:20]],
                     "config_files": [str(item) for item in config_files[:20]],
                 }
@@ -1985,6 +1998,7 @@ def collect_panel_pairing_indicators(
     result: Dict[str, object] = {
         "detected": False,
         "process_patterns": [],
+        "process_matches": [],
         "identity_patterns": [],
         "config_files": [],
         "credential_markers": [],
@@ -2002,9 +2016,36 @@ def collect_panel_pairing_indicators(
         ).split(",")
         if pattern.strip()
     ]
-    process_output = run(_runtime_exec_cmd(runtime, name, "ps -eo comm,args 2>/dev/null", project)).lower()
+    process_output = run(
+        _runtime_exec_cmd(runtime, name, "ps -eo pid=,stat=,comm=,args= 2>/dev/null", project)
+    )
     combined_identity = f"{name} {image}".lower()
-    process_patterns = sorted({pattern for pattern in patterns if pattern in process_output})
+    process_matches: List[Dict[str, object]] = []
+    process_patterns_set = set()
+    for line in process_output.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 3 or not parts[0].isdigit() or "z" in parts[1].lower():
+            continue
+        candidates = {parts[2].lower()}
+        if len(parts) >= 4:
+            try:
+                command_tokens = shlex.split(parts[3])
+            except ValueError:
+                command_tokens = parts[3].split()
+            candidates.update(
+                posixpath.basename(token).lower()
+                for token in command_tokens
+                if token and not token.startswith("-")
+            )
+        for pattern in patterns:
+            if pattern not in candidates:
+                continue
+            process_patterns_set.add(pattern)
+            process_matches.append({"pid": int(parts[0]), "pattern": pattern})
+            break
+        if len(process_matches) >= 20:
+            break
+    process_patterns = sorted(process_patterns_set)
     identity_patterns = sorted({pattern for pattern in patterns if pattern in combined_identity})
 
     raw_paths = os.getenv(
@@ -2067,6 +2108,7 @@ def collect_panel_pairing_indicators(
         {
             "detected": detected,
             "process_patterns": process_patterns,
+            "process_matches": process_matches,
             "identity_patterns": identity_patterns,
             "config_files": sorted(config_files),
             "credential_markers": sorted(credential_markers),
@@ -2850,6 +2892,7 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
         return False, "invalid Incus project"
     params = action.get("params") if isinstance(action.get("params"), dict) else {}
     requested_patterns = params.get("process_patterns") if isinstance(params.get("process_patterns"), list) else []
+    requested_pids = params.get("process_pids") if isinstance(params.get("process_pids"), list) else []
     requested_files = params.get("config_files") if isinstance(params.get("config_files"), list) else []
     allowed_patterns = set(_configured_panel_process_patterns())
     patterns = sorted(
@@ -2857,6 +2900,13 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
             str(item).strip().lower()
             for item in requested_patterns
             if isinstance(item, str) and str(item).strip().lower() in allowed_patterns
+        }
+    )
+    process_pids = sorted(
+        {
+            int(item)
+            for item in requested_pids
+            if isinstance(item, int) and 1 < item <= 4194304
         }
     )
     allowed_files = set(_configured_panel_config_paths())
@@ -2879,16 +2929,6 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
     ]
     for pattern in patterns:
         quoted_pattern = shlex.quote(pattern)
-        process_regex = shlex.quote(rf"^(/[^ ]*/)?{re.escape(pattern)}([[:space:]]|$)")
-        script_parts.append(
-            "for signal in TERM KILL; do "
-            "for proc in /proc/[0-9]*; do "
-            "pid=${proc##*/}; [ \"$pid\" = \"$$\" ] && continue; "
-            "cmd=$(tr '\\000' ' ' < \"$proc/cmdline\" 2>/dev/null || true); "
-            f"if printf '%s\\n' \"$cmd\" | grep -Eiq {process_regex}; then "
-            "kill -$signal \"$pid\" 2>/dev/null && killed_processes=$((killed_processes+1)) || true; fi; "
-            "done; [ \"$signal\" = TERM ] && sleep 1; done"
-        )
         script_parts.append(
             "for unit_dir in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do "
             "[ -d \"$unit_dir\" ] || continue; "
@@ -2903,6 +2943,31 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
             "else cleanup_errors=$((cleanup_errors+1)); fi; done; "
             f"command -v rc-update >/dev/null 2>&1 && rc-update del {quoted_pattern} >/dev/null 2>&1 || true"
         )
+        if process_pids:
+            for pid in process_pids:
+                script_parts.append(
+                    f"if [ -r /proc/{pid}/stat ]; then "
+                    f"state=$(awk '{{print $3}}' /proc/{pid}/stat 2>/dev/null || true); "
+                    f"identity=$(printf '%s ' \"$(cat /proc/{pid}/comm 2>/dev/null || true)\"; "
+                    f"tr '\\000' ' ' < /proc/{pid}/cmdline 2>/dev/null || true); "
+                    f"if [ \"$state\" != Z ] && printf '%s\\n' \"$identity\" | grep -Fqi -- {quoted_pattern}; then "
+                    f"if kill -TERM {pid} 2>/dev/null; then killed_processes=$((killed_processes+1)); "
+                    f"sleep 1; [ -d /proc/{pid} ] && kill -KILL {pid} 2>/dev/null || true; fi; fi; fi"
+                )
+        else:
+            script_parts.append(
+                "for proc in /proc/[0-9]*; do "
+                "pid=${proc##*/}; [ \"$pid\" = \"$$\" ] && continue; "
+                "state=$(awk '{print $3}' \"$proc/stat\" 2>/dev/null || true); [ \"$state\" = Z ] && continue; "
+                "comm=$(cat \"$proc/comm\" 2>/dev/null || true); "
+                "argv0=$(tr '\\000' '\\n' < \"$proc/cmdline\" 2>/dev/null | head -n 1); "
+                "exe=$(readlink \"$proc/exe\" 2>/dev/null || true); matched=0; "
+                "for candidate in \"$comm\" \"${argv0##*/}\" \"${exe##*/}\"; do "
+                f"[ \"$(printf '%s' \"$candidate\" | tr '[:upper:]' '[:lower:]')\" = {quoted_pattern} ] && matched=1; done; "
+                "if [ \"$matched\" -eq 1 ]; then "
+                "if kill -TERM \"$pid\" 2>/dev/null; then killed_processes=$((killed_processes+1)); "
+                "sleep 1; [ -d \"$proc\" ] && kill -KILL \"$pid\" 2>/dev/null || true; fi; fi; done"
+            )
     for config_file in config_files:
         quoted_file = shlex.quote(config_file)
         script_parts.append(
@@ -2914,7 +2979,8 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
         [
             "command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true",
             "printf 'killed_processes=%s removed_services=%s removed_configs=%s cleanup_errors=%s\\n' \"$killed_processes\" \"$removed_services\" \"$removed_configs\" \"$cleanup_errors\"",
-            "[ \"$cleanup_errors\" -eq 0 ]",
+            "changes=$((killed_processes+removed_services+removed_configs))",
+            "[ \"$cleanup_errors\" -eq 0 ] && [ \"$changes\" -gt 0 ]",
         ]
     )
     runtime_bin = get_runtime_bins().get(runtime_kind, "")

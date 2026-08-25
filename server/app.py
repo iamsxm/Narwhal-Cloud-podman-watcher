@@ -671,6 +671,20 @@ def _action_item(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
+def _remediation_changed(message: str) -> bool:
+    counts = {
+        key: int(value)
+        for key, value in re.findall(
+            r"\b(killed_processes|removed_services|removed_configs|cleanup_errors)=(\d+)\b",
+            message,
+        )
+    }
+    return counts.get("cleanup_errors", 0) == 0 and sum(
+        counts.get(key, 0)
+        for key in ("killed_processes", "removed_services", "removed_configs")
+    ) > 0
+
+
 def _alert_details(raw: str) -> Dict[str, Any]:
     try:
         value = json.loads(raw or "{}")
@@ -700,6 +714,13 @@ def _alert_action_evidence(alert: sqlite3.Row) -> Dict[str, Any]:
     domains = clean(details.get("unapproved_domains"), domains=True)
     process_patterns = clean(details.get("process_patterns"))
     config_files = clean(details.get("config_files"))
+    process_pids = sorted(
+        {
+            int(item)
+            for item in details.get("process_pids", [])
+            if isinstance(item, int) and 1 < item <= 4194304
+        }
+    ) if isinstance(details.get("process_pids"), list) else []
     if not domains:
         match = re.search(r"未授权面板域名\s*([^；;]+)", message)
         domains = clean(match.group(1).split(",") if match else [], domains=True)
@@ -711,6 +732,7 @@ def _alert_action_evidence(alert: sqlite3.Row) -> Dict[str, Any]:
         config_files = clean(match.group(1).split(",") if match else [])
     details["unapproved_domains"] = domains
     details["process_patterns"] = process_patterns
+    details["process_pids"] = process_pids
     details["config_files"] = config_files
     return details
 
@@ -798,6 +820,7 @@ async def queue_security_action(alert_id: int, request: Request) -> JSONResponse
         for item in details.get("config_files", [])
         if isinstance(item, str) and item.strip()
     ]
+    process_pids = details.get("process_pids") or []
     if action_type == "allow_panel_domains":
         if not unapproved_domains:
             conn.close()
@@ -810,6 +833,7 @@ async def queue_security_action(alert_id: int, request: Request) -> JSONResponse
         params = {
             "domains": sorted(set(unapproved_domains)),
             "process_patterns": sorted(set(process_patterns)),
+            "process_pids": process_pids,
             "config_files": sorted(set(config_files)),
         }
 
@@ -864,6 +888,7 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
             raise HTTPException(status_code=400, detail="alert has no container target")
         details = _alert_action_evidence(alert)
         process_patterns = details.get("process_patterns") or []
+        process_pids = details.get("process_pids") or []
         config_files = details.get("config_files") or []
         if not process_patterns and not config_files:
             conn.close()
@@ -871,6 +896,7 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
         params = {
             "domains": details.get("unapproved_domains") or [],
             "process_patterns": process_patterns,
+            "process_pids": process_pids,
             "config_files": config_files,
         }
         action, queued = _queue_security_action_row(
@@ -990,15 +1016,26 @@ async def security_action_result(
     message = str(payload.get("message") or "")[:2000]
     now = int(time.time())
     conn = db()
-    row = conn.execute("SELECT host_id, status FROM security_actions WHERE id=?", (action_id,)).fetchone()
+    row = conn.execute(
+        "SELECT host_id, status, action_type, alert_id FROM security_actions WHERE id=?",
+        (action_id,),
+    ).fetchone()
     if row is None or row["host_id"] != host_id:
         conn.close()
         raise HTTPException(status_code=404, detail="action not found for host")
+    if status == "succeeded" and row["action_type"] == "remediate_panel_pairing" and not _remediation_changed(message):
+        status = "failed"
+        message = f"no matching process, service or config was removed; {message}"[:2000]
     if row["status"] not in ("succeeded", "failed"):
         conn.execute(
             "UPDATE security_actions SET status=?, result_message=?, updated_at=? WHERE id=?",
             (status, message, now, action_id),
         )
+        if status == "succeeded" and row["action_type"] == "remediate_panel_pairing":
+            conn.execute(
+                "UPDATE security_alerts SET status='remediated' WHERE id=? AND status='active'",
+                (row["alert_id"],),
+            )
         conn.commit()
     conn.close()
     return signed_json_response({"ok": True, "action_id": action_id}, x_timestamp)
@@ -1337,8 +1374,17 @@ function escapeHtml(value){
   return String(value??'').replace(/[&<>'"]/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
 }
 const alertsById=new Map();
+function remediationChanged(action){
+  if(!action||action.action_type!=='remediate_panel_pairing'||action.status!=='succeeded')return false;
+  const text=String(action.result_message||'');
+  const values=[...text.matchAll(/\\b(?:killed_processes|removed_services|removed_configs)=(\\d+)\\b/g)].map(x=>Number(x[1]||0));
+  return values.some(x=>x>0)&&!/\\bcleanup_errors=[1-9]\\d*\\b/.test(text);
+}
 function actionStatusText(action){
   if(!action)return '';
+  if(action.action_type==='remediate_panel_pairing'&&action.status==='succeeded'&&!remediationChanged(action)){
+    return `未清理到目标：${action.result_message||'节点未找到匹配的进程、服务或配置'}`;
+  }
   const labels={queued:'等待节点',dispatched:'节点处理中',succeeded:'已完成',failed:'失败'};
   const result=action.result_message?`：${action.result_message}`:'';
   return `${labels[action.status]||action.status}${result}`;
@@ -1379,7 +1425,12 @@ async function loadAlerts(){
     const supportedRuntime=alert.runtime==='podman'||alert.runtime==='incus';
     const canRemediate=supportedRuntime&&alert.type==='unauthorized_panel_pairing'&&((alert.details?.process_patterns||[]).length>0||(alert.details?.config_files||[]).length>0);
     const pending=alert.latest_action&&(alert.latest_action.status==='queued'||alert.latest_action.status==='dispatched');
-    const actions=(canRemediate?`<button class='btn btn-danger' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'deny')">禁止</button>`:'')+
+    const lastRemediation=alert.latest_action?.action_type==='remediate_panel_pairing'?alert.latest_action:null;
+    const changed=remediationChanged(lastRemediation);
+    const recurred=changed&&Number(alert.last_seen||0)>Number(lastRemediation?.updated_at||0);
+    const denyLabel=pending?'禁止处理中':((lastRemediation&&(lastRemediation.status==='failed'||!changed))?'重试禁止':(recurred?'再次禁止':'禁止'));
+    const denyControl=canRemediate?(changed&&!recurred?`<span class='ok'>已禁止，等待复检</span>`:`<button class='btn btn-danger' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'deny')">${denyLabel}</button>`):'';
+    const actions=denyControl+
       `<button class='btn btn-allow' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'allow_silent')">允许且不再提醒</button>`+
       `<button class='btn btn-dismiss' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'dismiss_once')">本次取消提醒</button>`;
     tr.innerHTML=`<td class='severity-${escapeHtml(alert.severity)}'>${escapeHtml(alert.severity)}</td>`+

@@ -185,6 +185,7 @@ class ServerRuntimeTests(unittest.TestCase):
             "container_name": "node1",
             "unapproved_domains": ["panel.example.net"],
             "process_patterns": ["v2bx"],
+            "process_pids": [222],
             "config_files": ["/etc/V2bX/config.json"],
         }
         conn = server.db()
@@ -207,6 +208,7 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertTrue(queued_body["queued"])
         self.assertEqual(queued_body["action"]["action_type"], "remediate_panel_pairing")
         self.assertEqual(queued_body["action"]["params"]["domains"], ["panel.example.net"])
+        self.assertEqual(queued_body["action"]["params"]["process_pids"], [222])
 
         poll_body = json.dumps({"host_id": "host1"}, separators=(",", ":")).encode()
 
@@ -226,6 +228,100 @@ class ServerRuntimeTests(unittest.TestCase):
         ).hexdigest()
         self.assertEqual(response.headers["x-narwhal-response-signature"], expected)
         self.assertNotIn("stop_container", response.body.decode())
+
+    def test_remediation_result_requires_real_change_and_hides_successful_alert(self):
+        alert = {
+            "type": "unauthorized_panel_pairing",
+            "severity": "warning",
+            "title": "panel",
+            "message": "节点程序特征 v2bx",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node1",
+            "process_patterns": ["v2bx"],
+            "process_pids": [222],
+        }
+
+        class State:
+            dashboard_user = "operator"
+
+        class DenyRequest:
+            state = State()
+
+            async def json(self):
+                return {"decision": "deny"}
+
+        async def submit_result(action_id, message):
+            result_body = json.dumps(
+                {
+                    "action_id": action_id,
+                    "host_id": "host1",
+                    "status": "succeeded",
+                    "message": message,
+                },
+                separators=(",", ":"),
+            ).encode()
+
+            class ResultRequest:
+                async def body(self):
+                    return result_body
+
+            timestamp = str(int(time.time()))
+            signature = hmac.new(
+                server.SHARED_SECRET.encode(), result_body + timestamp.encode(), hashlib.sha256
+            ).hexdigest()
+            return await server.security_action_result(ResultRequest(), timestamp, signature)
+
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", int(time.time()), [alert])
+        conn.commit()
+        first_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+        first_action = json.loads(
+            asyncio.run(server.set_security_alert_disposition(first_id, DenyRequest())).body
+        )["action"]
+        asyncio.run(
+            submit_result(
+                first_action["id"],
+                "killed_processes=0 removed_services=0 removed_configs=0 cleanup_errors=0",
+            )
+        )
+        conn = server.db()
+        failed = conn.execute(
+            "SELECT status, result_message FROM security_actions WHERE id=?", (first_action["id"],)
+        ).fetchone()
+        alert_status = conn.execute(
+            "SELECT status FROM security_alerts WHERE id=?", (first_id,)
+        ).fetchone()["status"]
+        conn.close()
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("no matching process", failed["result_message"])
+        self.assertEqual(alert_status, "active")
+
+        conn = server.db()
+        conn.execute("UPDATE security_alerts SET status='resolved' WHERE id=?", (first_id,))
+        server.process_security_alerts(conn, "host1", int(time.time()) + 1, [alert])
+        conn.commit()
+        conn.close()
+        second_action = json.loads(
+            asyncio.run(server.set_security_alert_disposition(first_id, DenyRequest())).body
+        )["action"]
+        asyncio.run(
+            submit_result(
+                second_action["id"],
+                "killed_processes=1 removed_services=0 removed_configs=0 cleanup_errors=0",
+            )
+        )
+        conn = server.db()
+        succeeded = conn.execute(
+            "SELECT status FROM security_actions WHERE id=?", (second_action["id"],)
+        ).fetchone()["status"]
+        remediated = conn.execute(
+            "SELECT status FROM security_alerts WHERE id=?", (first_id,)
+        ).fetchone()["status"]
+        conn.close()
+        self.assertEqual(succeeded, "succeeded")
+        self.assertEqual(remediated, "remediated")
 
     def test_dismiss_once_hides_continuous_alert_but_realerts_after_resolution(self):
         alert = {

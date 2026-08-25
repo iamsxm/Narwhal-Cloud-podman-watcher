@@ -738,6 +738,113 @@ def _collect_remote_ips_by_proto(pid: int, proto: str) -> Dict[str, int]:
     return ip_counter
 
 
+def _parse_socket_endpoint(endpoint: str) -> Tuple[str, int]:
+    text = (endpoint or "").strip()
+    if not text or text in ("*", "*:*", "0.0.0.0:*", "[::]:*"):
+        return "", 0
+    host, separator, port_text = text.rpartition(":")
+    if not separator:
+        return text.strip("[]"), 0
+    host = host.strip("[]")
+    try:
+        port = int(port_text)
+    except ValueError:
+        port = 0
+    return host, port
+
+
+def _collect_socket_process_details(
+    runtime: str, name: str, project: str, listening_ports: List[int]
+) -> Dict[str, object]:
+    """Collect one bounded socket snapshot and reuse it for process attribution."""
+    snapshot_limit = max(50, min(2000, int(_env_float("SECURITY_SOCKET_SNAPSHOT_MAX", 500))))
+    detail_limit = max(10, min(500, int(_env_float("SECURITY_COMMUNICATION_DETAIL_MAX", 100))))
+    command = (
+        "if command -v ss >/dev/null 2>&1; then "
+        "echo @@SS_AVAILABLE@@; "
+        f"ss -H -t -u -n -a -p 2>/dev/null | head -n {snapshot_limit}; "
+        "fi"
+    )
+    output = run(_runtime_exec_cmd(runtime, name, command, project))
+    available = "@@SS_AVAILABLE@@" in output
+    lines = [
+        line.strip()
+        for line in output.splitlines()
+        if line.strip() and line.strip() != "@@SS_AVAILABLE@@"
+    ]
+    listening = {int(port) for port in listening_ports if int(port) > 0}
+    sockets: List[Dict[str, object]] = []
+    process_totals: Dict[Tuple[int, str], Dict[str, object]] = {}
+
+    for line in lines:
+        parts = line.split(None, 6)
+        if len(parts) < 6:
+            continue
+        proto = parts[0].lower()
+        if not (proto.startswith("tcp") or proto.startswith("udp")):
+            continue
+        state = parts[1].upper()
+        local_endpoint = parts[4]
+        remote_endpoint = parts[5]
+        process_text = parts[6] if len(parts) > 6 else ""
+        remote_ip, remote_port = _parse_socket_endpoint(remote_endpoint)
+        _, local_port = _parse_socket_endpoint(local_endpoint)
+        if not _is_trackable_ip(remote_ip):
+            continue
+        if proto.startswith("tcp") and state not in ("ESTAB", "ESTABLISHED", "SYN-SENT", "SYN-RECV"):
+            continue
+        if proto.startswith("udp") and remote_port <= 0:
+            continue
+        direction = "inbound" if local_port in listening or state == "SYN-RECV" else "outbound"
+        owners = re.findall(r'\("([^"\\]{1,120})",pid=(\d+)', process_text)
+        process_name = owners[0][0] if owners else "unknown"
+        process_pid = int(owners[0][1]) if owners else 0
+        item = {
+            "proto": "tcp" if proto.startswith("tcp") else "udp",
+            "state": state.lower(),
+            "direction": direction,
+            "local": local_endpoint,
+            "remote": remote_endpoint,
+            "remote_ip": remote_ip,
+            "process": process_name,
+            "pid": process_pid,
+        }
+        if len(sockets) < detail_limit:
+            sockets.append(item)
+        key = (process_pid, process_name)
+        aggregate = process_totals.setdefault(
+            key,
+            {
+                "pid": process_pid,
+                "process": process_name,
+                "inbound_connections": 0,
+                "outbound_connections": 0,
+                "remote_ips": set(),
+            },
+        )
+        aggregate[f"{direction}_connections"] = int(aggregate[f"{direction}_connections"]) + 1
+        remote_ips = aggregate["remote_ips"]
+        if isinstance(remote_ips, set):
+            remote_ips.add(remote_ip)
+
+    processes = []
+    for aggregate in process_totals.values():
+        remote_ips = aggregate.pop("remote_ips", set())
+        aggregate["unique_remote_ips"] = len(remote_ips) if isinstance(remote_ips, set) else 0
+        processes.append(aggregate)
+    processes.sort(
+        key=lambda item: int(item["inbound_connections"]) + int(item["outbound_connections"]),
+        reverse=True,
+    )
+    return {
+        "communication_detail_available": available,
+        "communication_snapshot_count": len(lines),
+        "communication_snapshot_truncated": len(lines) >= snapshot_limit,
+        "communication_processes": processes[:50],
+        "communication_sockets": sockets,
+    }
+
+
 def _geoip_country_batch(ip_counts: Dict[str, int]) -> List[Dict[str, int | str]]:
     if not ip_counts:
         return []
@@ -885,6 +992,9 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
         "tcp_states": {},
         "syn_recv_count": 0,
         "incoming_established": 0,
+        "inbound_unique_ips": 0,
+        "inbound_top_ips": [],
+        "inbound_unique_ip_threshold": int(_env_float("ALERT_INBOUND_UNIQUE_IPS", 10)),
         "outbound_established": 0,
         "outbound_unique_ips": 0,
         "outbound_unique_ports": 0,
@@ -942,6 +1052,7 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
     outbound_ips = set()
     outbound_ports = set()
     inbound_source_ports: Dict[str, set] = {}
+    inbound_ip_connections: Dict[str, int] = {}
     suspicious_ports = {
         int(x.strip())
         for x in os.getenv("SECURITY_SUSPICIOUS_OUTBOUND_PORTS", "25,465,587,23,445,6667").split(",")
@@ -974,6 +1085,7 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
                 incoming_established += 1
             if _is_trackable_ip(remote_ip):
                 inbound_source_ports.setdefault(remote_ip, set()).add(local_port)
+                inbound_ip_connections[remote_ip] = inbound_ip_connections.get(remote_ip, 0) + 1
             continue
         if not _is_trackable_ip(remote_ip):
             continue
@@ -997,6 +1109,14 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
             "tcp_states": tcp_states,
             "syn_recv_count": syn_recv,
             "incoming_established": incoming_established,
+            "inbound_unique_ips": len(inbound_source_ports),
+            "inbound_top_ips": [
+                {"ip": ip, "connections": count}
+                for ip, count in sorted(
+                    inbound_ip_connections.items(), key=lambda item: item[1], reverse=True
+                )[:20]
+            ],
+            "inbound_unique_ip_threshold": int(_env_float("ALERT_INBOUND_UNIQUE_IPS", 10)),
             "outbound_established": outbound_established,
             "outbound_unique_ips": len(outbound_ips),
             "outbound_unique_ports": len(outbound_ports),
@@ -1452,6 +1572,7 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
     ddos_rx_bps = _env_float("ALERT_DDOS_RX_BPS", 100_000_000)
     ddos_rx_pps = _env_float("ALERT_DDOS_RX_PPS", 50_000)
     ddos_syn = _env_float("ALERT_DDOS_SYN_RECV", 200)
+    inbound_unique_ip_threshold = _env_float("ALERT_INBOUND_UNIQUE_IPS", 10)
     scan_ports = _env_float("ALERT_SCAN_UNIQUE_PORTS", 20)
     abuse_unique_ips = _env_float("ALERT_ABUSE_OUTBOUND_UNIQUE_IPS", 200)
     abuse_suspicious = _env_float("ALERT_ABUSE_SUSPICIOUS_CONNECTIONS", 20)
@@ -1535,6 +1656,38 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
                     f"SYN_RECV 连接数 {syn_recv} 超过阈值 {int(ddos_syn)}",
                     syn_recv,
                     ddos_syn,
+                    container,
+                )
+            )
+        inbound_unique_ips = int(security.get("inbound_unique_ips") or 0)
+        if inbound_unique_ips > inbound_unique_ip_threshold:
+            communication_processes = (
+                security.get("communication_processes")
+                if isinstance(security.get("communication_processes"), list)
+                else []
+            )
+            top_process = max(
+                (item for item in communication_processes if isinstance(item, dict)),
+                key=lambda item: int(item.get("inbound_connections") or 0),
+                default={},
+            )
+            process_hint = ""
+            if isinstance(top_process, dict) and top_process.get("process"):
+                process_hint = (
+                    f"；主要通信进程 {top_process.get('process')}"
+                    f"(PID {int(top_process.get('pid') or 0)})"
+                )
+            alerts.append(
+                _security_alert(
+                    "inbound_ip_fanout",
+                    "critical"
+                    if inbound_unique_ips > inbound_unique_ip_threshold * 2
+                    else "warning",
+                    "入站来源 IP 数量过多",
+                    f"容器当前有 {inbound_unique_ips} 个不同入站 IP，"
+                    f"超过重点提醒阈值 {int(inbound_unique_ip_threshold)}{process_hint}",
+                    inbound_unique_ips,
+                    inbound_unique_ip_threshold,
                     container,
                 )
             )
@@ -2702,6 +2855,33 @@ def collect_container(
     suspicious_processes = collect_suspicious_processes(name, runtime, project)
     panel_pairing = collect_panel_pairing_indicators(name, runtime, project, image)
     socket_security = _collect_socket_security(pid)
+    has_remote_connections = any(
+        int(socket_security.get(key) or 0) > 0
+        for key in (
+            "incoming_established",
+            "outbound_established",
+            "inbound_unique_ips",
+            "outbound_unique_ips",
+        )
+    )
+    communication = (
+        _collect_socket_process_details(
+            runtime,
+            name,
+            project,
+            socket_security.get("listening_ports", [])
+            if isinstance(socket_security.get("listening_ports"), list)
+            else [],
+        )
+        if has_remote_connections
+        else {
+            "communication_detail_available": True,
+            "communication_snapshot_count": 0,
+            "communication_snapshot_truncated": False,
+            "communication_processes": [],
+            "communication_sockets": [],
+        }
+    )
     socket_security.update(
         {
             "net_rx_pps": net_rx_pps,
@@ -2714,6 +2894,7 @@ def collect_container(
             "process_count": process_count,
             "panel_pairing": panel_pairing,
             "network_exposure": network_exposure,
+            **communication,
         }
     )
     if cpu_percent <= 0 and float(top_cpu_process.get("cpu_percent") or 0) > 0:

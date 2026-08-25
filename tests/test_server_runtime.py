@@ -226,6 +226,7 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("容器安全与运行状态中心", html)
         self.assertIn("容器日志正常", html)
         self.assertIn("主机 IPv4", html)
+        self.assertIn("入站去重 IP", html)
         self.assertNotIn("<table id='t'", html)
 
     def test_container_detail_is_a_dedicated_internal_metrics_page(self):
@@ -237,6 +238,9 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("/api/v1/history?", html)
         self.assertIn("overflow-x:hidden", html)
         self.assertIn("detail-version", html)
+        self.assertIn("通信进程与连接明细", html)
+        self.assertIn("communication_sockets", html)
+        self.assertIn("入站去重 IP", html)
         self.assertIn("已忽略 ${excludedSamples} 条旧版本口径样本", html)
         self.assertIn("/container-detail?", server.stats_page())
 
@@ -250,6 +254,7 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn('os.getenv("NARWHAL_VERSION", "dev")', agent_source)
         self.assertIn('os.getenv("NARWHAL_VERSION", "dev")', server_source)
         self.assertIn("NARWHAL_VERSION=$PROJECT_VERSION", client_installer)
+        self.assertIn("ALERT_INBOUND_UNIQUE_IPS=$inbound_unique_ips", client_installer)
         self.assertIn("NARWHAL_VERSION=$PROJECT_VERSION", server_installer)
 
     def test_panel_action_queue_and_agent_poll_are_signed(self):

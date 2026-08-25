@@ -285,6 +285,7 @@ Incus 的 CPU 与网络速度由累计指标的相邻采样差值计算，因此
 
 - **流量型 DDoS**：容器入站 B/s、入站 pps 超阈值。
 - **SYN Flood**：容器网络命名空间中 `SYN_RECV` 数量超阈值。
+- **入站 IP 扇出**：容器当前入站去重 IP 大于 10 时重点告警，并在容器详情中展示对应通信进程、PID、本地/远端端点和方向。
 - **HTTP/CC**：Nginx combined 或 Caddy JSON 访问日志中的总 RPS、单 IP RPS、4xx 比例超阈值。
 - **扫描**：同一来源在采样时刻同时触达的本地端口数超阈值，或访问日志命中敏感 Web 路径探测规则。
 - **滥用**：容器出站连接外部 IP 扇出过大、SMTP/Telnet/SMB/IRC 等敏感端口连接过多，或单 IP 产生大量 401/403/429。
@@ -302,10 +303,13 @@ SECURITY_MONITOR_ENABLED=true
 SECURITY_ACCESS_LOG_PATHS=/var/log/nginx/access.log,/var/log/caddy/access.log
 SECURITY_CONTAINER_ACCESS_LOG_PATHS=/var/log/nginx/access.log,/var/log/caddy/access.log
 SECURITY_ACCESS_LOG_MAX_BYTES=1048576
+SECURITY_SOCKET_SNAPSHOT_MAX=500
+SECURITY_COMMUNICATION_DETAIL_MAX=100
 
 ALERT_DDOS_RX_BPS=100000000
 ALERT_DDOS_RX_PPS=50000
 ALERT_DDOS_SYN_RECV=200
+ALERT_INBOUND_UNIQUE_IPS=10
 ALERT_CC_TOTAL_RPS=100
 ALERT_CC_IP_RPS=30
 ALERT_CC_4XX_RATE=0.5
@@ -328,7 +332,7 @@ SECURITY_ALLOWED_PANEL_DOMAINS=
 SECURITY_PANEL_ALLOWLIST_FILE=/opt/narwhal-monitor/panel-allowlist.json
 SECURITY_PANEL_AUTO_REMEDIATE_FILE=/opt/narwhal-monitor/panel-auto-remediate.json
 SECURITY_PANEL_PROCESS_PATTERNS=xboard-node,xrayr,v2bx,soga,sspanel-uim-node
-SECURITY_PANEL_CONFIG_PATHS=/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml
+SECURITY_PANEL_CONFIG_PATHS=/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/V2bX/config.json.bak,/usr/local/V2bX/config.json,/usr/local/V2bX/config.json.bak,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml
 ACTION_POLL_INTERVAL=10
 ALERT_WEB_SCAN_REQUESTS=10
 ALERT_AUTH_FAILURES_PER_IP=20
@@ -361,8 +365,9 @@ Agent 会同时读取宿主机 `SECURITY_ACCESS_LOG_PATHS`，并通过对应的 
 - “宿主机主盘”优先读取 `/data`；节点没有 `/data` 时自动回退到 `/`，页面同时显示实际挂载点，不再把不存在的 `/data` 显示为 `0 B / 0 B`。
 - 主机 IPv4/IPv6 指示器先用宿主机路由做无数据包探测，再按需使用容器网络探测，不再因容器没有安装 `curl` 或 `ip.sb` 不可达而把正常宿主机误报为异常。
 - “访问日志”会区分宿主机日志正常、容器日志正常、日志文件未发现、权限不足和未配置。节点侧 Agent 以 root 运行；若显示“未发现日志文件”，请将实际 Nginx/Caddy access log 路径加入 `SECURITY_ACCESS_LOG_PATHS`（宿主机）或 `SECURITY_CONTAINER_ACCESS_LOG_PATHS`（容器内），更新 Client 后生效。
+- 入站去重 IP 直接从容器网络命名空间的 `/proc/net` 读取；默认只有数量大于 `ALERT_INBOUND_UNIQUE_IPS=10` 才产生重点告警。容器详情通过每轮一次、最多 500 条的 `ss` 快照归属到进程，默认最多上报 100 条活动连接；这是瞬时元数据采样，不抓包、不遍历文件，也不持续占用 CPU。
 - 宿主机磁盘结果缓存 30 秒，同一轮多个容器复用；容器侧只读取文件系统元数据，不遍历目录、不计算目录大小。镜像层 `inspect --size` 默认关闭；确需采集时可在 Client 环境中设置 `CONTAINER_LAYER_SIZE_ENABLED=true`，但这可能增加 IO。
-- 统计页的 Top10、“全部容器”和总览容器卡片均跳转到独立的容器详情页，不再借用首页弹窗。详情展示容器内部 CPU/内存/连接/进程/网络命名空间、历史速率曲线、监听端口、NAT/代理映射、文件系统和配置风险，全部复用既有采样，不提高 Agent 上报频率。
+- 统计页的 Top10、“全部容器”和总览容器卡片均跳转到独立的容器详情页，不再借用首页弹窗。详情展示容器内部 CPU/内存/连接/进程/网络命名空间、历史速率曲线、监听端口、NAT/代理映射、通信进程与端点、文件系统和配置风险；页面刷新只复用既有上报，不额外触发节点采集。
 - 历史图表与统计聚合默认只使用当前 Client 版本产生的样本，避免升级前后的指标口径混在同一曲线或平均值中；旧数据仍保留在数据库，不执行破坏性清理。
 
 机场面板/节点识别**不假设 80、443 或任何固定端口**。Agent 会枚举容器网络命名空间中的全部 TCP 监听端口，并展示 Podman publish 以及 Incus proxy device 中可见的外部端口到内部端口映射；公网 NAT 端口与容器端口可以完全不同。由宿主机自定义 nftables/iptables、上游路由器或云厂商实现且没有运行时元数据的 DNAT 无法可靠归属到具体容器，此时仍通过进程、配置文件、环境变量和面板域名判断是否存在机场对接。

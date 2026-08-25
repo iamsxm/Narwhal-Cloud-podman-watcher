@@ -257,6 +257,25 @@ class SecurityTelemetryTests(unittest.TestCase):
         with mock.patch("builtins.open", mock.mock_open(read_data="321\n")):
             self.assertEqual(agent._read_process_count_from_pid(123), 321)
 
+    def test_socket_snapshot_attributes_inbound_and_outbound_processes(self):
+        snapshot = (
+            '@@SS_AVAILABLE@@\n'
+            'tcp ESTAB 0 0 10.0.0.2:443 203.0.113.10:50123 users:(("nginx",pid=42,fd=8))\n'
+            'tcp ESTAB 0 0 10.0.0.2:53000 198.51.100.20:443 users:(("curl",pid=88,fd=3))\n'
+        )
+        with mock.patch.object(agent, "run", return_value=snapshot):
+            result = agent._collect_socket_process_details(
+                "incus", "node1", "default", [443]
+            )
+
+        self.assertTrue(result["communication_detail_available"])
+        self.assertEqual(
+            [item["direction"] for item in result["communication_sockets"]],
+            ["inbound", "outbound"],
+        )
+        self.assertEqual(result["communication_processes"][0]["process"], "nginx")
+        self.assertEqual(result["communication_processes"][0]["inbound_connections"], 1)
+
     def test_audits_podman_and_incus_isolation_risks(self):
         oci = agent._oci_security_risks(
             {
@@ -620,6 +639,15 @@ class SecurityTelemetryTests(unittest.TestCase):
                 "net_rx_pps": 200,
                 "net_tx_pps": 200,
                 "syn_recv_count": 20,
+                "inbound_unique_ips": 11,
+                "communication_processes": [
+                    {
+                        "process": "nginx",
+                        "pid": 42,
+                        "inbound_connections": 11,
+                        "outbound_connections": 0,
+                    }
+                ],
                 "scan_unique_ports_max": 8,
                 "scan_source_ip": "203.0.113.10",
                 "outbound_unique_ips": 20,
@@ -648,6 +676,7 @@ class SecurityTelemetryTests(unittest.TestCase):
             "ALERT_DDOS_RX_BPS": "100",
             "ALERT_DDOS_RX_PPS": "100",
             "ALERT_DDOS_SYN_RECV": "10",
+            "ALERT_INBOUND_UNIQUE_IPS": "10",
             "ALERT_SCAN_UNIQUE_PORTS": "5",
             "ALERT_ABUSE_OUTBOUND_UNIQUE_IPS": "10",
             "ALERT_ABUSE_SUSPICIOUS_CONNECTIONS": "3",
@@ -669,6 +698,7 @@ class SecurityTelemetryTests(unittest.TestCase):
                 "ddos_bandwidth",
                 "ddos_packets",
                 "ddos_syn",
+                "inbound_ip_fanout",
                 "port_scan",
                 "outbound_fanout",
                 "outbound_sensitive_ports",
@@ -719,6 +749,20 @@ class SecurityTelemetryTests(unittest.TestCase):
             {item["type"] for item in result["alerts"]},
             {"cc_total_rps", "cc_single_ip", "cc_4xx_ratio", "web_scan", "http_abuse"},
         )
+
+    def test_inbound_ip_alert_requires_more_than_ten_unique_ips(self):
+        container = {
+            "name": "web",
+            "runtime": "incus",
+            "security": {"inbound_unique_ips": 10, "panel_pairing": {}},
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"ALERT_INBOUND_UNIQUE_IPS": "10", "SECURITY_ACCESS_LOG_PATHS": ""},
+            clear=False,
+        ):
+            result = agent.collect_security_summary([container], 60)
+        self.assertNotIn("inbound_ip_fanout", {item["type"] for item in result["alerts"]})
 
     def test_container_access_log_alert_keeps_container_identity(self):
         container = {

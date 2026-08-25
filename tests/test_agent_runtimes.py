@@ -437,6 +437,7 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertIn("killed_processes=1", message)
         host_command = runner.call_args_list[1].args[0]
         self.assertEqual(host_command[:5], ["nsenter", "-t", "9876", "-p", "-m"])
+        self.assertEqual(host_command[6], "/bin/sh")
         self.assertIn('"$candidate" = "$pattern"', host_command[-1])
 
     def test_confirmed_panel_domain_is_silently_auto_remediated(self):

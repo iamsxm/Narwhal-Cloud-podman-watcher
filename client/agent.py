@@ -2990,7 +2990,7 @@ def _incus_host_namespace_kill(
         '"$matched" "$killed" "$errors"; [ "$errors" -eq 0 ]'
     )
     ok, output = _run_action_command(
-        ["nsenter", "-t", str(init_pid), "-p", "-m", "--", "sh", "-lc", script]
+        ["nsenter", "-t", str(init_pid), "-p", "-m", "--", "/bin/sh", "-lc", script]
     )
     values = {
         key: int(value)

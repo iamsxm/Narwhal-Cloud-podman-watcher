@@ -688,6 +688,15 @@ def _is_trackable_ip(ip: str) -> bool:
     return True
 
 
+def _is_public_source_ip(ip: str) -> bool:
+    if not _is_trackable_ip(ip):
+        return False
+    try:
+        return bool(ipaddress.ip_address(ip).is_global)
+    except ValueError:
+        return False
+
+
 def _collect_remote_ips_from_exec(runtime: str, name: str, proto: str, project: str = "") -> Dict[str, int]:
     if not runtime or not name:
         return {}
@@ -1222,6 +1231,54 @@ def _collect_host_conntrack_snapshot() -> Dict[str, object]:
                 value = str(address.get("local") or "")
                 if _is_trackable_ip(value):
                     host_addresses.add(value)
+    nat_mappings: List[Dict[str, object]] = []
+    nat_output = run(["sh", "-lc", "iptables-save -t nat 2>/dev/null || true"])
+    for line in nat_output.splitlines():
+        proto_match = re.search(r"(?:^|\s)-p\s+(tcp|udp)\b", line, re.IGNORECASE)
+        port_match = re.search(r"(?:^|\s)--dport\s+(\d+)\b", line)
+        target_match = re.search(r"(?:^|\s)--to-destination\s+([^\s]+)", line)
+        if not port_match or not target_match:
+            continue
+        target_host, target_port = _parse_socket_endpoint(target_match.group(1))
+        destination_match = re.search(r"(?:^|\s)-d\s+([^\s/]+)(?:/\d+)?", line)
+        nat_mappings.append(
+            {
+                "proto": proto_match.group(1).lower() if proto_match else "",
+                "host": destination_match.group(1) if destination_match else "",
+                "public_port": int(port_match.group(1)),
+                "target_host": target_host,
+                "container_port": target_port,
+            }
+        )
+    if not nat_mappings:
+        nft_output = run(
+            [
+                "sh",
+                "-lc",
+                "if command -v nft >/dev/null 2>&1; then "
+                "nft list ruleset 2>/dev/null | grep -E '(^|[[:space:]])dnat[[:space:]]+to[[:space:]]' | "
+                "sed -n '1,2000p'; fi",
+            ]
+        )
+        for line in nft_output.splitlines():
+            mapping_match = re.search(
+                r"\b(tcp|udp)\s+dport\s+(\d+).*?\bdnat\s+to\s+([^\s]+)",
+                line,
+                re.IGNORECASE,
+            )
+            if not mapping_match:
+                continue
+            target_host, target_port = _parse_socket_endpoint(mapping_match.group(3))
+            destination_match = re.search(r"\b(?:ip|ip6)\s+daddr\s+([^\s]+)", line)
+            nat_mappings.append(
+                {
+                    "proto": mapping_match.group(1).lower(),
+                    "host": destination_match.group(1) if destination_match else "",
+                    "public_port": int(mapping_match.group(2)),
+                    "target_host": target_host,
+                    "container_port": target_port,
+                }
+            )
     entries = []
     for line in lines:
         parsed = _parse_conntrack_line(line)
@@ -1232,6 +1289,7 @@ def _collect_host_conntrack_snapshot() -> Dict[str, object]:
         "snapshot_count": len(lines),
         "snapshot_truncated": len(lines) >= limit,
         "host_addresses": sorted(host_addresses),
+        "nat_mappings": nat_mappings[:2000],
         "entries": entries,
     }
 
@@ -1287,6 +1345,21 @@ def _apply_host_conntrack_security(
                     "container_port": target_port,
                 }
             )
+    host_nat_mappings = conntrack.get("nat_mappings") if isinstance(conntrack.get("nat_mappings"), list) else []
+    for mapping in host_nat_mappings:
+        if not isinstance(mapping, dict):
+            continue
+        target_host = str(mapping.get("target_host") or "")
+        if target_host not in addresses:
+            continue
+        mappings.append(
+            {
+                "proto": str(mapping.get("proto") or ""),
+                "host": str(mapping.get("host") or ""),
+                "public_port": int(mapping.get("public_port") or 0),
+                "container_port": int(mapping.get("container_port") or 0),
+            }
+        )
 
     source_connections: Dict[str, int] = {}
     flow_connections: Dict[Tuple[str, str, int, int], int] = {}
@@ -1316,7 +1389,7 @@ def _apply_host_conntrack_security(
                 matched = True
                 container_port = int(mapping.get("container_port") or 0)
                 break
-        if not matched or not _is_trackable_ip(source_ip) or source_ip in addresses:
+        if not matched or not _is_public_source_ip(source_ip) or source_ip in addresses:
             continue
         source_connections[source_ip] = source_connections.get(source_ip, 0) + 1
         flow_key = (source_ip, proto, original_dport, container_port)

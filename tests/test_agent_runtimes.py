@@ -280,9 +280,9 @@ class SecurityTelemetryTests(unittest.TestCase):
         entries = []
         for suffix in range(1, 12):
             parsed = agent._parse_conntrack_line(
-                f"ipv4 2 tcp 6 431999 ESTABLISHED src=198.51.100.{suffix} "
-                "dst=192.0.2.10 sport=50000 dport=18443 "
-                f"src=192.0.2.10 dst=198.51.100.{suffix} sport=18443 dport=50000 [ASSURED]"
+                f"ipv4 2 tcp 6 431999 ESTABLISHED src=8.8.8.{suffix} "
+                "dst=9.9.9.9 sport=50000 dport=18443 "
+                f"src=9.9.9.9 dst=8.8.8.{suffix} sport=18443 dport=50000 [ASSURED]"
             )
             self.assertIsNotNone(parsed)
             entries.append(parsed)
@@ -323,7 +323,7 @@ class SecurityTelemetryTests(unittest.TestCase):
             communication,
             [
                 {
-                    "remote_ip": "198.51.100.8",
+                    "remote_ip": "8.8.8.8",
                     "container_port": 443,
                     "connections": 3,
                 }
@@ -333,8 +333,50 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertEqual(process["original_inbound_unique_ips"], 1)
         self.assertEqual(
             communication["communication_sockets"][0]["original_remote_ips"],
-            ["198.51.100.8"],
+            ["8.8.8.8"],
         )
+
+    def test_private_proxy_gateway_is_not_counted_as_public_source(self):
+        entry = agent._parse_conntrack_line(
+            "ipv4 2 tcp 6 431999 ESTABLISHED src=10.91.0.1 dst=10.91.0.5 "
+            "sport=50000 dport=22 src=10.91.0.5 dst=10.91.0.1 sport=22 dport=50000"
+        )
+        security = {"container_ips": ["10.91.0.5"], "inbound_unique_ips": 1}
+        agent._apply_host_conntrack_security(
+            security,
+            {"available": True, "snapshot_count": 1, "entries": [entry]},
+            ["10.91.0.5"],
+            [],
+        )
+        self.assertEqual(security["inbound_unique_ips"], 1)
+        self.assertEqual(security.get("inbound_ip_observation"), None)
+
+    def test_host_nat_rule_links_outer_proxy_connection_to_container(self):
+        conntrack_line = (
+            "ipv4 2 tcp 6 431999 ESTABLISHED src=8.8.4.4 dst=9.9.9.9 "
+            "sport=50000 dport=18443 src=9.9.9.9 dst=8.8.4.4 sport=18443 dport=50000"
+        )
+        ip_output = '[{"addr_info":[{"local":"9.9.9.9","scope":"global"}]}]'
+        nat_output = (
+            "-A PREROUTING -d 9.9.9.9/32 -p tcp --dport 18443 "
+            "-j DNAT --to-destination 10.91.0.5:443"
+        )
+        with mock.patch("builtins.open", side_effect=FileNotFoundError), mock.patch.object(
+            agent,
+            "run",
+            side_effect=[conntrack_line, ip_output, nat_output],
+        ):
+            snapshot = agent._collect_host_conntrack_snapshot()
+        security = {"container_ips": ["10.91.0.5"], "inbound_unique_ips": 0}
+        agent._apply_host_conntrack_security(
+            security,
+            snapshot,
+            ["10.91.0.5"],
+            [],
+        )
+        self.assertEqual(security["inbound_ip_observation"], "host_conntrack")
+        self.assertEqual(security["inbound_unique_ips"], 1)
+        self.assertEqual(security["inbound_public_flows"][0]["container_port"], 443)
 
     def test_proc_ipv6_decoder_normalizes_ipv4_mapped_address(self):
         self.assertEqual(

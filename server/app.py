@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import time
 import urllib.request
@@ -153,6 +154,24 @@ def init_db() -> None:
             ON security_actions(host_id, status, updated_at);
         CREATE INDEX IF NOT EXISTS idx_security_actions_alert_created
             ON security_actions(alert_id, created_at);
+        CREATE TABLE IF NOT EXISTS security_alert_policies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint TEXT NOT NULL UNIQUE,
+            mode TEXT NOT NULL DEFAULT 'allow_silent',
+            requested_by TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS security_alert_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_security_alert_decisions_alert_created
+            ON security_alert_decisions(alert_id, created_at);
         """
     )
     cols = conn.execute("PRAGMA table_info(reports)").fetchall()
@@ -186,6 +205,7 @@ def cleanup_old_reports(now_ts: int | None = None) -> int:
     conn.execute("DELETE FROM security_alerts WHERE status='resolved' AND last_seen < ?", (cutoff,))
     conn.execute("DELETE FROM host_security WHERE ts < ?", (cutoff,))
     conn.execute("DELETE FROM security_actions WHERE updated_at < ?", (cutoff,))
+    conn.execute("DELETE FROM security_alert_decisions WHERE created_at < ?", (cutoff,))
     conn.commit()
     deleted = int(cur.rowcount or 0)
     conn.close()
@@ -252,15 +272,27 @@ _SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 
 
 def _alert_fingerprint(host_id: str, alert: Dict[str, Any]) -> str:
-    identity = "|".join(
-        [
-            host_id,
-            str(alert.get("runtime") or ""),
-            str(alert.get("project") or ""),
-            str(alert.get("container_name") or ""),
-            str(alert.get("type") or "unknown"),
-        ]
-    )
+    parts = [
+        host_id,
+        str(alert.get("runtime") or ""),
+        str(alert.get("project") or ""),
+        str(alert.get("container_name") or ""),
+        str(alert.get("type") or "unknown"),
+    ]
+    if str(alert.get("type") or "") == "unauthorized_panel_pairing":
+        domains = alert.get("unapproved_domains")
+        domain_values = [
+            str(item).strip().lower().rstrip(".")
+            for item in domains if isinstance(item, str) and item.strip()
+        ] if isinstance(domains, list) else []
+        if not domain_values:
+            match = re.search(r"未授权面板域名\s*([^；;]+)", str(alert.get("message") or ""))
+            domain_values = [
+                item.strip().lower().rstrip(".")
+                for item in (match.group(1).split(",") if match else []) if item.strip()
+            ]
+        parts.append(",".join(sorted(set(domain_values))))
+    identity = "|".join(parts)
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
@@ -291,20 +323,34 @@ def process_security_alerts(
             "value": float(raw_alert.get("value") or 0),
             "threshold": float(raw_alert.get("threshold") or 0),
         }
-        fingerprint = _alert_fingerprint(host_id, normalized)
+        fingerprint_source = dict(normalized)
+        fingerprint_source["unapproved_domains"] = raw_alert.get("unapproved_domains")
+        fingerprint = _alert_fingerprint(host_id, fingerprint_source)
         active_fingerprints.append(fingerprint)
         existing = conn.execute(
             "SELECT status, severity, occurrence_count FROM security_alerts WHERE fingerprint=?",
             (fingerprint,),
         ).fetchone()
-        should_notify = existing is None
+        allow_policy = conn.execute(
+            "SELECT 1 FROM security_alert_policies WHERE fingerprint=? AND mode='allow_silent'",
+            (fingerprint,),
+        ).fetchone() is not None
+        next_status = "suppressed" if allow_policy else "active"
+        should_notify = existing is None and not allow_policy
         if existing is not None:
-            should_notify = str(existing["status"]) != "active" or _SEVERITY_RANK[severity] > _SEVERITY_RANK.get(str(existing["severity"]), 0)
+            previous_status = str(existing["status"])
+            if allow_policy:
+                should_notify = False
+            elif previous_status == "dismissed":
+                next_status = "dismissed"
+                should_notify = False
+            else:
+                should_notify = previous_status == "resolved" or _SEVERITY_RANK[severity] > _SEVERITY_RANK.get(str(existing["severity"]), 0)
             conn.execute(
                 """
                 UPDATE security_alerts
                 SET severity=?, title=?, message=?, value=?, threshold=?, last_seen=?,
-                    occurrence_count=occurrence_count+1, status='active', details_json=?
+                    occurrence_count=occurrence_count+1, status=?, details_json=?
                 WHERE fingerprint=?
                 """,
                 (
@@ -314,6 +360,7 @@ def process_security_alerts(
                     normalized["value"],
                     normalized["threshold"],
                     ts,
+                    next_status,
                     json.dumps(raw_alert, ensure_ascii=False),
                     fingerprint,
                 ),
@@ -325,7 +372,7 @@ def process_security_alerts(
                     fingerprint, host_id, runtime, project, container_name, alert_type,
                     severity, title, message, value, threshold, first_seen, last_seen,
                     occurrence_count, status, details_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'active',?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)
                 """,
                 (
                     fingerprint,
@@ -341,6 +388,7 @@ def process_security_alerts(
                     normalized["threshold"],
                     ts,
                     ts,
+                    next_status,
                     json.dumps(raw_alert, ensure_ascii=False),
                 ),
             )
@@ -351,12 +399,12 @@ def process_security_alerts(
         placeholders = ",".join("?" for _ in active_fingerprints)
         conn.execute(
             f"UPDATE security_alerts SET status='resolved', last_seen=? "
-            f"WHERE host_id=? AND status='active' AND fingerprint NOT IN ({placeholders})",
+            f"WHERE host_id=? AND status IN ('active','dismissed') AND fingerprint NOT IN ({placeholders})",
             (ts, host_id, *active_fingerprints),
         )
     else:
         conn.execute(
-            "UPDATE security_alerts SET status='resolved', last_seen=? WHERE host_id=? AND status='active'",
+            "UPDATE security_alerts SET status='resolved', last_seen=? WHERE host_id=? AND status IN ('active','dismissed')",
             (ts, host_id),
         )
     return notifications
@@ -522,6 +570,8 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "disk_root_avail_bytes": host_disk.get("root_avail_bytes") or disk.get("root_avail_bytes", 0),
             "disk_data_total_bytes": host_disk.get("data_total_bytes") or disk.get("data_total_bytes", 0),
             "disk_data_avail_bytes": host_disk.get("data_avail_bytes") or disk.get("data_avail_bytes", 0),
+            "disk_data_requested_path": host_disk.get("data_requested_path") or disk.get("data_requested_path", "/"),
+            "disk_data_mountpoint": host_disk.get("data_mountpoint") or disk.get("data_mountpoint", "/"),
             "container_disk_rw_bytes": container_disk.get("rw_bytes", 0),
             "container_disk_rootfs_bytes": container_disk.get("rootfs_bytes", 0),
             "container_fs_root_total_bytes": container_disk.get("fs", {}).get("root", {}).get("total_bytes", 0),
@@ -629,6 +679,77 @@ def _alert_details(raw: str) -> Dict[str, Any]:
         return {}
 
 
+def _alert_action_evidence(alert: sqlite3.Row) -> Dict[str, Any]:
+    """Return structured evidence, including alerts reported by older agents."""
+    details = _alert_details(alert["details_json"])
+    message = str(alert["message"] or "")
+
+    def clean(items: Any, *, domains: bool = False) -> List[str]:
+        if not isinstance(items, list):
+            return []
+        values = []
+        for item in items:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            value = item.strip()
+            if domains:
+                value = value.lower().rstrip(".")
+            values.append(value)
+        return sorted(set(values))
+
+    domains = clean(details.get("unapproved_domains"), domains=True)
+    process_patterns = clean(details.get("process_patterns"))
+    config_files = clean(details.get("config_files"))
+    if not domains:
+        match = re.search(r"未授权面板域名\s*([^；;]+)", message)
+        domains = clean(match.group(1).split(",") if match else [], domains=True)
+    if not process_patterns:
+        match = re.search(r"节点程序特征\s*([^；;]+)", message)
+        process_patterns = clean(match.group(1).split(",") if match else [])
+    if not config_files:
+        match = re.search(r"配置文件\s*([^；;]+)", message)
+        config_files = clean(match.group(1).split(",") if match else [])
+    details["unapproved_domains"] = domains
+    details["process_patterns"] = process_patterns
+    details["config_files"] = config_files
+    return details
+
+
+def _queue_security_action_row(
+    conn: sqlite3.Connection,
+    alert: sqlite3.Row,
+    action_type: str,
+    params: Dict[str, Any],
+    requested_by: str,
+) -> tuple[sqlite3.Row, bool]:
+    existing = conn.execute(
+        """
+        SELECT * FROM security_actions
+        WHERE alert_id=? AND action_type=? AND status IN ('queued','dispatched')
+        ORDER BY id DESC LIMIT 1
+        """,
+        (alert["id"], action_type),
+    ).fetchone()
+    if existing is not None:
+        return existing, False
+    now = int(time.time())
+    cur = conn.execute(
+        """
+        INSERT INTO security_actions(
+            alert_id, host_id, runtime, project, container_name, action_type, params_json,
+            status, requested_by, created_at, updated_at
+        ) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)
+        """,
+        (
+            alert["id"], alert["host_id"], alert["runtime"], alert["project"],
+            alert["container_name"], action_type, json.dumps(params, ensure_ascii=False),
+            requested_by[:100], now, now,
+        ),
+    )
+    row = conn.execute("SELECT * FROM security_actions WHERE id=?", (cur.lastrowid,)).fetchone()
+    return row, True
+
+
 @app.post("/api/v1/security/alerts/{alert_id}/actions")
 async def queue_security_action(alert_id: int, request: Request) -> JSONResponse:
     try:
@@ -661,7 +782,7 @@ async def queue_security_action(alert_id: int, request: Request) -> JSONResponse
         conn.close()
         raise HTTPException(status_code=400, detail="alert has no container target")
 
-    details = _alert_details(alert["details_json"])
+    details = _alert_action_evidence(alert)
     unapproved_domains = [
         str(item).strip().lower().rstrip(".")
         for item in details.get("unapproved_domains", [])
@@ -692,44 +813,111 @@ async def queue_security_action(alert_id: int, request: Request) -> JSONResponse
             "config_files": sorted(set(config_files)),
         }
 
-    existing = conn.execute(
-        """
-        SELECT * FROM security_actions
-        WHERE alert_id=? AND action_type=? AND status IN ('queued','dispatched')
-        ORDER BY id DESC LIMIT 1
-        """,
-        (alert_id, action_type),
-    ).fetchone()
-    if existing is not None:
-        conn.close()
-        return JSONResponse(content={"ok": True, "queued": False, "action": _action_item(existing)})
-
-    now = int(time.time())
     requested_by = str(getattr(request.state, "dashboard_user", DASHBOARD_USERNAME or "dashboard"))[:100]
-    cur = conn.execute(
+    row, queued = _queue_security_action_row(conn, alert, action_type, params, requested_by)
+    conn.commit()
+    conn.close()
+    return JSONResponse(
+        status_code=202 if queued else 200,
+        content={"ok": True, "queued": queued, "action": _action_item(row)},
+    )
+
+
+@app.post("/api/v1/security/alerts/{alert_id}/disposition")
+async def set_security_alert_disposition(alert_id: int, request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    decision = str(payload.get("decision") or "").strip().lower()
+    if decision not in ("deny", "allow_silent", "dismiss_once"):
+        raise HTTPException(
+            status_code=400,
+            detail="decision must be deny, allow_silent or dismiss_once",
+        )
+
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    alert = conn.execute("SELECT * FROM security_alerts WHERE id=?", (alert_id,)).fetchone()
+    if alert is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="alert not found")
+    if alert["status"] != "active":
+        conn.close()
+        raise HTTPException(status_code=409, detail="alert is no longer active")
+
+    requested_by = str(
+        getattr(request.state, "dashboard_user", DASHBOARD_USERNAME or "dashboard")
+    )[:100]
+    now = int(time.time())
+    action = None
+    queued = False
+    if decision == "deny":
+        if alert["alert_type"] != "unauthorized_panel_pairing":
+            conn.close()
+            raise HTTPException(status_code=400, detail="deny currently supports panel-pairing alerts")
+        if alert["runtime"] not in ("podman", "incus"):
+            conn.close()
+            raise HTTPException(status_code=400, detail="Docker is notice-only and cannot be denied")
+        if not alert["container_name"]:
+            conn.close()
+            raise HTTPException(status_code=400, detail="alert has no container target")
+        details = _alert_action_evidence(alert)
+        process_patterns = details.get("process_patterns") or []
+        config_files = details.get("config_files") or []
+        if not process_patterns and not config_files:
+            conn.close()
+            raise HTTPException(status_code=400, detail="alert has no safe remediation evidence")
+        params = {
+            "domains": details.get("unapproved_domains") or [],
+            "process_patterns": process_patterns,
+            "config_files": config_files,
+        }
+        action, queued = _queue_security_action_row(
+            conn, alert, "remediate_panel_pairing", params, requested_by
+        )
+    elif decision == "allow_silent":
+        conn.execute(
+            """
+            INSERT INTO security_alert_policies(
+                fingerprint, mode, requested_by, created_at, updated_at
+            ) VALUES(?,'allow_silent',?,?,?)
+            ON CONFLICT(fingerprint) DO UPDATE SET
+                mode='allow_silent', requested_by=excluded.requested_by,
+                updated_at=excluded.updated_at
+            """,
+            (alert["fingerprint"], requested_by, now, now),
+        )
+        conn.execute("UPDATE security_alerts SET status='suppressed' WHERE id=?", (alert_id,))
+        if alert["alert_type"] == "unauthorized_panel_pairing" and alert["runtime"] in ("podman", "incus"):
+            details = _alert_action_evidence(alert)
+            domains = details.get("unapproved_domains") or []
+            if domains:
+                action, queued = _queue_security_action_row(
+                    conn, alert, "allow_panel_domains", {"domains": domains}, requested_by
+                )
+    else:
+        conn.execute("UPDATE security_alerts SET status='dismissed' WHERE id=?", (alert_id,))
+
+    conn.execute(
         """
-        INSERT INTO security_actions(
-            alert_id, host_id, runtime, project, container_name, action_type, params_json,
-            status, requested_by, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)
+        INSERT INTO security_alert_decisions(
+            alert_id, fingerprint, decision, requested_by, created_at
+        ) VALUES(?,?,?,?,?)
         """,
-        (
-            alert_id,
-            alert["host_id"],
-            alert["runtime"],
-            alert["project"],
-            alert["container_name"],
-            action_type,
-            json.dumps(params, ensure_ascii=False),
-            requested_by,
-            now,
-            now,
-        ),
+        (alert_id, alert["fingerprint"], decision, requested_by, now),
     )
     conn.commit()
-    row = conn.execute("SELECT * FROM security_actions WHERE id=?", (cur.lastrowid,)).fetchone()
     conn.close()
-    return JSONResponse(status_code=202, content={"ok": True, "queued": True, "action": _action_item(row)})
+    return JSONResponse(
+        status_code=202 if action is not None and queued else 200,
+        content={
+            "ok": True,
+            "decision": decision,
+            "queued": queued,
+            "action": _action_item(action) if action is not None else None,
+        },
+    )
 
 
 @app.post("/api/v1/actions/poll")
@@ -863,7 +1051,7 @@ def security_alerts(active_only: bool = True, limit: int = 200) -> JSONResponse:
                 "last_seen_utc8": format_utc8(int(row["last_seen"])),
                 "occurrence_count": int(row["occurrence_count"]),
                 "status": row["status"],
-                "details": _alert_details(row["details_json"]),
+                "details": _alert_action_evidence(row),
                 "latest_action": _action_item(latest_action) if latest_action is not None else None,
             }
         )
@@ -1057,7 +1245,8 @@ th{background:#1a2c4e}
 .severity-warning{color:#ffbf4b;font-weight:bold}
 .btn{border:1px solid #4b6fa8;padding:4px 8px;border-radius:6px;background:#1a2c4e;color:#dbe7ff;cursor:pointer}
 .btn-danger{background:#7c2330;border-color:#d94b61;margin-right:6px}
-.btn-allow{background:#185d4a;border-color:#36a77f}
+.btn-allow{background:#185d4a;border-color:#36a77f;margin-right:6px}
+.btn-dismiss{background:#34445e;border-color:#6e85a8}
 .btn:disabled{opacity:.55;cursor:not-allowed}
 .action-status{font-size:12px;margin-top:5px;color:#a9bddc;max-width:260px}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center}
@@ -1070,6 +1259,8 @@ th{background:#1a2c4e}
 .panel h4{margin:0 0 6px 0}
 svg{width:100%;height:220px;border-top:1px solid #28436c}
 #traffic{height:280px}
+.snapshot-grid{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:10px;margin-top:12px}
+.snapshot-list{margin:6px 0 0 18px;padding:0;text-align:left;max-height:180px;overflow:auto}
 </style>
 </head><body>
 <h2>Narwhal Container Monitor Dashboard</h2>
@@ -1079,7 +1270,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 <h3>主机安全遥测</h3>
 <table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table>
 <h3>容器状态</h3>
-  <table id='t'><thead><tr><th>主机</th><th>运行时</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>内存%</th><th>连接数</th><th>进程数</th><th>RX pps</th><th>SYN_RECV</th><th>出站IP</th><th>监听端口</th><th>NAT/代理映射</th><th>TCP建连/s</th><th>TCP失败/s</th><th>可疑进程</th><th>配置风险</th><th>面板对接</th><th>国家Top3(TCP/UDP)</th><th>RX Mbps</th><th>TX Mbps</th><th>总容量/可用</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
+  <table id='t'><thead><tr><th>主机</th><th>运行时</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>内存%</th><th>连接数</th><th>进程数</th><th>RX pps</th><th>SYN_RECV</th><th>出站IP</th><th>监听端口</th><th>NAT/代理映射</th><th>TCP建连/s</th><th>TCP失败/s</th><th>可疑进程</th><th>配置风险</th><th>面板对接</th><th>国家Top3(TCP/UDP)</th><th>RX Mbps</th><th>TX Mbps</th><th>容器根盘(/ 总量/可用)</th><th>宿主机主盘(挂载点/总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
   <div class='detail-grid'>
@@ -1101,6 +1292,11 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
       </div>
       <svg id='bandwidth' viewBox='0 0 900 220' preserveAspectRatio='none'></svg>
     </div>
+  </div>
+  <div class='snapshot-grid'>
+    <div class='panel'><h4>当前速率与资源</h4><div id='detail-current'></div></div>
+    <div class='panel'><h4>进程排查</h4><div id='detail-processes'></div></div>
+    <div class='panel'><h4>安全与暴露面</h4><div id='detail-risks'></div></div>
   </div>
   <div class='panel' style='margin-top:12px'>
     <h4>流量统计（累计字节）</h4>
@@ -1134,6 +1330,9 @@ function formatCountryLine(protocol, stats){
 function formatCountryStats(tcpStats, udpStats){
   return `${formatCountryLine('TCP', tcpStats)}<br/>${formatCountryLine('UDP', udpStats)}`;
 }
+function formatCapacity(total, avail){
+  return Number(total||0)>0 ? `${fmtBytes(total)} / ${fmtBytes(avail)}` : '采集不可用';
+}
 function escapeHtml(value){
   return String(value??'').replace(/[&<>'"]/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
 }
@@ -1144,22 +1343,23 @@ function actionStatusText(action){
   const result=action.result_message?`：${action.result_message}`:'';
   return `${labels[action.status]||action.status}${result}`;
 }
-async function queueAlertAction(alertId, actionName){
+async function setAlertDisposition(alertId, decision){
   const alert=alertsById.get(Number(alertId)); if(!alert)return;
   const details=alert.details||{};
   let promptText='';
-  if(actionName==='remediate'){
+  if(decision==='deny'){
     const processes=(details.process_patterns||[]).join(', ')||'无';
     const files=(details.config_files||[]).join(', ')||'无';
-    promptText=`确认清理 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的机场对接组件？\n\n将终止进程特征：${processes}\n停用并删除对应服务，删除配置：${files}\n容器本身不会停止。清理成功后，同一面板域名再次出现将自动清理且不再提醒。`;
+    promptText=`确认禁止并清理 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的机场对接组件？\n\n将终止进程特征：${processes}\n停用并删除对应服务，删除配置：${files}\n容器本身不会停止。成功后同一面板域名再次出现会自动清理且不再提醒。`;
+  }else if(decision==='allow_silent'){
+    promptText=`确认允许此告警且以后不再提醒？\n\n该告警指纹会被永久抑制；机场面板域名还会同步加入节点放行名单。`;
   }else{
-    const domains=(details.unapproved_domains||[]).join(', ');
-    promptText=`确认放行以下面板域名？\n${domains}\n\n放行后该节点以后不再对此域名告警。`;
+    promptText=`确认仅取消本次提醒？\n\n当前连续出现期间不再显示；事件消失后如果再次出现，仍会重新告警。`;
   }
   if(!confirm(promptText))return;
   try{
-    const response=await fetch(`/api/v1/security/alerts/${Number(alertId)}/actions`,{
-      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:actionName})
+    const response=await fetch(`/api/v1/security/alerts/${Number(alertId)}/disposition`,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision})
     });
     const result=await response.json();
     if(!response.ok)throw new Error(result.detail||`HTTP ${response.status}`);
@@ -1177,14 +1377,11 @@ async function loadAlerts(){
     const tr=document.createElement('tr');
     const runtime=alert.project?`${alert.runtime}/${alert.project}`:(alert.runtime||'-');
     const supportedRuntime=alert.runtime==='podman'||alert.runtime==='incus';
-    const canRemediate=supportedRuntime&&((alert.details?.process_patterns||[]).length>0||(alert.details?.config_files||[]).length>0);
-    const actionable=alert.type==='unauthorized_panel_pairing'&&supportedRuntime;
-    const hasDomains=Array.isArray(alert.details?.unapproved_domains)&&alert.details.unapproved_domains.length>0;
+    const canRemediate=supportedRuntime&&alert.type==='unauthorized_panel_pairing'&&((alert.details?.process_patterns||[]).length>0||(alert.details?.config_files||[]).length>0);
     const pending=alert.latest_action&&(alert.latest_action.status==='queued'||alert.latest_action.status==='dispatched');
-    const actions=actionable?
-      (canRemediate?`<button class='btn btn-danger' ${pending?'disabled':''} onclick="queueAlertAction(${Number(alert.id)},'remediate')">快速清理</button>`:'')+
-      (hasDomains?`<button class='btn btn-allow' ${pending?'disabled':''} onclick="queueAlertAction(${Number(alert.id)},'allow')">放行</button>`:''):
-      `<span>${alert.runtime==='docker'?'仅提醒':'-'}</span>`;
+    const actions=(canRemediate?`<button class='btn btn-danger' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'deny')">禁止</button>`:'')+
+      `<button class='btn btn-allow' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'allow_silent')">允许且不再提醒</button>`+
+      `<button class='btn btn-dismiss' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'dismiss_once')">本次取消提醒</button>`;
     tr.innerHTML=`<td class='severity-${escapeHtml(alert.severity)}'>${escapeHtml(alert.severity)}</td>`+
       `<td>${escapeHtml(alert.host_id)}</td><td>${escapeHtml(runtime)}</td>`+
       `<td>${escapeHtml(alert.container_name||'-')}</td><td>${escapeHtml(alert.type)}</td>`+
@@ -1225,8 +1422,9 @@ async function load(){
       const tr=document.createElement('tr');
       const cpuCls=x.alerts.cpu?'bad':'';
       const connCls=x.alerts.conn?'bad':'';
-      const hostDiskText = `/data: ${fmtBytes(x.disk_data_total_bytes)} / ${fmtBytes(x.disk_data_avail_bytes)}`;
-      const containerDiskText = `${fmtBytes(x.container_fs_root_total_bytes)} / ${fmtBytes(x.container_fs_root_avail_bytes)}`;
+      const hostMount=x.disk_data_mountpoint||x.disk_data_requested_path||'/';
+      const hostDiskText = `${hostMount}: ${formatCapacity(x.disk_data_total_bytes, x.disk_data_avail_bytes)}`;
+      const containerDiskText = formatCapacity(x.container_fs_root_total_bytes, x.container_fs_root_avail_bytes);
       let html='';
       if(idx===0){
         html += `<td rowspan='${rows.length}'>${host}</td>`;
@@ -1288,6 +1486,19 @@ async function openDetail(host, runtime, project, container){
   const svg=document.getElementById('chart');
   const bandwidthSvg=document.getElementById('bandwidth');
   const trafficSvg=document.getElementById('traffic');
+  const security=target?.security||{};
+  const rates=security.protocol_rates||{};
+  const topProcess=target?.top_cpu_process_command?
+    `PID ${Number(target.top_cpu_process_pid||0)} · CPU ${formatSmallNumber(target.top_cpu_process_cpu_percent,2)}% · ${escapeHtml(target.top_cpu_process_command)}`:'未采集到高 CPU 进程';
+  const suspicious=Array.isArray(security.suspicious_processes)?security.suspicious_processes:[];
+  const risks=Array.isArray(security.configuration_risks)?security.configuration_risks:[];
+  const exposures=Array.isArray(security.network_exposure)?security.network_exposure:[];
+  document.getElementById('detail-current').innerHTML=`CPU ${formatSmallNumber(target?.cpu_percent,2)}% · 内存 ${formatSmallNumber(target?.mem_percent,2)}%<br/>连接 ${Number(target?.conn_count||0)} · 进程 ${Number(security.process_count||0)}<br/>RX ${formatSmallNumber(bpsToMbps(target?.net_rx_bps),2)} Mbps / ${formatSmallNumber(security.net_rx_pps,1)} pps<br/>TX ${formatSmallNumber(bpsToMbps(target?.net_tx_bps),2)} Mbps<br/>TCP 建连 ${formatSmallNumber(rates.Tcp_ActiveOpens_per_second,1)}/s · 失败 ${formatSmallNumber(rates.Tcp_AttemptFails_per_second,1)}/s`;
+  document.getElementById('detail-processes').innerHTML=`<div>${topProcess}</div>`+
+    (suspicious.length?`<ul class='snapshot-list'>${suspicious.map(x=>`<li>PID ${Number(x.pid||0)} · ${escapeHtml(x.pattern||x.command||'可疑进程')}</li>`).join('')}</ul>`:'<div class="ok">未发现可疑进程特征</div>');
+  document.getElementById('detail-risks').innerHTML=`监听端口：${escapeHtml((security.listening_ports||[]).join(', ')||'-')}<br/>`+
+    `NAT/代理：${escapeHtml(exposures.map(x=>`${x.listen||'?'}→${x.target||'?'}`).join(', ')||'-')}`+
+    (risks.length?`<ul class='snapshot-list'>${risks.map(x=>`<li>${escapeHtml(x.message||x.type||JSON.stringify(x))}</li>`).join('')}</ul>`:'<div class="ok">未发现配置风险</div>');
   if(!recent.length){
     svg.innerHTML = '';
     bandwidthSvg.innerHTML = '';
@@ -1343,7 +1554,17 @@ async function openDetail(host, runtime, project, container){
   `;
   document.getElementById('modal').style.display='flex';
 }
-load(); loadAlerts(); setInterval(()=>{load();loadAlerts();}, 15000);
+let openedFromUrl=false;
+async function loadAndOpenRequestedDetail(){
+  await load();
+  if(openedFromUrl)return;
+  const q=new URLSearchParams(location.search);
+  if(q.get('detail')==='1'&&q.get('host')&&q.get('runtime')&&q.get('container')){
+    openedFromUrl=true;
+    await openDetail(q.get('host'),q.get('runtime'),q.get('project')||'',q.get('container'));
+  }
+}
+loadAndOpenRequestedDetail(); loadAlerts(); setInterval(()=>{load();loadAlerts();}, 15000);
 </script>
 </body></html>
 """
@@ -1364,6 +1585,7 @@ table{border-collapse:collapse;width:100%;background:#13213b;color:#dbe7ff;margi
 th,td{border:1px solid #233b61;padding:8px;text-align:center}
 th{background:#1a2c4e}
 a{color:#8cc7ff}
+.detail-link{display:inline-block;border:1px solid #4b6fa8;border-radius:6px;padding:4px 8px;text-decoration:none;background:#1a2c4e}
 </style>
 </head><body>
 <h2>数据统计页</h2>
@@ -1380,13 +1602,16 @@ a{color:#8cc7ff}
 </div>
 
 <h3>Top10：平均 CPU</h3>
-  <table id='cpu-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均 CPU%</th><th>峰值 CPU%</th><th>估算间隔(秒)</th></tr></thead><tbody></tbody></table>
+  <table id='cpu-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均 CPU%</th><th>峰值 CPU%</th><th>估算间隔(秒)</th><th>排查</th></tr></thead><tbody></tbody></table>
 
 <h3>Top10：平均连接数</h3>
-  <table id='conn-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均连接</th><th>峰值连接</th><th>样本数</th></tr></thead><tbody></tbody></table>
+  <table id='conn-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均连接</th><th>峰值连接</th><th>样本数</th><th>排查</th></tr></thead><tbody></tbody></table>
 
 <h3>Top10：累计流量</h3>
-  <table id='traffic-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th></tr></thead><tbody></tbody></table>
+  <table id='traffic-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th><th>排查</th></tr></thead><tbody></tbody></table>
+
+<h3>全部容器</h3>
+<table id='all-containers'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>当前 CPU%</th><th>当前内存%</th><th>当前 RX</th><th>当前 TX</th><th>当前连接</th><th>样本数</th><th>排查</th></tr></thead><tbody></tbody></table>
 
 <h3>Host 汇总</h3>
 <table id='host-summary'><thead><tr><th>主机</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th><th>样本数</th></tr></thead><tbody></tbody></table>
@@ -1397,6 +1622,16 @@ function fmtBytes(n){
   const units=['B','KB','MB','GB','TB']; let i=0; let v=x;
   while(v>=1024 && i<units.length-1){v/=1024;i++;}
   return `${v.toFixed(v>=100?0:1)} ${units[i]}`;
+}
+function escapeHtml(value){
+  return String(value??'').replace(/[&<>'"]/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+}
+function detailHref(x){
+  const q=new URLSearchParams({detail:'1',host:x.host_id,runtime:x.runtime,project:x.project||'',container:x.container_name});
+  return `/?${q.toString()}`;
+}
+function detailCell(x){
+  return `<a class='detail-link' href='${escapeHtml(detailHref(x))}'>容器详情</a>`;
 }
 function renderRows(id, rows, mapper){
   const tb=document.querySelector(`#${id} tbody`);
@@ -1421,18 +1656,27 @@ async function loadStats(){
     <td>${Number(x.avg.cpu_percent||0).toFixed(2)}</td>
     <td>${Number(x.max.cpu_percent||0).toFixed(2)}</td>
     <td>${Number(x.estimated_interval_seconds||0).toFixed(2)}</td>
+    <td>${detailCell(x)}</td>
   `);
   renderRows('conn-top', data.ranks?.avg_conn_top10||[], x=>`
     <td>${x.host_id}</td><td>${x.project?`${x.runtime}/${x.project}`:x.runtime}</td><td>${x.container_name}</td>
     <td>${Number(x.avg.conn_count||0).toFixed(2)}</td>
     <td>${Number(x.max.conn_count||0)}</td>
     <td>${x.samples||0}</td>
+    <td>${detailCell(x)}</td>
   `);
   renderRows('traffic-top', data.ranks?.traffic_top10||[], x=>`
     <td>${x.host_id}</td><td>${x.project?`${x.runtime}/${x.project}`:x.runtime}</td><td>${x.container_name}</td>
     <td>${fmtBytes(x.traffic_bytes.rx)}</td>
     <td>${fmtBytes(x.traffic_bytes.tx)}</td>
     <td>${fmtBytes(x.traffic_bytes.total)}</td>
+    <td>${detailCell(x)}</td>
+  `);
+  renderRows('all-containers', data.containers||[], x=>`
+    <td>${escapeHtml(x.host_id)}</td><td>${escapeHtml(x.project?`${x.runtime}/${x.project}`:x.runtime)}</td><td>${escapeHtml(x.container_name)}</td>
+    <td>${Number(x.latest?.cpu_percent||0).toFixed(2)}</td><td>${Number(x.latest?.mem_percent||0).toFixed(2)}</td>
+    <td>${fmtBytes(x.latest?.net_rx_bps)}/s</td><td>${fmtBytes(x.latest?.net_tx_bps)}/s</td>
+    <td>${Number(x.latest?.conn_count||0)}</td><td>${Number(x.samples||0)}</td><td>${detailCell(x)}</td>
   `);
   renderRows('host-summary', data.hosts||[], x=>`
     <td>${x.host_id}</td>

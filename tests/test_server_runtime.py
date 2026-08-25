@@ -227,6 +227,141 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertEqual(response.headers["x-narwhal-response-signature"], expected)
         self.assertNotIn("stop_container", response.body.decode())
 
+    def test_dismiss_once_hides_continuous_alert_but_realerts_after_resolution(self):
+        alert = {
+            "type": "port_scan",
+            "severity": "warning",
+            "title": "scan",
+            "message": "scan",
+            "runtime": "incus",
+            "container_name": "node1",
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class Request:
+            state = State()
+
+            async def json(self):
+                return {"decision": "dismiss_once"}
+
+        asyncio.run(server.set_security_alert_disposition(alert_id, Request()))
+        conn = server.db()
+        self.assertEqual(server.process_security_alerts(conn, "host1", 110, [alert]), [])
+        self.assertEqual(
+            conn.execute("SELECT status FROM security_alerts WHERE id=?", (alert_id,)).fetchone()["status"],
+            "dismissed",
+        )
+        server.process_security_alerts(conn, "host1", 120, [])
+        notifications = server.process_security_alerts(conn, "host1", 130, [alert])
+        conn.commit()
+        status = conn.execute(
+            "SELECT status FROM security_alerts WHERE id=?", (alert_id,)
+        ).fetchone()["status"]
+        conn.close()
+        self.assertEqual(status, "active")
+        self.assertEqual(len(notifications), 1)
+
+    def test_allow_silent_policy_persists_and_suppresses_future_samples(self):
+        alert = {
+            "type": "docker_container_notice",
+            "severity": "info",
+            "title": "docker",
+            "message": "notice only",
+            "runtime": "docker",
+            "container_name": "helper",
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class Request:
+            state = State()
+
+            async def json(self):
+                return {"decision": "allow_silent"}
+
+        asyncio.run(server.set_security_alert_disposition(alert_id, Request()))
+        conn = server.db()
+        notifications = server.process_security_alerts(conn, "host1", 110, [alert])
+        conn.commit()
+        row = conn.execute(
+            "SELECT status FROM security_alerts WHERE id=?", (alert_id,)
+        ).fetchone()
+        policy_count = conn.execute("SELECT COUNT(*) FROM security_alert_policies").fetchone()[0]
+        conn.close()
+        self.assertEqual(notifications, [])
+        self.assertEqual(row["status"], "suppressed")
+        self.assertEqual(policy_count, 1)
+
+    def test_panel_allow_silent_is_scoped_to_exact_domain(self):
+        first = {
+            "type": "unauthorized_panel_pairing",
+            "severity": "critical",
+            "title": "panel",
+            "message": "panel one",
+            "runtime": "incus",
+            "container_name": "node1",
+            "unapproved_domains": ["one.example.net"],
+        }
+        second = dict(first, message="panel two", unapproved_domains=["two.example.net"])
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [first])
+        fingerprint = conn.execute("SELECT fingerprint FROM security_alerts").fetchone()["fingerprint"]
+        conn.execute(
+            "INSERT INTO security_alert_policies(fingerprint,mode,requested_by,created_at,updated_at) VALUES(?,'allow_silent','operator',100,100)",
+            (fingerprint,),
+        )
+        notifications = server.process_security_alerts(conn, "host1", 110, [first, second])
+        conn.commit()
+        statuses = [row["status"] for row in conn.execute("SELECT status FROM security_alerts ORDER BY id")]
+        conn.close()
+        self.assertEqual(statuses, ["suppressed", "active"])
+        self.assertEqual([item["message"] for item in notifications], ["panel two"])
+
+    def test_deny_extracts_safe_evidence_from_legacy_alert_message(self):
+        alert = {
+            "type": "unauthorized_panel_pairing",
+            "severity": "critical",
+            "title": "panel",
+            "message": "未授权面板域名 panel.example.net；节点程序特征 v2bx；配置文件 /etc/V2bX/config.json；容器内部监听端口 22,443",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node1",
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class Request:
+            state = State()
+
+            async def json(self):
+                return {"decision": "deny"}
+
+        response = asyncio.run(server.set_security_alert_disposition(alert_id, Request()))
+        body = json.loads(response.body)
+        self.assertTrue(body["queued"])
+        self.assertEqual(body["action"]["params"]["domains"], ["panel.example.net"])
+        self.assertEqual(body["action"]["params"]["process_patterns"], ["v2bx"])
+        self.assertEqual(body["action"]["params"]["config_files"], ["/etc/V2bX/config.json"])
+
     def test_latest_keeps_same_incus_name_from_different_projects_separate(self):
         self._insert("incus", 10, "default")
         self._insert("incus", 20, "prod")

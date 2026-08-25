@@ -2303,6 +2303,7 @@ def list_containers() -> List[Dict[str, str]]:
 
 
 def collect_docker_notice(container: Dict[str, str]) -> Dict[str, object]:
+    runtime = container.get("runtime_bin", "") or "docker"
     return {
         "id": container.get("id", ""),
         "name": container.get("name", "unknown"),
@@ -2319,7 +2320,9 @@ def collect_docker_notice(container: Dict[str, str]) -> Dict[str, object]:
         "tcp_country_stats": [],
         "udp_country_stats": [],
         "disk": collect_disk_alert(),
-        "container_disk": {"rw_bytes": 0, "rootfs_bytes": 0, "fs": {}},
+        "container_disk": collect_container_disk_usage(
+            container.get("name", ""), runtime, "", include_layer_size=False
+        ),
         "top_cpu_process": {"pid": 0, "cpu_percent": 0.0, "command": ""},
         "security": {"notice_only": True},
     }
@@ -2340,14 +2343,22 @@ def _parse_df_target(df_out: str, target: str) -> Dict[str, int]:
         mountpoint = parts[5]
         if mountpoint != target:
             continue
-        return {
-            "total_bytes": int(parts[1]) * 1024,
-            "avail_bytes": int(parts[3]) * 1024,
-        }
+        try:
+            return {
+                "total_bytes": int(parts[1]) * 1024,
+                "avail_bytes": int(parts[3]) * 1024,
+            }
+        except ValueError:
+            continue
     return {"total_bytes": 0, "avail_bytes": 0}
 
 
-def collect_container_disk_usage(name: str, runtime: str = "", project: str = "") -> Dict[str, Dict[str, int] | int]:
+def collect_container_disk_usage(
+    name: str,
+    runtime: str = "",
+    project: str = "",
+    include_layer_size: bool | None = None,
+) -> Dict[str, Dict[str, int] | int]:
     runtime = runtime or get_container_bin()
     if not runtime:
         return {
@@ -2356,9 +2367,13 @@ def collect_container_disk_usage(name: str, runtime: str = "", project: str = ""
             "fs": {"root": {"total_bytes": 0, "avail_bytes": 0}, "data": {"total_bytes": 0, "avail_bytes": 0}},
         }
 
+    if include_layer_size is None:
+        include_layer_size = os.getenv("CONTAINER_LAYER_SIZE_ENABLED", "false").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
     rw_bytes = 0
     rootfs_bytes = 0
-    if _runtime_kind(runtime) != "incus":
+    if include_layer_size and _runtime_kind(runtime) != "incus":
         inspect = run([runtime, "container", "inspect", "--size", name])
         if inspect:
             try:
@@ -2620,45 +2635,53 @@ def collect_container(
     }
 
 
+_disk_alert_cache: Dict[str, object] = {}
+_disk_alert_cache_at = 0.0
+
+
 def collect_disk_alert() -> Dict:
+    global _disk_alert_cache, _disk_alert_cache_at
+    now = time.monotonic()
+    if _disk_alert_cache and now - _disk_alert_cache_at < 30:
+        return dict(_disk_alert_cache)
     file_path = os.getenv("WATCH_DISK_FILE", "/xfs_disk.img")
     image_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
-    root_device = ""
-    root_avail_bytes = 0
-    root_total_bytes = 0
-    df_root = run(["df", "-P", "/"])
-    if df_root:
-        lines = df_root.splitlines()
-        if len(lines) >= 2:
-            parts = lines[1].split()
-            if len(parts) >= 6:
-                root_device = parts[0]
-                root_total_bytes = int(parts[1]) * 1024
-                root_avail_bytes = int(parts[3]) * 1024
+    def parse_host_df(output: str) -> Dict[str, object]:
+        for line in reversed(output.splitlines()):
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            try:
+                return {
+                    "device": parts[0],
+                    "total_bytes": int(parts[1]) * 1024,
+                    "avail_bytes": int(parts[3]) * 1024,
+                    "used_percent": float(parts[4].rstrip("%")),
+                    "mountpoint": parts[5],
+                }
+            except ValueError:
+                continue
+        return {"device": "", "total_bytes": 0, "avail_bytes": 0, "used_percent": 0.0, "mountpoint": ""}
 
-    data_avail_bytes = 0
-    data_total_bytes = 0
-    df = run(["df", "-P", "/data"])
-    used = 0.0
-    if df:
-        lines = df.splitlines()
-        if len(lines) >= 2:
-            parts = lines[1].split()
-            if len(parts) >= 6:
-                used = float(parts[4].rstrip("%"))
-                data_total_bytes = int(parts[1]) * 1024
-                data_avail_bytes = int(parts[3]) * 1024
-    return {
+    root_usage = parse_host_df(run(["df", "-P", "/"]))
+    requested_main_path = "/data" if os.path.exists("/data") else "/"
+    main_usage = parse_host_df(run(["df", "-P", requested_main_path]))
+    result = {
         "file": file_path,
         "size_bytes": image_size,
-        "used_percent": used,
-        "root_device": root_device,
-        "root_total_bytes": root_total_bytes,
-        "root_avail_bytes": root_avail_bytes,
-        "data_total_bytes": data_total_bytes,
-        "data_avail_bytes": data_avail_bytes,
+        "used_percent": float(main_usage["used_percent"]),
+        "root_device": str(root_usage["device"]),
+        "root_total_bytes": int(root_usage["total_bytes"]),
+        "root_avail_bytes": int(root_usage["avail_bytes"]),
+        "data_requested_path": requested_main_path,
+        "data_mountpoint": str(main_usage["mountpoint"] or requested_main_path),
+        "data_total_bytes": int(main_usage["total_bytes"]),
+        "data_avail_bytes": int(main_usage["avail_bytes"]),
     }
+    _disk_alert_cache = result
+    _disk_alert_cache_at = now
+    return dict(result)
 
 
 def network_health(containers: List[Dict[str, str]] | None = None) -> Tuple[bool, bool]:

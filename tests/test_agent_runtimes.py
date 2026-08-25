@@ -18,6 +18,8 @@ class RuntimeDiscoveryTests(unittest.TestCase):
         agent._podman_bin = None
         agent._container_bin = None
         agent._runtime_bins = None
+        agent._disk_alert_cache = {}
+        agent._disk_alert_cache_at = 0.0
         agent._warned_missing_bins.clear()
 
     def test_auto_discovers_all_available_runtimes(self):
@@ -93,12 +95,19 @@ class RuntimeDiscoveryTests(unittest.TestCase):
 
     def test_docker_notice_mode_creates_lightweight_report_and_info_alert(self):
         source = {"id": "d1", "name": "helper", "image": "helper:latest", "runtime": "docker"}
-        with mock.patch.object(agent, "collect_disk_alert", return_value={}):
+        fs = {"root": {"total_bytes": 1000, "avail_bytes": 400}}
+        with mock.patch.object(agent, "collect_disk_alert", return_value={}), mock.patch.object(
+            agent,
+            "collect_container_disk_usage",
+            return_value={"rw_bytes": 0, "rootfs_bytes": 0, "fs": fs},
+        ) as disk_mock:
             report = agent.collect_docker_notice(source)
         with mock.patch.dict(os.environ, {"SECURITY_ACCESS_LOG_PATHS": ""}, clear=False):
             summary = agent.collect_security_summary([report], 60)
         self.assertEqual(report["monitor_mode"], "notice")
         self.assertTrue(report["security"]["notice_only"])
+        self.assertEqual(report["container_disk"]["fs"]["root"]["total_bytes"], 1000)
+        disk_mock.assert_called_once_with("helper", "docker", "", include_layer_size=False)
         self.assertEqual(summary["alerts"][0]["type"], "docker_container_notice")
         self.assertEqual(summary["alerts"][0]["severity"], "info")
 
@@ -109,6 +118,39 @@ class RuntimeDiscoveryTests(unittest.TestCase):
             agent.list_containers()
         self.assertEqual(collect_mock.call_count, 1)
         self.assertEqual(collect_mock.call_args.args[0], "podman")
+
+    def test_host_main_disk_falls_back_to_root_without_data_mount(self):
+        df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 1000 250 750 25% /\n"
+
+        def exists(path):
+            return False
+
+        with mock.patch.object(agent.os.path, "exists", side_effect=exists), mock.patch.object(
+            agent, "run", return_value=df
+        ) as run_mock:
+            disk = agent.collect_disk_alert()
+        self.assertEqual(disk["data_requested_path"], "/")
+        self.assertEqual(disk["data_mountpoint"], "/")
+        self.assertEqual(disk["data_total_bytes"], 1000 * 1024)
+        self.assertEqual(run_mock.call_args_list[-1].args[0], ["df", "-P", "/"])
+
+    def test_host_main_disk_uses_data_when_present(self):
+        root_df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 1000 250 750 25% /\n"
+        data_df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vdb1 2000 500 1500 25% /data\n"
+
+        def exists(path):
+            return path == "/data"
+
+        def fake_run(cmd):
+            return data_df if cmd[-1] == "/data" else root_df
+
+        with mock.patch.object(agent.os.path, "exists", side_effect=exists), mock.patch.object(
+            agent, "run", side_effect=fake_run
+        ):
+            disk = agent.collect_disk_alert()
+        self.assertEqual(disk["data_requested_path"], "/data")
+        self.assertEqual(disk["data_mountpoint"], "/data")
+        self.assertEqual(disk["data_avail_bytes"], 1500 * 1024)
 
 
 class IncusMetricsTests(unittest.TestCase):

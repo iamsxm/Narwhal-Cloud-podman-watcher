@@ -16,7 +16,7 @@
 - **节点侧安全检测**：针对 DDoS、CC、扫描、异常出站、可疑进程、危险容器配置和机场面板对接进行检测与预警。
 - **NAT 场景识别**：不依赖 80/443 等固定端口，结合全部监听端口、运行时端口映射、进程、配置与面板域名判断。
 - **一键安装与更新**：`install.sh` 支持安装、更新和卸载；更新会复用 `/opt/narwhal-monitor/*.env` 配置并重建或重启服务。
-- **告警快速处理**：机场面板对接告警可在页面中选择“快速清理”或“放行”；只对 Podman/Incus 执行动作，Docker 始终仅提醒。
+- **告警快速处理**：活动告警可选择“禁止”“允许且不再提醒”或“本次取消提醒”；只有 Podman/Incus 的机场面板对接告警可以执行禁止清理，Docker 不执行清理。
 - **自动更新**：Server 与 Client 默认每 15 分钟检查 GitHub `main`，只进行安全的 fast-forward 更新并记录日志。
 - **Server HTTPS 自动化**：支持自动拉起 Caddy 反向代理：
   - 域名场景：自动申请公网证书（ACME HTTP-01）。
@@ -253,13 +253,13 @@ INCUS_PROJECT=default
 
 `auto` 会发现主机上可用的 Podman、Docker、Incus。Podman 和 Incus 默认做完整采集，两个过滤项默认都是 `*`，所以其中的 Xboard、xboard-node、Nginx/Caddy、数据库及其他运行中容器都会进入监测；只有明确需要缩小范围时才改成镜像或实例名关键字。Incus 虚拟机不在本项目的容器采集范围内。
 
-Docker 默认采用 `notice`：只枚举容器并在仪表盘产生信息提醒，不执行 `inspect/stats/exec`、日志读取或安全判断。可改为 `full` 启用与 Podman 相同的完整监测，或改为 `off` 完全忽略。信息级 Docker 提醒默认不会触发 `warning` 级别的 Webhook；需要推送时把 Server 的 `ALERT_WEBHOOK_MIN_SEVERITY` 改为 `info`。
+Docker 默认采用 `notice`：只枚举容器、执行一次轻量 `df` 获取容器根盘容量，并在仪表盘产生信息提醒；不执行 stats、进程/连接/日志读取、镜像层尺寸计算或安全判断。可改为 `full` 启用与 Podman 相同的完整监测，或改为 `off` 完全忽略。信息级 Docker 提醒默认不会触发 `warning` 级别的 Webhook；需要推送时把 Server 的 `ALERT_WEBHOOK_MIN_SEVERITY` 改为 `info`。
 
 Incus 的 CPU 与网络速度由累计指标的相邻采样差值计算，因此 Agent 启动后的第一次上报可能暂时为 0；从第二次采样起会得到区间值。内存、连接数、磁盘和进程信息仍会在首次采样采集。
 
 ## DDoS / CC / 滥用 / 扫描监测与预警
 
-所有安全监测都在节点宿主机执行，不会向远端 Xboard 发起额外探测。Agent 会对 Podman 和 Incus 容器执行完整采集，无论其中运行的是 Xboard 面板、xboard-node、协议服务、反向代理还是其他组件，都会检查其网络命名空间、连接、进程和配置线索。Docker 默认只枚举并提醒，不进入容器、不读取日志且不做安全判断；只有将 `DOCKER_MONITOR_MODE=full` 后才执行同类深度采集。
+所有安全监测都在节点宿主机执行，不会向远端 Xboard 发起额外探测。Agent 会对 Podman 和 Incus 容器执行完整采集，无论其中运行的是 Xboard 面板、xboard-node、协议服务、反向代理还是其他组件，都会检查其网络命名空间、连接、进程和配置线索。Docker 默认仅枚举、轻量读取根盘容量并提醒，不读取日志且不做安全判断；只有将 `DOCKER_MONITOR_MODE=full` 后才执行同类深度采集。
 
 安全监测默认启用，作用是**发现并告警**，不会自动封禁 IP 或修改防火墙：
 
@@ -320,14 +320,22 @@ Agent 会同时读取宿主机 `SECURITY_ACCESS_LOG_PATHS`，并通过对应的 
 
 ### Critical 机场对接告警的处理
 
-活动的 `unauthorized_panel_pairing` 告警在总览页提供两个按钮：
+活动告警在总览页提供三个处置入口：
 
-- **快速清理**：Server 把经过 HMAC 签名的定向动作发送给对应节点。Agent 不停止或删除容器，只在目标 Podman/Incus 容器内部终止本次检测命中的机场节点进程，停用并删除同名 systemd/OpenRC 服务定义，并删除本次检测到且同时属于 `SECURITY_PANEL_CONFIG_PATHS` 的配置文件。Agent 会再次校验容器、运行时、进程特征和配置路径，不接受任意 Shell 或任意文件路径。首次人工清理成功后，本次命中的具体面板域名会写入节点侧 `SECURITY_PANEL_AUTO_REMEDIATE_FILE`；同一域名以后再次出现时会自动执行清理且不再向 Server 提醒。如果同批检测还出现从未确认过的新域名，新域名仍会正常告警。
-- **放行**：把告警中提取到的域名写入该节点的 `SECURITY_PANEL_ALLOWLIST_FILE`；下一次安全采样后告警自动恢复。该文件以 `0600` 权限原子写入，更新 Client 时保留。
+- **禁止**：只出现在证据完整的 Podman/Incus `unauthorized_panel_pairing` 告警上。Server 把经过 HMAC 签名的定向动作发送给对应节点。Agent 不停止或删除容器，只在目标容器内部终止本次检测命中的机场节点进程，停用并删除同名 systemd/OpenRC 服务定义，并删除本次检测到且同时属于 `SECURITY_PANEL_CONFIG_PATHS` 的配置文件。Agent 会再次校验容器、运行时、进程特征和配置路径，不接受任意 Shell 或任意文件路径。首次人工清理成功后，本次命中的具体面板域名会写入节点侧 `SECURITY_PANEL_AUTO_REMEDIATE_FILE`；同一域名以后再次出现时会自动执行清理且不再向 Server 提醒，新域名仍正常告警。
+- **允许且不再提醒**：永久抑制该告警指纹。机场面板告警按具体域名形成指纹，并把域名写入节点的 `SECURITY_PANEL_ALLOWLIST_FILE`；其他告警按主机、运行时、项目、容器和类型抑制。更新 Client/Server 后策略保留。
+- **本次取消提醒**：只隐藏当前连续出现的这一次事件。只要节点后续一次上报不再包含它，事件即恢复；以后再次出现会重新展示并通知。
 
-按钮提交、节点领取和执行结果记录在 Server 的 `security_actions` 审计表中，页面会显示“等待节点 / 节点处理中 / 已完成 / 失败”及结果。动作响应由共享密钥签名校验，即使使用 internal CA，也不会接受被篡改的动作。Docker 告警没有处置按钮，仍只提醒。
+按钮决策记录在 `security_alert_decisions`，永久抑制策略记录在 `security_alert_policies`，节点动作记录在 `security_actions`。页面会显示“等待节点 / 节点处理中 / 已完成 / 失败”及结果。动作响应由共享密钥签名校验，即使使用 internal CA，也不会接受被篡改的动作。Docker 仍没有“禁止”，但可以选择永久不再提醒或取消本次提醒。
 
-> “快速清理”会删除容器内对应配置与服务定义，属于不可逆操作，页面提交前会列出目标及后续自动清理规则并要求二次确认。它不会删除程序二进制，也不会停止 Incus/Podman 容器。需要取消某个域名的自动清理时，请从节点的 `/opt/narwhal-monitor/panel-auto-remediate.json` 中删除该域名并保持 JSON 格式有效。
+> “禁止”会删除容器内对应配置与服务定义，属于不可逆操作，页面提交前会列出目标及后续自动清理规则并要求二次确认。它不会删除程序二进制，也不会停止 Incus/Podman 容器。需要取消某个域名的自动清理时，请从节点的 `/opt/narwhal-monitor/panel-auto-remediate.json` 中删除该域名并保持 JSON 格式有效。
+
+### 容量采集与容器详情
+
+- “容器根盘(/ 总量/可用)”来自容器内 `df -P /`，表示容器看到的根文件系统容量，不是镜像层大小。
+- “宿主机主盘”优先读取 `/data`；节点没有 `/data` 时自动回退到 `/`，页面同时显示实际挂载点，不再把不存在的 `/data` 显示为 `0 B / 0 B`。
+- 宿主机磁盘结果缓存 30 秒，同一轮多个容器复用；容器侧只读取文件系统元数据，不遍历目录、不计算目录大小。镜像层 `inspect --size` 默认关闭；确需采集时可在 Client 环境中设置 `CONTAINER_LAYER_SIZE_ENABLED=true`，但这可能增加 IO。
+- 统计页的 Top10 和“全部容器”均提供“容器详情”跳转。详情展示历史 CPU/内存/连接/速率曲线、当前 RX/TX/pps/TCP 建连失败速率、最高 CPU 进程、可疑进程、监听端口、NAT/代理映射和配置风险，全部复用既有采样，不提高 Agent 上报频率。
 
 机场面板/节点识别**不假设 80、443 或任何固定端口**。Agent 会枚举容器网络命名空间中的全部 TCP 监听端口，并展示 Podman publish 以及 Incus proxy device 中可见的外部端口到内部端口映射；公网 NAT 端口与容器端口可以完全不同。由宿主机自定义 nftables/iptables、上游路由器或云厂商实现且没有运行时元数据的 DNAT 无法可靠归属到具体容器，此时仍通过进程、配置文件、环境变量和面板域名判断是否存在机场对接。
 Agent 启动时会把现有日志位置记为基线，只统计之后追加的新请求，避免把历史日志误判为当前攻击。
@@ -508,11 +516,12 @@ sudo bash scripts/collect-podman-raw.sh
 - 网络速度（RX/TX）
 - 容器内当前 CPU 占用最高进程（PID / CPU% / 命令）
 - 离线容器生命周期管理：离线后默认保留 1 天并标记离线时长（按小时刷新），超过 1 天默认隐藏，超过 30 天自动删除历史数据
-- 指定磁盘文件容量与挂载点使用率
+- 容器根盘容量，以及优先 `/data`、不存在时回退 `/` 的宿主机主盘容量与挂载点
 - 容器网络健康（IPv4 / IPv6，跨 Podman/Docker/Incus 探测）
 - 运行时与 Incus 项目维度，支持同主机同名容器隔离展示和历史统计
 - DDoS、SYN Flood、HTTP/CC、端口扫描及出站滥用监测
 - 告警去重、自动恢复、历史查询与可选 Webhook 通知
+- 统计页到容器详情的一键跳转，以及进程、速率、暴露面和风险排查视图
 
 ## 容器权限说明
 

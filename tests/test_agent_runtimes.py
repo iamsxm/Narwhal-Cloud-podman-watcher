@@ -403,6 +403,33 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertEqual(mappings[0]["listen"], "tcp:9.9.9.9:18080")
         self.assertEqual(mappings[1]["target"], "tcp:10.91.0.5:443")
 
+    def test_unique_host_proxy_pid_links_public_socket_to_container(self):
+        snapshot = (
+            'tcp LISTEN 0 128 9.9.9.9:18443 0.0.0.0:* users:(("socat",pid=100,fd=3))\n'
+            'tcp ESTAB 0 0 9.9.9.9:18443 8.8.8.8:50000 users:(("socat",pid=100,fd=4))\n'
+            'tcp ESTAB 0 0 10.91.0.1:40000 10.91.0.5:443 users:(("socat",pid=100,fd=5))\n'
+        )
+        conntrack = {"entries": [], "nat_mappings": []}
+        containers = [
+            {
+                "runtime": "incus",
+                "name": "node1",
+                "network_addresses": ["10.91.0.5"],
+            }
+        ]
+        with mock.patch.object(agent, "run", return_value=snapshot):
+            agent._augment_conntrack_with_host_proxy_sockets(conntrack, containers)
+        security = {"container_ips": ["10.91.0.5"], "inbound_unique_ips": 0}
+        agent._apply_host_conntrack_security(
+            security,
+            conntrack,
+            ["10.91.0.5"],
+            [],
+        )
+        self.assertEqual(conntrack["host_proxy_matched_connections"], 1)
+        self.assertEqual(security["inbound_unique_ips"], 1)
+        self.assertEqual(security["inbound_public_flows"][0]["container_port"], 443)
+
     def test_proc_ipv6_decoder_normalizes_ipv4_mapped_address(self):
         self.assertEqual(
             agent._decode_proc_addr("0000000000000000FFFF000006005B0A", is_v6=True),

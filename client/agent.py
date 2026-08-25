@@ -1295,6 +1295,122 @@ def _collect_host_conntrack_snapshot() -> Dict[str, object]:
     }
 
 
+def _augment_conntrack_with_host_proxy_sockets(
+    conntrack: Dict[str, object], containers: List[Dict[str, object]]
+) -> None:
+    """Safely correlate two-leg user-space proxy sockets when one PID has one target."""
+    address_owners: Dict[str, str] = {}
+    for container in containers:
+        if not isinstance(container, dict) or container.get("runtime") == "docker":
+            continue
+        for address in container.get("network_addresses") or []:
+            value = str(address)
+            if _is_trackable_ip(value):
+                address_owners[value] = str(container.get("name") or "")
+    if not address_owners:
+        return
+    limit = max(100, min(20000, int(_env_float("SECURITY_HOST_PROXY_SOCKET_MAX", 5000))))
+    output = run(
+        [
+            "sh",
+            "-lc",
+            "if command -v ss >/dev/null 2>&1; then "
+            f"ss -H -t -u -n -a -p 2>/dev/null | sed -n '1,{limit}p'; fi",
+        ]
+    )
+    lines = [line.strip() for line in output.splitlines()[:limit] if line.strip()]
+    listeners: Dict[Tuple[int, str], set] = {}
+    established: List[Dict[str, object]] = []
+    for line in lines:
+        parts = line.split(None, 6)
+        if len(parts) < 6:
+            continue
+        proto = parts[0].lower()
+        state = parts[1].upper()
+        local_ip, local_port = _parse_socket_endpoint(parts[4])
+        remote_ip, remote_port = _parse_socket_endpoint(parts[5])
+        process_text = parts[6] if len(parts) > 6 else ""
+        owners = re.findall(r'\("([^"\\]{1,120})",pid=(\d+)', process_text)
+        if not owners:
+            continue
+        owner = (int(owners[0][1]), owners[0][0])
+        if state == "LISTEN" and local_port > 0:
+            listeners.setdefault(owner, set()).add((proto, local_ip, local_port))
+        elif state in ("ESTAB", "ESTABLISHED") and local_port > 0 and remote_port > 0:
+            established.append(
+                {
+                    "owner": owner,
+                    "proto": "tcp" if proto.startswith("tcp") else proto,
+                    "local_ip": local_ip,
+                    "local_port": local_port,
+                    "remote_ip": remote_ip,
+                    "remote_port": remote_port,
+                }
+            )
+    targets: Dict[Tuple[int, str], set] = {}
+    external_sources: Dict[Tuple[int, str], List[Dict[str, object]]] = {}
+    for socket_item in established:
+        owner = socket_item["owner"]
+        remote_ip = str(socket_item["remote_ip"])
+        remote_port = int(socket_item["remote_port"])
+        if remote_ip in address_owners:
+            targets.setdefault(owner, set()).add((remote_ip, remote_port))
+            continue
+        if not _is_public_source_ip(remote_ip):
+            continue
+        local_port = int(socket_item["local_port"])
+        listening = listeners.get(owner, set())
+        if not any(int(item[2]) == local_port for item in listening):
+            continue
+        external_sources.setdefault(owner, []).append(socket_item)
+    entries = conntrack.get("entries") if isinstance(conntrack.get("entries"), list) else []
+    nat_mappings = conntrack.get("nat_mappings") if isinstance(conntrack.get("nat_mappings"), list) else []
+    matched_connections = 0
+    for owner, sources in external_sources.items():
+        owner_targets = targets.get(owner, set())
+        if len(owner_targets) != 1:
+            continue
+        target_ip, target_port = next(iter(owner_targets))
+        for source in sources:
+            local_ip = str(source["local_ip"])
+            local_port = int(source["local_port"])
+            proto = str(source["proto"])
+            remote_ip = str(source["remote_ip"])
+            remote_port = int(source["remote_port"])
+            entries.append(
+                {
+                    "proto": proto,
+                    "original_src": remote_ip,
+                    "original_dst": local_ip,
+                    "original_sport": remote_port,
+                    "original_dport": local_port,
+                    "reply_src": local_ip,
+                    "reply_dst": remote_ip,
+                    "reply_sport": local_port,
+                    "reply_dport": remote_port,
+                    "proxy_process": owner[1],
+                    "proxy_pid": owner[0],
+                }
+            )
+            nat_mappings.append(
+                {
+                    "proto": proto,
+                    "host": local_ip,
+                    "public_port": local_port,
+                    "target_host": target_ip,
+                    "container_port": target_port,
+                    "source": "host-proxy-socket",
+                }
+            )
+            matched_connections += 1
+    conntrack["entries"] = entries
+    conntrack["nat_mappings"] = nat_mappings
+    conntrack["host_proxy_socket_available"] = bool(lines)
+    conntrack["host_proxy_socket_snapshot_count"] = len(lines)
+    conntrack["host_proxy_socket_snapshot_truncated"] = len(lines) >= limit
+    conntrack["host_proxy_matched_connections"] = matched_connections
+
+
 def _parse_exposure_endpoint(value: str) -> Tuple[str, str, int]:
     text = (value or "").strip()
     proto = ""
@@ -1400,6 +1516,9 @@ def _apply_host_conntrack_security(
     security["host_conntrack_available"] = bool(conntrack.get("available"))
     security["host_conntrack_snapshot_count"] = int(conntrack.get("snapshot_count") or 0)
     security["host_conntrack_snapshot_truncated"] = bool(conntrack.get("snapshot_truncated"))
+    security["host_proxy_socket_available"] = bool(conntrack.get("host_proxy_socket_available"))
+    security["host_proxy_socket_snapshot_count"] = int(conntrack.get("host_proxy_socket_snapshot_count") or 0)
+    security["host_proxy_matched_connections"] = int(conntrack.get("host_proxy_matched_connections") or 0)
     security["container_ips"] = sorted(addresses)
     if not source_connections:
         return
@@ -3897,6 +4016,8 @@ def main() -> None:
             if runtime_bin not in incus_metrics_by_runtime:
                 incus_metrics_by_runtime[runtime_bin] = _get_incus_metrics(runtime_bin)
         host_conntrack = _collect_host_conntrack_snapshot() if security_enabled else {}
+        if security_enabled:
+            _augment_conntrack_with_host_proxy_sockets(host_conntrack, containers)
         collected = []
         for c in containers:
             if c.get("runtime") == "docker" and docker_mode == "notice":

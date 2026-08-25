@@ -161,6 +161,7 @@ suspicious_ports="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_SUSPIC
 access_log_max_bytes="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_ACCESS_LOG_MAX_BYTES "1048576")"
 socket_snapshot_max="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_SOCKET_SNAPSHOT_MAX "500")"
 communication_detail_max="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_COMMUNICATION_DETAIL_MAX "100")"
+conntrack_snapshot_max="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_CONNTRACK_SNAPSHOT_MAX "5000")"
 web_scan_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_WEB_SCAN_PATTERNS ".env,.git,wp-login,wp-admin,phpmyadmin,actuator,server-status,cgi-bin,vendor/phpunit,etc/passwd,boaform,hnap1")"
 web_scan_requests="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_WEB_SCAN_REQUESTS "10")"
 auth_failures_per_ip="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_AUTH_FAILURES_PER_IP "20")"
@@ -202,6 +203,18 @@ if [[ "$server_url" == https://* || "$server_url" != *://* ]]; then
     --output "$tls_ca_output")"
 fi
 
+if [[ ! -r /proc/net/nf_conntrack && ! -r /proc/net/ip_conntrack ]] \
+  && ! command -v conntrack >/dev/null 2>&1; then
+  echo "Installing conntrack for NAT-aware inbound source telemetry..."
+  if command -v apt-get >/dev/null 2>&1; then
+    if ! apt-get update || ! apt-get install -y conntrack; then
+      echo "[WARN] conntrack install failed; inbound IP telemetry will use container socket fallback."
+    fi
+  else
+    echo "[WARN] conntrack is unavailable; install conntrack-tools to restore public source IPs behind NAT."
+  fi
+fi
+
 cat >"$CLIENT_ENV_FILE" <<ENV
 NARWHAL_VERSION=$PROJECT_VERSION
 SERVER_URL=$server_url
@@ -241,6 +254,7 @@ SECURITY_SUSPICIOUS_OUTBOUND_PORTS=$suspicious_ports
 SECURITY_ACCESS_LOG_MAX_BYTES=$access_log_max_bytes
 SECURITY_SOCKET_SNAPSHOT_MAX=$socket_snapshot_max
 SECURITY_COMMUNICATION_DETAIL_MAX=$communication_detail_max
+SECURITY_CONNTRACK_SNAPSHOT_MAX=$conntrack_snapshot_max
 SECURITY_WEB_SCAN_PATTERNS=$web_scan_patterns
 ALERT_WEB_SCAN_REQUESTS=$web_scan_requests
 ALERT_AUTH_FAILURES_PER_IP=$auth_failures_per_ip

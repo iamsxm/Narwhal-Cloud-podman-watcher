@@ -255,6 +255,7 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn('os.getenv("NARWHAL_VERSION", "dev")', server_source)
         self.assertIn("NARWHAL_VERSION=$PROJECT_VERSION", client_installer)
         self.assertIn("ALERT_INBOUND_UNIQUE_IPS=$inbound_unique_ips", client_installer)
+        self.assertIn("SECURITY_CONNTRACK_SNAPSHOT_MAX=$conntrack_snapshot_max", client_installer)
         self.assertIn("NARWHAL_VERSION=$PROJECT_VERSION", server_installer)
 
     def test_panel_action_queue_and_agent_poll_are_signed(self):

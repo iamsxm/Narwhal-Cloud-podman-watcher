@@ -276,6 +276,66 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertEqual(result["communication_processes"][0]["process"], "nginx")
         self.assertEqual(result["communication_processes"][0]["inbound_connections"], 1)
 
+    def test_conntrack_restores_original_sources_hidden_by_incus_proxy(self):
+        entries = []
+        for suffix in range(1, 12):
+            parsed = agent._parse_conntrack_line(
+                f"ipv4 2 tcp 6 431999 ESTABLISHED src=198.51.100.{suffix} "
+                "dst=192.0.2.10 sport=50000 dport=18443 "
+                f"src=192.0.2.10 dst=198.51.100.{suffix} sport=18443 dport=50000 [ASSURED]"
+            )
+            self.assertIsNotNone(parsed)
+            entries.append(parsed)
+        security = {
+            "container_ips": ["10.91.0.2"],
+            "inbound_unique_ips": 1,
+            "inbound_top_ips": [{"ip": "10.91.0.1", "connections": 11}],
+        }
+        agent._apply_host_conntrack_security(
+            security,
+            {"available": True, "snapshot_count": 11, "entries": entries},
+            ["10.91.0.2"],
+            [
+                {
+                    "source": "incus-proxy",
+                    "listen": "tcp:0.0.0.0:18443",
+                    "target": "tcp:10.91.0.2:443",
+                }
+            ],
+        )
+        self.assertEqual(security["inbound_ip_observation"], "host_conntrack")
+        self.assertEqual(security["inbound_unique_ips"], 11)
+        self.assertEqual(security["inbound_public_flows"][0]["container_port"], 443)
+
+    def test_original_conntrack_sources_are_attributed_to_listening_process(self):
+        communication = {
+            "communication_sockets": [
+                {
+                    "direction": "inbound",
+                    "local": "10.91.0.2:443",
+                    "process": "nginx",
+                    "pid": 42,
+                }
+            ],
+            "communication_processes": [{"process": "nginx", "pid": 42}],
+        }
+        agent._enrich_communication_with_original_sources(
+            communication,
+            [
+                {
+                    "remote_ip": "198.51.100.8",
+                    "container_port": 443,
+                    "connections": 3,
+                }
+            ],
+        )
+        process = communication["communication_processes"][0]
+        self.assertEqual(process["original_inbound_unique_ips"], 1)
+        self.assertEqual(
+            communication["communication_sockets"][0]["original_remote_ips"],
+            ["198.51.100.8"],
+        )
+
     def test_proc_ipv6_decoder_normalizes_ipv4_mapped_address(self):
         self.assertEqual(
             agent._decode_proc_addr("0000000000000000FFFF000006005B0A", is_v6=True),

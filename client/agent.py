@@ -1000,6 +1000,9 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
         "inbound_unique_ips": 0,
         "inbound_top_ips": [],
         "inbound_unique_ip_threshold": int(_env_float("ALERT_INBOUND_UNIQUE_IPS", 10)),
+        "inbound_ip_observation": "container_socket",
+        "inbound_public_flows": [],
+        "container_ips": [],
         "outbound_established": 0,
         "outbound_unique_ips": 0,
         "outbound_unique_ports": 0,
@@ -1040,6 +1043,11 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
         int(x["local_port"])
         for x in entries
         if x["proto"] == "tcp" and x["state"] == "0A" and int(x["local_port"]) > 0
+    }
+    container_ips = {
+        str(entry["local_ip"])
+        for entry in entries
+        if _is_trackable_ip(str(entry.get("local_ip") or ""))
     }
     state_names = {
         "01": "established",
@@ -1124,6 +1132,7 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
                 )[:20]
             ],
             "inbound_unique_ip_threshold": int(_env_float("ALERT_INBOUND_UNIQUE_IPS", 10)),
+            "container_ips": sorted(container_ips),
             "outbound_established": outbound_established,
             "outbound_unique_ips": len(outbound_ips),
             "outbound_unique_ports": len(outbound_ports),
@@ -1134,6 +1143,244 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
         }
     )
     return result
+
+
+def _parse_conntrack_line(line: str) -> Dict[str, object] | None:
+    """Parse the original and reply tuples from one conntrack record."""
+    proto = next((token.lower() for token in line.split()[:8] if token.lower() in ("tcp", "udp")), "")
+    src_values = re.findall(r"\bsrc=([^\s]+)", line)
+    dst_values = re.findall(r"\bdst=([^\s]+)", line)
+    sport_values = re.findall(r"\bsport=(\d+)", line)
+    dport_values = re.findall(r"\bdport=(\d+)", line)
+    if not proto or len(src_values) < 2 or len(dst_values) < 2:
+        return None
+    if not _is_trackable_ip(src_values[0]):
+        return None
+    try:
+        original_sport = int(sport_values[0]) if sport_values else 0
+        original_dport = int(dport_values[0]) if dport_values else 0
+        reply_sport = int(sport_values[1]) if len(sport_values) > 1 else 0
+        reply_dport = int(dport_values[1]) if len(dport_values) > 1 else 0
+    except ValueError:
+        return None
+    return {
+        "proto": proto,
+        "original_src": src_values[0],
+        "original_dst": dst_values[0],
+        "original_sport": original_sport,
+        "original_dport": original_dport,
+        "reply_src": src_values[1],
+        "reply_dst": dst_values[1],
+        "reply_sport": reply_sport,
+        "reply_dport": reply_dport,
+    }
+
+
+def _collect_host_conntrack_snapshot() -> Dict[str, object]:
+    """Read one bounded host conntrack snapshot for NAT-aware source attribution."""
+    limit = max(100, min(50000, int(_env_float("SECURITY_CONNTRACK_SNAPSHOT_MAX", 5000))))
+    lines: List[str] = []
+    available = False
+    for path in ("/proc/net/nf_conntrack", "/proc/net/ip_conntrack"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                available = True
+                for index, line in enumerate(handle):
+                    if index >= limit:
+                        break
+                    if line.strip():
+                        lines.append(line.strip())
+            break
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+    if not available:
+        output = run(
+            [
+                "sh",
+                "-lc",
+                "if command -v conntrack >/dev/null 2>&1; then "
+                f"conntrack -L -o extended 2>/dev/null | sed -n '1,{limit}p'; fi",
+            ]
+        )
+        if output.strip():
+            available = True
+            lines = [line.strip() for line in output.splitlines()[:limit] if line.strip()]
+    host_addresses = set()
+    address_output = run(["ip", "-j", "address", "show"])
+    if address_output.strip():
+        try:
+            address_payload = json.loads(address_output)
+        except (TypeError, ValueError):
+            address_payload = []
+        for interface in address_payload if isinstance(address_payload, list) else []:
+            if not isinstance(interface, dict):
+                continue
+            address_info = interface.get("addr_info") if isinstance(interface.get("addr_info"), list) else []
+            for address in address_info:
+                if not isinstance(address, dict):
+                    continue
+                value = str(address.get("local") or "")
+                if _is_trackable_ip(value):
+                    host_addresses.add(value)
+    entries = []
+    for line in lines:
+        parsed = _parse_conntrack_line(line)
+        if parsed:
+            entries.append(parsed)
+    return {
+        "available": available,
+        "snapshot_count": len(lines),
+        "snapshot_truncated": len(lines) >= limit,
+        "host_addresses": sorted(host_addresses),
+        "entries": entries,
+    }
+
+
+def _parse_exposure_endpoint(value: str) -> Tuple[str, str, int]:
+    text = (value or "").strip()
+    proto = ""
+    if text.lower().startswith(("tcp:", "udp:")):
+        proto, text = text.split(":", 1)
+        proto = proto.lower()
+    elif "/" in text and text.rsplit("/", 1)[1].lower() in ("tcp", "udp"):
+        text, proto = text.rsplit("/", 1)
+        proto = proto.lower()
+    host, port = _parse_socket_endpoint(text)
+    if port <= 0 and text.isdigit():
+        port = int(text)
+        host = ""
+    return proto, host, port
+
+
+def _apply_host_conntrack_security(
+    security: Dict[str, object],
+    conntrack: Dict[str, object],
+    container_addresses: List[str],
+    network_exposure: List[Dict[str, str]],
+) -> None:
+    """Replace proxy-collapsed source counts with original host conntrack tuples."""
+    entries = conntrack.get("entries") if isinstance(conntrack.get("entries"), list) else []
+    host_addresses = {
+        str(address)
+        for address in (conntrack.get("host_addresses") or [])
+        if _is_trackable_ip(str(address))
+    }
+    addresses = {
+        str(address)
+        for address in list(container_addresses) + list(security.get("container_ips") or [])
+        if _is_trackable_ip(str(address))
+    }
+    mappings = []
+    for exposure in network_exposure:
+        if not isinstance(exposure, dict):
+            continue
+        listen_proto, listen_host, listen_port = _parse_exposure_endpoint(str(exposure.get("listen") or ""))
+        target_proto, target_host, target_port = _parse_exposure_endpoint(str(exposure.get("target") or ""))
+        if target_host and _is_trackable_ip(target_host):
+            addresses.add(target_host)
+        if listen_port > 0:
+            mappings.append(
+                {
+                    "proto": listen_proto or target_proto,
+                    "host": listen_host,
+                    "public_port": listen_port,
+                    "container_port": target_port,
+                }
+            )
+
+    source_connections: Dict[str, int] = {}
+    flow_connections: Dict[Tuple[str, str, int, int], int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        source_ip = str(entry.get("original_src") or "")
+        proto = str(entry.get("proto") or "")
+        original_dst = str(entry.get("original_dst") or "")
+        original_dport = int(entry.get("original_dport") or 0)
+        reply_src = str(entry.get("reply_src") or "")
+        reply_sport = int(entry.get("reply_sport") or 0)
+        matched = reply_src in addresses
+        container_port = reply_sport if matched else 0
+        if not matched:
+            for mapping in mappings:
+                mapping_proto = str(mapping.get("proto") or "")
+                mapping_host = str(mapping.get("host") or "")
+                if mapping_proto and mapping_proto != proto:
+                    continue
+                if int(mapping.get("public_port") or 0) != original_dport:
+                    continue
+                if mapping_host and mapping_host not in ("0.0.0.0", "::", "*") and mapping_host != original_dst:
+                    continue
+                if mapping_host in ("", "0.0.0.0", "::", "*") and host_addresses and original_dst not in host_addresses:
+                    continue
+                matched = True
+                container_port = int(mapping.get("container_port") or 0)
+                break
+        if not matched or not _is_trackable_ip(source_ip) or source_ip in addresses:
+            continue
+        source_connections[source_ip] = source_connections.get(source_ip, 0) + 1
+        flow_key = (source_ip, proto, original_dport, container_port)
+        flow_connections[flow_key] = flow_connections.get(flow_key, 0) + 1
+
+    security["host_conntrack_available"] = bool(conntrack.get("available"))
+    security["host_conntrack_snapshot_count"] = int(conntrack.get("snapshot_count") or 0)
+    security["host_conntrack_snapshot_truncated"] = bool(conntrack.get("snapshot_truncated"))
+    security["container_ips"] = sorted(addresses)
+    if not source_connections:
+        return
+    security["inbound_ip_observation"] = "host_conntrack"
+    security["inbound_unique_ips"] = len(source_connections)
+    security["inbound_top_ips"] = [
+        {"ip": ip, "connections": count}
+        for ip, count in sorted(source_connections.items(), key=lambda item: item[1], reverse=True)[:20]
+    ]
+    security["inbound_public_flows"] = [
+        {
+            "remote_ip": key[0],
+            "proto": key[1],
+            "public_port": key[2],
+            "container_port": key[3],
+            "connections": count,
+        }
+        for key, count in sorted(flow_connections.items(), key=lambda item: item[1], reverse=True)[:100]
+    ]
+
+
+def _enrich_communication_with_original_sources(
+    communication: Dict[str, object], public_flows: List[Dict[str, object]]
+) -> None:
+    flows_by_port: Dict[int, List[Dict[str, object]]] = {}
+    for flow in public_flows:
+        if not isinstance(flow, dict):
+            continue
+        port = int(flow.get("container_port") or 0)
+        if port > 0:
+            flows_by_port.setdefault(port, []).append(flow)
+    process_sources: Dict[Tuple[int, str], set] = {}
+    sockets = communication.get("communication_sockets")
+    if not isinstance(sockets, list):
+        sockets = []
+    for item in sockets:
+        if not isinstance(item, dict) or item.get("direction") != "inbound":
+            continue
+        _, local_port = _parse_socket_endpoint(str(item.get("local") or ""))
+        matched_flows = flows_by_port.get(local_port, [])
+        original_ips = sorted({str(flow.get("remote_ip") or "") for flow in matched_flows if flow.get("remote_ip")})
+        if not original_ips:
+            continue
+        item["original_remote_ips"] = original_ips[:20]
+        key = (int(item.get("pid") or 0), str(item.get("process") or "unknown"))
+        process_sources.setdefault(key, set()).update(original_ips)
+    processes = communication.get("communication_processes")
+    if not isinstance(processes, list):
+        return
+    for process in processes:
+        if not isinstance(process, dict):
+            continue
+        key = (int(process.get("pid") or 0), str(process.get("process") or "unknown"))
+        sources = sorted(process_sources.get(key, set()))
+        process["original_inbound_unique_ips"] = len(sources)
+        process["original_inbound_top_ips"] = sources[:20]
 
 
 _NGINX_ACCESS_RE = re.compile(r'^([^ ]+)\s+.*?"([A-Z]+)\s+([^ ]+)\s+[^\"]+"\s+(\d{3})\b')
@@ -2522,6 +2769,18 @@ def _incus_containers(runtime: str) -> List[Dict[str, str]]:
             continue
         item_project = project or str(item.get("project") or "default")
         state = item.get("state") if isinstance(item.get("state"), dict) else {}
+        network = state.get("network") if isinstance(state.get("network"), dict) else {}
+        network_addresses: List[str] = []
+        for interface in network.values():
+            if not isinstance(interface, dict):
+                continue
+            addresses = interface.get("addresses") if isinstance(interface.get("addresses"), list) else []
+            for address in addresses:
+                if not isinstance(address, dict):
+                    continue
+                value = str(address.get("address") or "")
+                if str(address.get("scope") or "").lower() == "global" and _is_trackable_ip(value):
+                    network_addresses.append(value)
         items.append(
             {
                 "id": name,
@@ -2533,6 +2792,7 @@ def _incus_containers(runtime: str) -> List[Dict[str, str]]:
                 "pid": str(state.get("pid") or ""),
                 "security_risks": _incus_security_risks(item),
                 "network_exposure": _incus_network_exposure(item),
+                "network_addresses": sorted(set(network_addresses)),
             }
         )
     return items
@@ -2697,6 +2957,8 @@ def collect_container(
     precomputed_network_exposure: List[Dict[str, str]] | None = None,
     image: str = "",
     precomputed_incus_metrics: Dict[Tuple[str, str], Dict[str, float]] | None = None,
+    precomputed_network_addresses: List[str] | None = None,
+    host_conntrack: Dict[str, object] | None = None,
 ) -> Dict:
     runtime = runtime or get_container_bin()
     runtime_name = runtime_name or _runtime_kind(runtime)
@@ -2796,6 +3058,7 @@ def collect_container(
     inspect = ""
     configuration_risks = list(precomputed_security_risks or [])
     network_exposure = list(precomputed_network_exposure or [])
+    network_addresses = list(precomputed_network_addresses or [])
     if runtime_name == "incus":
         if pid <= 0:
             pid = _incus_instance_pid(runtime, name, project)
@@ -2807,6 +3070,15 @@ def collect_container(
             pid = int(d.get("State", {}).get("Pid", 0) or 0)
             configuration_risks = _oci_security_risks(d)
             network_exposure = _oci_network_exposure(d)
+            network_settings = d.get("NetworkSettings") if isinstance(d.get("NetworkSettings"), dict) else {}
+            networks = network_settings.get("Networks") if isinstance(network_settings.get("Networks"), dict) else {}
+            for network in networks.values():
+                if not isinstance(network, dict):
+                    continue
+                for key in ("IPAddress", "GlobalIPv6Address"):
+                    value = str(network.get(key) or "")
+                    if _is_trackable_ip(value):
+                        network_addresses.append(value)
         except Exception:
             pass
     if pid:
@@ -2862,6 +3134,12 @@ def collect_container(
     suspicious_processes = collect_suspicious_processes(name, runtime, project)
     panel_pairing = collect_panel_pairing_indicators(name, runtime, project, image)
     socket_security = _collect_socket_security(pid)
+    _apply_host_conntrack_security(
+        socket_security,
+        host_conntrack or {},
+        network_addresses,
+        network_exposure,
+    )
     has_remote_connections = any(
         int(socket_security.get(key) or 0) > 0
         for key in (
@@ -2888,6 +3166,12 @@ def collect_container(
             "communication_processes": [],
             "communication_sockets": [],
         }
+    )
+    _enrich_communication_with_original_sources(
+        communication,
+        socket_security.get("inbound_public_flows", [])
+        if isinstance(socket_security.get("inbound_public_flows"), list)
+        else [],
     )
     socket_security.update(
         {
@@ -3427,6 +3711,7 @@ def main() -> None:
             runtime_bin = str(item.get("runtime_bin") or "incus")
             if runtime_bin not in incus_metrics_by_runtime:
                 incus_metrics_by_runtime[runtime_bin] = _get_incus_metrics(runtime_bin)
+        host_conntrack = _collect_host_conntrack_snapshot() if security_enabled else {}
         collected = []
         for c in containers:
             if c.get("runtime") == "docker" and docker_mode == "notice":
@@ -3449,6 +3734,8 @@ def main() -> None:
                     incus_metrics_by_runtime.get(str(c.get("runtime_bin") or "incus"))
                     if c.get("runtime") == "incus"
                     else None,
+                    c.get("network_addresses") if isinstance(c.get("network_addresses"), list) else None,
+                    host_conntrack,
                 )
             container_security = container_report.get("security")
             if security_enabled and isinstance(container_security, dict):

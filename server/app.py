@@ -556,7 +556,9 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "monitor_mode": str(payload.get("monitor_mode") or "full"),
             "cpu_percent": r["cpu_percent"],
             "mem_bytes": r["mem_bytes"],
+            "mem_limit_bytes": int(payload.get("mem_limit_bytes") or 0),
             "mem_percent": float(r["mem_percent"] or 0),
+            "cpu_effective_cpus": float(payload.get("cpu_effective_cpus") or 0),
             "net_rx_bps": r["net_rx_bps"],
             "net_tx_bps": r["net_tx_bps"],
             "conn_count": int(r["conn_count"]),
@@ -797,6 +799,36 @@ def _latest_action_for_alert(
     ).fetchone()
 
 
+def _refresh_remediation_process_pids(
+    conn: sqlite3.Connection, action: sqlite3.Row
+) -> Dict[str, Any]:
+    try:
+        params = json.loads(action["params_json"] or "{}")
+    except (TypeError, ValueError):
+        params = {}
+    if action["action_type"] != "remediate_panel_pairing" or not isinstance(params, dict):
+        return params if isinstance(params, dict) else {}
+    alert = conn.execute(
+        "SELECT * FROM security_alerts WHERE id=?", (action["alert_id"],)
+    ).fetchone()
+    if alert is None:
+        return params
+    evidence = _alert_action_evidence(alert)
+    approved_patterns = {
+        str(item).strip().lower()
+        for item in params.get("process_patterns", [])
+        if isinstance(item, str) and item.strip()
+    }
+    current_patterns = {
+        str(item).strip().lower()
+        for item in evidence.get("process_patterns", [])
+        if isinstance(item, str) and item.strip()
+    }
+    if approved_patterns & current_patterns:
+        params["process_pids"] = evidence.get("process_pids") or []
+    return params
+
+
 @app.post("/api/v1/security/alerts/{alert_id}/actions")
 async def queue_security_action(alert_id: int, request: Request) -> JSONResponse:
     try:
@@ -1008,11 +1040,13 @@ async def poll_security_actions(
     ).fetchall()
     actions = []
     for row in rows:
+        params = _refresh_remediation_process_pids(conn, row)
         conn.execute(
-            "UPDATE security_actions SET status='dispatched', attempts=attempts+1, updated_at=? WHERE id=?",
-            (now, row["id"]),
+            "UPDATE security_actions SET status='dispatched', attempts=attempts+1, updated_at=?, params_json=? WHERE id=?",
+            (now, json.dumps(params, ensure_ascii=False), row["id"]),
         )
         action = _action_item(row)
+        action["params"] = params
         action["status"] = "dispatched"
         action["attempts"] += 1
         actions.append(action)
@@ -1167,7 +1201,7 @@ def stats(minutes: int = 720) -> JSONResponse:
     conn = db()
     rows = conn.execute(
         """
-        SELECT host_id, runtime, project, container_name, ts, cpu_percent, mem_bytes, mem_percent, net_rx_bps, net_tx_bps, conn_count
+        SELECT host_id, runtime, project, container_name, ts, cpu_percent, mem_bytes, mem_percent, net_rx_bps, net_tx_bps, conn_count, payload_json
         FROM reports
         WHERE ts>=?
         ORDER BY host_id, runtime, project, container_name, ts ASC
@@ -1209,6 +1243,10 @@ def stats(minutes: int = 720) -> JSONResponse:
             tx_bytes += float(row["net_tx_bps"] or 0) * step
 
         latest = series[-1]
+        try:
+            latest_payload = json.loads(latest["payload_json"] or "{}")
+        except (TypeError, ValueError):
+            latest_payload = {}
         item = {
             "host_id": host_id,
             "runtime": runtime,
@@ -1220,6 +1258,7 @@ def stats(minutes: int = 720) -> JSONResponse:
                 "timestamp": int(latest["ts"]),
                 "cpu_percent": float(latest["cpu_percent"] or 0),
                 "mem_bytes": int(latest["mem_bytes"] or 0),
+                "mem_limit_bytes": int(latest_payload.get("mem_limit_bytes") or 0),
                 "mem_percent": float(latest["mem_percent"] or 0),
                 "net_rx_bps": float(latest["net_rx_bps"] or 0),
                 "net_tx_bps": float(latest["net_tx_bps"] or 0),
@@ -1461,10 +1500,12 @@ function remediationChanged(action){
 }
 function actionStatusText(action){
   if(!action)return '';
+  if(action.status==='queued')return '等待节点领取（正常情况下约 10 秒内）';
+  if(action.status==='dispatched')return '节点已领取，正在执行清理';
   if(action.action_type==='remediate_panel_pairing'&&action.status==='succeeded'&&!remediationChanged(action)){
     return `未清理到目标：${action.result_message||'节点未找到匹配的进程、服务或配置'}`;
   }
-  const labels={queued:'等待节点',dispatched:'节点处理中',succeeded:'已完成',failed:'失败'};
+  const labels={succeeded:'已完成',failed:'失败'};
   const result=action.result_message?`：${action.result_message}`:'';
   return `${labels[action.status]||action.status}${result}`;
 }
@@ -1542,6 +1583,10 @@ function groupByHost(items){
     m.get(x.host_id).push(x);
   }
   return [...m.entries()];
+}
+function containerDetailUrl(host,runtime,project,container){
+  const q=new URLSearchParams({host,runtime,project:project||'',container});
+  return `/container-detail?${q.toString()}`;
 }
 const expandedHosts=new Set();
 function setHostExpanded(host, group, button, panel, expanded){
@@ -1624,7 +1669,9 @@ async function load(){
         `<section class='info-block'><h4>端口与网络</h4><dl class='kv'><dt>监听端口</dt><dd>${escapeHtml(listeningPorts||'-')}</dd><dt>NAT/代理</dt><dd>${escapeHtml(exposureText)}</dd><dt>来源 Top3</dt><dd>${formatCountryStats(x.tcp_country_stats,x.udp_country_stats)}</dd></dl></section>`+
         `<section class='info-block'><h4>安全检查</h4><dl class='kv'><dt>面板对接</dt><dd class='${panelPairing.detected&&!panelPairing.approved?'bad':''}'>${escapeHtml(pairingText)}</dd><dt>可疑进程</dt><dd class='${suspiciousCount?'bad':''}'>${suspiciousCount}</dd><dt>配置风险</dt><dd class='${riskCount?'bad':''}'>${riskCount}</dd><dt>采样时间</dt><dd>${escapeHtml(x.timestamp_iso_utc8||'-')}</dd></dl></section></div>`+
         `<div class='container-actions'><button type='button' class='btn detail-button'>查看容器详情</button></div>`;
-      card.querySelector('.detail-button').addEventListener('click',()=>openDetail(host,x.runtime,x.project||'',x.container_name));
+      card.querySelector('.detail-button').addEventListener('click',()=>{
+        location.href=containerDetailUrl(host,x.runtime,x.project||'',x.container_name);
+      });
       grid.appendChild(card);
     });
     panel.appendChild(grid);
@@ -1755,22 +1802,88 @@ loadAndOpenRequestedDetail(); loadAlerts(); setInterval(()=>{load();loadAlerts()
 """
 
 
+@app.get("/container-detail", response_class=HTMLResponse)
+def container_detail_page() -> str:
+    return """
+<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Container Detail</title>
+<style>
+*{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}
+body{margin:0;background:#0f1a2e;color:#dbe7ff;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}
+.page{width:min(1500px,100%);margin:auto;padding:18px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:16px}
+h1{margin:0;font-size:24px;overflow-wrap:anywhere}.subtitle{color:#9fb5d5;margin-top:4px;overflow-wrap:anywhere}.actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid #4b6fa8;border-radius:8px;background:#1a2c4e;color:#dbe7ff;text-decoration:none}
+.btn:focus-visible{outline:3px solid #8cc7ff;outline-offset:2px}.status{border:1px solid #29466f;border-radius:10px;background:#14243f;padding:10px 12px;margin-bottom:14px;color:#b8cbea}
+.status.bad{border-color:#a84655;color:#ffadb8}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+.metric,.panel{min-width:0;border:1px solid #29466f;border-radius:12px;background:#13213b;padding:13px}.metric span{display:block;color:#91a9cb;font-size:12px}.metric strong{display:block;margin-top:4px;font-size:20px;overflow-wrap:anywhere}
+.charts,.details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:14px}.panel h2{font-size:16px;margin:0 0 10px}.panel h3{font-size:14px;margin:12px 0 6px;color:#9fc8ff}
+.legend{display:flex;gap:14px;flex-wrap:wrap;color:#9fb5d5;font-size:12px;margin-bottom:7px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+svg{width:100%;height:220px;border-top:1px solid #29466f}.kv{display:grid;grid-template-columns:minmax(115px,auto) minmax(0,1fr);gap:6px 10px;margin:0}.kv dt{color:#91a9cb}.kv dd{margin:0;text-align:right;overflow-wrap:anywhere}
+.list{margin:6px 0 0 18px;padding:0}.ok{color:#72dfa7}.bad-text{color:#ff6b78}.samples{display:grid;gap:7px}.sample{display:grid;grid-template-columns:1.4fr repeat(5,minmax(75px,1fr));gap:8px;padding:8px;border:1px solid #274365;border-radius:8px;background:#101e36;font-size:12px}.sample span{overflow-wrap:anywhere}
+.source{display:inline-flex;border:1px solid #365680;border-radius:999px;padding:3px 9px;background:#10213c;color:#c9dbf5;font-size:12px}
+@media(max-width:900px){.top{flex-direction:column}.charts,.details{grid-template-columns:1fr}.sample{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:520px){.page{padding:10px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metric strong{font-size:17px}.kv{grid-template-columns:1fr}.kv dd{text-align:left}.actions{width:100%}.btn{flex:1}}
+</style></head><body><main class='page'>
+<header class='top'><div><h1 id='title'>容器详情</h1><div id='subtitle' class='subtitle'>正在读取容器内部指标…</div></div><nav class='actions'><a class='btn' href='/stats'>返回统计页</a><a class='btn' href='/'>返回总览</a></nav></header>
+<div id='status' class='status'>正在加载最新采样与历史数据…</div>
+<section id='metrics' class='metrics'></section>
+<section class='charts'><article class='panel'><h2>容器 CPU / 内存历史</h2><div class='legend'><span><i class='dot' style='background:#4a90e2'></i>CPU%</span><span><i class='dot' style='background:#16a085'></i>内存%</span></div><svg id='resource-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article><article class='panel'><h2>容器网络速率历史</h2><div class='legend'><span><i class='dot' style='background:#2ecc71'></i>RX Mbps</span><span><i class='dot' style='background:#f39c12'></i>TX Mbps</span></div><svg id='network-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article></section>
+<section class='details'><article class='panel'><h2>容器内部进程</h2><div id='processes'></div></article><article class='panel'><h2>容器网络命名空间</h2><dl id='network' class='kv'></dl></article><article class='panel'><h2>安全与面板检查</h2><div id='security'></div></article><article class='panel'><h2>容器文件系统</h2><dl id='filesystem' class='kv'></dl></article></section>
+<section class='panel'><h2>最近采样</h2><div id='samples' class='samples'></div></section>
+</main><script>
+function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
+function fmtBytes(n){const x=Number(n||0);if(x<=0)return '0 B';const u=['B','KB','MB','GB','TB'];let i=0,v=x;while(v>=1024&&i<u.length-1){v/=1024;i++}return `${v.toFixed(v>=100?0:1)} ${u[i]}`}
+function mbps(v){return Number(v||0)*8/1000000}function num(v,d=2){const n=Number(v||0);return Number.isFinite(n)?n.toFixed(d):'0.00'}
+function linePoints(values,max,w=900,h=220,pad=18){return values.map((v,i)=>`${i*(w/Math.max(1,values.length-1))},${(h-pad)-(Number(v||0)/Math.max(1,max))*(h-pad*2)}`).join(' ')}
+function drawChart(id,series){const svg=document.getElementById(id);const values=series.flatMap(x=>x.values);const max=Math.max(1,...values);let grid='';for(let i=0;i<=4;i++){const y=18+i*46;grid+=`<line x1='0' y1='${y}' x2='900' y2='${y}' stroke='#29466f' stroke-width='1'/>`}svg.innerHTML=grid+series.map(x=>`<polyline fill='none' stroke='${x.color}' stroke-width='2.5' points='${linePoints(x.values,max)}'/>`).join('')}
+function sourceText(runtime){if(runtime==='incus')return 'Incus 容器级 cgroup/OpenMetrics 与网络命名空间';if(runtime==='podman')return 'Podman 容器 stats 与网络命名空间';return 'Docker 仅提醒模式（不执行深度采集）'}
+function listHtml(items,empty,mapper){return items.length?`<ul class='list'>${items.map(mapper).join('')}</ul>`:`<div class='ok'>${esc(empty)}</div>`}
+async function loadDetail(){
+ const q=new URLSearchParams(location.search),host=q.get('host')||'',runtime=q.get('runtime')||'',project=q.get('project')||'',container=q.get('container')||'';
+ if(!host||!runtime||!container){document.getElementById('status').className='status bad';document.getElementById('status').innerText='详情参数不完整，请从总览或统计页重新进入。';return}
+ document.getElementById('title').innerText=container;document.getElementById('subtitle').innerText=`${host} · ${project?`${runtime}/${project}`:runtime}`;
+ const params=new URLSearchParams({host_id:host,runtime,project,container_name:container,minutes:'1440'});
+ try{
+  const [latestData,historyData]=await Promise.all([fetch('/api/v1/latest?include_stale=true').then(r=>r.json()),fetch(`/api/v1/history?${params}`).then(r=>r.json())]);
+  const current=(latestData.items||[]).find(x=>x.host_id===host&&x.runtime===runtime&&(x.project||'')===project&&x.container_name===container);const pts=historyData.items||[];
+  const status=document.getElementById('status');
+  if(current){status.innerHTML=`<span class='source'>${esc(sourceText(runtime))}</span>　最新采样 ${esc(current.timestamp_iso_utc8||'-')}${current.alerts?.stale?'　<span class="bad-text">当前离线或上报已过期</span>':''}`}
+  else{status.className='status bad';status.innerText='未找到该容器的当前采样，仅显示保留的历史数据。'}
+  const sec=current?.security||{},limit=Number(current?.mem_limit_bytes||0),used=Number(current?.mem_bytes||0),rootTotal=Number(current?.container_fs_root_total_bytes||0),rootAvail=Number(current?.container_fs_root_avail_bytes||0);
+  const cards=[['CPU',`${num(current?.cpu_percent)}%`],['内存',`${num(current?.mem_percent)}%`],['内存 已用/总量',`${fmtBytes(used)} / ${fmtBytes(limit)}`],['RX',`${num(mbps(current?.net_rx_bps))} Mbps`],['TX',`${num(mbps(current?.net_tx_bps))} Mbps`],['连接数',Number(current?.conn_count||0)],['进程数',Number(sec.process_count||0)],['有效 CPU',Number(current?.cpu_effective_cpus||0)||'未限制']];
+  document.getElementById('metrics').innerHTML=cards.map(x=>`<article class='metric'><span>${esc(x[0])}</span><strong>${esc(x[1])}</strong></article>`).join('');
+  const recent=pts.slice(-80);drawChart('resource-chart',[{values:recent.map(x=>Number(x.cpu_percent||0)),color:'#4a90e2'},{values:recent.map(x=>Number(x.mem_percent||0)),color:'#16a085'}]);drawChart('network-chart',[{values:recent.map(x=>mbps(x.net_rx_bps)),color:'#2ecc71'},{values:recent.map(x=>mbps(x.net_tx_bps)),color:'#f39c12'}]);
+  const suspicious=Array.isArray(sec.suspicious_processes)?sec.suspicious_processes:[];const top=current?.top_cpu_process_command?`PID ${Number(current.top_cpu_process_pid||0)} · CPU ${num(current.top_cpu_process_cpu_percent)}% · ${esc(current.top_cpu_process_command)}`:'未采集到高 CPU 进程';document.getElementById('processes').innerHTML=`<div>${top}</div>`+listHtml(suspicious,'未发现可疑进程',x=>`<li>PID ${Number(x.pid||0)} · ${esc(x.command||x.pattern||'')}</li>`);
+  const countries=(arr)=>(Array.isArray(arr)&&arr.length?arr.slice(0,5).map(x=>`${x.country||'UN'} (${Number(x.connections||0)})`).join('、'):'-');const exposure=Array.isArray(sec.network_exposure)?sec.network_exposure:[];document.getElementById('network').innerHTML=`<dt>监听端口</dt><dd>${esc((sec.listening_ports||[]).join(', ')||'-')}</dd><dt>NAT/代理</dt><dd>${esc(exposure.map(x=>`${x.listen||'?'} → ${x.target||'?'}`).join(', ')||'-')}</dd><dt>TCP 来源</dt><dd>${esc(countries(current?.tcp_country_stats))}</dd><dt>UDP 来源</dt><dd>${esc(countries(current?.udp_country_stats))}</dd><dt>RX pps</dt><dd>${num(sec.net_rx_pps,1)}</dd><dt>SYN_RECV</dt><dd>${Number(sec.syn_recv_count||0)}</dd>`;
+  const risks=Array.isArray(sec.configuration_risks)?sec.configuration_risks:[],pair=sec.panel_pairing||{};document.getElementById('security').innerHTML=`<div>面板对接：<strong class='${pair.detected&&!pair.approved?'bad-text':'ok'}'>${pair.detected?(pair.approved?'已放行':'检测到特征'):'未发现'}</strong></div>`+listHtml(risks,'未发现配置风险',x=>`<li>${esc(x.message||x.code||'配置风险')}</li>`);
+  document.getElementById('filesystem').innerHTML=`<dt>根盘 已用/总量</dt><dd>${fmtBytes(Math.max(0,rootTotal-rootAvail))} / ${fmtBytes(rootTotal)}</dd><dt>根盘可用</dt><dd>${fmtBytes(rootAvail)}</dd><dt>镜像可写层</dt><dd>${fmtBytes(current?.container_disk_rw_bytes)}</dd>`;
+  document.getElementById('samples').innerHTML=pts.length?pts.slice(-20).reverse().map(x=>`<div class='sample'><span>${esc(x.timestamp_iso_utc8||'-')}</span><span>CPU ${num(x.cpu_percent)}%</span><span>内存 ${num(x.mem_percent)}%</span><span>RX ${num(mbps(x.net_rx_bps))}M</span><span>TX ${num(mbps(x.net_tx_bps))}M</span><span>连接 ${Number(x.conn_count||0)}</span></div>`).join(''):`<div class='ok'>暂无历史采样</div>`;
+ }catch(error){const status=document.getElementById('status');status.className='status bad';status.innerText=`详情加载失败：${error.message||error}`}
+}
+loadDetail();setInterval(loadDetail,15000);
+</script></body></html>
+"""
+
+
 @app.get("/stats", response_class=HTMLResponse)
 def stats_page() -> str:
     return """
 <!doctype html>
-<html><head><meta charset='utf-8'><title>Container Stats</title>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Container Stats</title>
 <style>
+*{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}
 body{font-family:sans-serif;margin:1rem;background:#0f1a2e;color:#dbe7ff}
 .topbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}
 .card-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-bottom:12px}
 .card{background:#13213b;border:1px solid #233b61;border-radius:10px;padding:10px}
 .value{font-size:22px;font-weight:700;margin-top:6px}
-table{border-collapse:collapse;width:100%;background:#13213b;color:#dbe7ff;margin-top:10px}
-th,td{border:1px solid #233b61;padding:8px;text-align:center}
+table{border-collapse:collapse;width:100%;max-width:100%;table-layout:fixed;background:#13213b;color:#dbe7ff;margin-top:10px}
+th,td{border:1px solid #233b61;padding:8px;text-align:center;overflow-wrap:anywhere;word-break:break-word}
 th{background:#1a2c4e}
 a{color:#8cc7ff}
 .detail-link{display:inline-block;border:1px solid #4b6fa8;border-radius:6px;padding:4px 8px;text-decoration:none;background:#1a2c4e}
+@media(max-width:680px){body{margin:8px}.card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}th,td{padding:5px;font-size:11px}#all-containers th:nth-child(6),#all-containers td:nth-child(6),#all-containers th:nth-child(7),#all-containers td:nth-child(7),#all-containers th:nth-child(9),#all-containers td:nth-child(9){display:none}}
 </style>
 </head><body>
 <h2>数据统计页</h2>
@@ -1812,8 +1925,8 @@ function escapeHtml(value){
   return String(value??'').replace(/[&<>'"]/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
 }
 function detailHref(x){
-  const q=new URLSearchParams({detail:'1',host:x.host_id,runtime:x.runtime,project:x.project||'',container:x.container_name});
-  return `/?${q.toString()}`;
+  const q=new URLSearchParams({host:x.host_id,runtime:x.runtime,project:x.project||'',container:x.container_name});
+  return `/container-detail?${q.toString()}`;
 }
 function detailCell(x){
   return `<a class='detail-link' href='${escapeHtml(detailHref(x))}'>容器详情</a>`;
@@ -1859,7 +1972,7 @@ async function loadStats(){
   `);
   renderRows('all-containers', data.containers||[], x=>`
     <td>${escapeHtml(x.host_id)}</td><td>${escapeHtml(x.project?`${x.runtime}/${x.project}`:x.runtime)}</td><td>${escapeHtml(x.container_name)}</td>
-    <td>${Number(x.latest?.cpu_percent||0).toFixed(2)}</td><td>${Number(x.latest?.mem_percent||0).toFixed(2)}</td>
+    <td>${Number(x.latest?.cpu_percent||0).toFixed(2)}</td><td>${Number(x.latest?.mem_percent||0).toFixed(2)}<br/><small>${fmtBytes(x.latest?.mem_bytes)} / ${fmtBytes(x.latest?.mem_limit_bytes)}</small></td>
     <td>${fmtBytes(x.latest?.net_rx_bps)}/s</td><td>${fmtBytes(x.latest?.net_tx_bps)}/s</td>
     <td>${Number(x.latest?.conn_count||0)}</td><td>${Number(x.samples||0)}</td><td>${detailCell(x)}</td>
   `);

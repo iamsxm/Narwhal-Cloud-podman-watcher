@@ -233,6 +233,7 @@ def _pick_first(item: Dict[str, object], keys: List[str]) -> object:
 def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
     cpu_percent = 0.0
     mem_bytes = 0
+    mem_limit_bytes = 0
     mem_percent = 0.0
     net_rx_total_bytes = 0
     net_tx_total_bytes = 0
@@ -241,6 +242,7 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
         return {
             "cpu_percent": cpu_percent,
             "mem_bytes": mem_bytes,
+            "mem_limit_bytes": mem_limit_bytes,
             "mem_percent": mem_percent,
             "net_rx_total_bytes": net_rx_total_bytes,
             "net_tx_total_bytes": net_tx_total_bytes,
@@ -275,7 +277,10 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
         if mem_usage is None:
             mem_usage = _pick_first(item, ["MemUsage", "Mem Usage"])
         if mem_usage is not None:
-            mem_bytes = parse_size(str(mem_usage).split("/")[0].strip())
+            mem_usage_parts = str(mem_usage).split("/")
+            mem_bytes = parse_size(mem_usage_parts[0].strip())
+            if len(mem_usage_parts) == 2:
+                mem_limit_bytes = parse_size(mem_usage_parts[1].strip())
         else:
             mem_bytes = int(
                 _normalize_stat_number(
@@ -291,8 +296,12 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
             mem_limit = _normalize_stat_number(
                 _find_value_ci(item, ["MemLimit", "MemLimitBytes", "mem_limit", "memory_limit"])
             )
+            if mem_limit > 0:
+                mem_limit_bytes = int(mem_limit)
             if mem_limit > 0 and mem_bytes > 0:
                 mem_percent = (float(mem_bytes) / mem_limit) * 100.0
+        if mem_percent <= 0 and mem_limit_bytes > 0 and mem_bytes > 0:
+            mem_percent = (float(mem_bytes) / float(mem_limit_bytes)) * 100.0
 
         net_io = _find_value_ci(item, ["NetIO", "Net I/O", "net_io"])
         if net_io is None:
@@ -334,6 +343,7 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
     return {
         "cpu_percent": cpu_percent,
         "mem_bytes": mem_bytes,
+        "mem_limit_bytes": mem_limit_bytes,
         "mem_percent": mem_percent,
         "net_rx_total_bytes": net_rx_total_bytes,
         "net_tx_total_bytes": net_tx_total_bytes,
@@ -343,6 +353,7 @@ def _parse_stats_json(stats_text: str) -> Dict[str, float | int]:
 def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
     cpu_percent = 0.0
     mem_bytes = 0
+    mem_limit_bytes = 0
     mem_percent = 0.0
     net_rx_total_bytes = 0
     net_tx_total_bytes = 0
@@ -354,6 +365,7 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
         mem_usage_parts = parts[1].split("/")
         if len(mem_usage_parts) == 2:
             mem_total = parse_size(mem_usage_parts[1].strip())
+            mem_limit_bytes = mem_total
             if mem_total > 0 and mem_bytes > 0:
                 mem_percent = (float(mem_bytes) / mem_total) * 100.0
         net = parts[2].split("/")
@@ -368,6 +380,7 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
     return {
         "cpu_percent": cpu_percent,
         "mem_bytes": mem_bytes,
+        "mem_limit_bytes": mem_limit_bytes,
         "mem_percent": mem_percent,
         "net_rx_total_bytes": net_rx_total_bytes,
         "net_tx_total_bytes": net_tx_total_bytes,
@@ -377,7 +390,7 @@ def _parse_stats_template(stats_text: str) -> Dict[str, float | int]:
 def _parse_stats_compact(stats_text: str) -> Dict[str, float | int]:
     parts = (stats_text or "").strip().split("|")
     if len(parts) < 3:
-        return {"cpu_percent": 0.0, "mem_bytes": 0, "mem_percent": 0.0, "net_rx_total_bytes": 0, "net_tx_total_bytes": 0}
+        return {"cpu_percent": 0.0, "mem_bytes": 0, "mem_limit_bytes": 0, "mem_percent": 0.0, "net_rx_total_bytes": 0, "net_tx_total_bytes": 0}
     net_rx_total_bytes = 0
     net_tx_total_bytes = 0
     net = parts[2].split("/")
@@ -390,6 +403,7 @@ def _parse_stats_compact(stats_text: str) -> Dict[str, float | int]:
     return {
         "cpu_percent": _normalize_stat_number(parts[0]),
         "mem_bytes": parse_size(parts[1]),
+        "mem_limit_bytes": 0,
         "mem_percent": 0.0,
         "net_rx_total_bytes": net_rx_total_bytes,
         "net_tx_total_bytes": net_tx_total_bytes,
@@ -512,6 +526,7 @@ def _parse_incus_metrics(text: str) -> Dict[Tuple[str, str], Dict[str, float]]:
         "incus_cpu_seconds_total",
         "incus_cpu_effective_total",
         "incus_memory_MemTotal_bytes",
+        "incus_memory_MemAvailable_bytes",
         "incus_network_receive_bytes_total",
         "incus_network_transmit_bytes_total",
         "incus_network_receive_packets_total",
@@ -544,6 +559,8 @@ def _parse_incus_metrics(text: str) -> Dict[Tuple[str, str], Dict[str, float]]:
                 "cpu_seconds": 0.0,
                 "effective_cpus": 0.0,
                 "mem_bytes": 0.0,
+                "mem_total_bytes": 0.0,
+                "mem_available_bytes": -1.0,
                 "net_rx_total_bytes": 0.0,
                 "net_tx_total_bytes": 0.0,
                 "net_rx_total_packets": 0.0,
@@ -558,7 +575,9 @@ def _parse_incus_metrics(text: str) -> Dict[Tuple[str, str], Dict[str, float]]:
         elif metric == "incus_cpu_effective_total":
             item["effective_cpus"] = value
         elif metric == "incus_memory_MemTotal_bytes":
-            item["mem_bytes"] = value
+            item["mem_total_bytes"] = value
+        elif metric == "incus_memory_MemAvailable_bytes":
+            item["mem_available_bytes"] = value
         elif metric == "incus_network_receive_bytes_total":
             if labels.get("device") != "lo":
                 item["net_rx_total_bytes"] += value
@@ -575,6 +594,11 @@ def _parse_incus_metrics(text: str) -> Dict[Tuple[str, str], Dict[str, float]]:
             item["fs_total_bytes"] = max(item["fs_total_bytes"], value)
         elif metric == "incus_filesystem_avail_bytes":
             item["fs_avail_bytes"] = max(item["fs_avail_bytes"], value)
+    for item in result.values():
+        total = float(item.get("mem_total_bytes", 0.0) or 0.0)
+        available = float(item.get("mem_available_bytes", -1.0))
+        if total > 0 and available >= 0:
+            item["mem_bytes"] = max(0.0, min(total, total - available))
     return result
 
 
@@ -2446,30 +2470,25 @@ def _incus_instance_pid(runtime: str, name: str, project: str = "") -> int:
         return 0
 
 
-def _incus_stats(runtime: str, name: str, project: str) -> Dict[str, float | int]:
-    metrics = _get_incus_metrics(runtime).get((project or "default", name), {})
+def _incus_stats(
+    runtime: str,
+    name: str,
+    project: str,
+    metrics_snapshot: Dict[Tuple[str, str], Dict[str, float]] | None = None,
+) -> Dict[str, float | int]:
+    all_metrics = metrics_snapshot if metrics_snapshot is not None else _get_incus_metrics(runtime)
+    metrics = all_metrics.get((project or "default", name), {})
     cpu_seconds = float(metrics.get("cpu_seconds", 0.0) or 0.0)
     container_key = f"incus:{project or 'default'}:{name}"
     cpu_percent = _derive_cpu_percent(container_key, cpu_seconds)
     mem_bytes = int(metrics.get("mem_bytes", 0.0) or 0)
-    mem_percent = 0.0
-    mem_limit_out = run(
-        _runtime_exec_cmd(
-            runtime,
-            name,
-            "awk '/^MemTotal:/{print $2 * 1024; exit}' /proc/meminfo 2>/dev/null",
-            project,
-        )
-    ).strip()
-    try:
-        mem_limit = int(float(mem_limit_out))
-    except ValueError:
-        mem_limit = 0
-    if mem_limit > 0 and mem_bytes > 0:
-        mem_percent = (float(mem_bytes) / float(mem_limit)) * 100.0
+    mem_limit = int(metrics.get("mem_total_bytes", 0.0) or 0)
+    mem_percent = (float(mem_bytes) / float(mem_limit)) * 100.0 if mem_limit > 0 else 0.0
     return {
         "cpu_percent": cpu_percent,
+        "cpu_effective_cpus": float(metrics.get("effective_cpus", 0.0) or 0.0),
         "mem_bytes": mem_bytes,
+        "mem_limit_bytes": mem_limit,
         "mem_percent": mem_percent,
         "net_rx_total_bytes": int(metrics.get("net_rx_total_bytes", 0.0) or 0),
         "net_tx_total_bytes": int(metrics.get("net_tx_total_bytes", 0.0) or 0),
@@ -2488,6 +2507,7 @@ def collect_container(
     precomputed_security_risks: List[Dict[str, str]] | None = None,
     precomputed_network_exposure: List[Dict[str, str]] | None = None,
     image: str = "",
+    precomputed_incus_metrics: Dict[Tuple[str, str], Dict[str, float]] | None = None,
 ) -> Dict:
     runtime = runtime or get_container_bin()
     runtime_name = runtime_name or _runtime_kind(runtime)
@@ -2497,6 +2517,7 @@ def collect_container(
             "name": name,
             "cpu_percent": 0.0,
             "mem_bytes": 0,
+            "mem_limit_bytes": 0,
             "mem_percent": 0.0,
             "net_rx_bps": 0.0,
             "net_tx_bps": 0.0,
@@ -2509,6 +2530,7 @@ def collect_container(
 
     cpu_percent = 0.0
     mem = 0
+    mem_limit = 0
     mem_percent = 0.0
     rx_total = 0
     tx_total = 0
@@ -2521,7 +2543,7 @@ def collect_container(
     stats_tpl = ""
     stats_compact = ""
     if runtime_name == "incus":
-        parsed_stats = _incus_stats(runtime, name, project)
+        parsed_stats = _incus_stats(runtime, name, project, precomputed_incus_metrics)
         parsed_tpl = _parse_stats_template("")
         parsed_compact = _parse_stats_compact("")
     else:
@@ -2544,6 +2566,11 @@ def collect_container(
 
     cpu_candidates = [parsed_stats["cpu_percent"], parsed_tpl["cpu_percent"], parsed_compact["cpu_percent"]]
     mem_candidates = [parsed_stats["mem_bytes"], parsed_tpl["mem_bytes"], parsed_compact["mem_bytes"]]
+    mem_limit_candidates = [
+        parsed_stats.get("mem_limit_bytes", 0),
+        parsed_tpl.get("mem_limit_bytes", 0),
+        parsed_compact.get("mem_limit_bytes", 0),
+    ]
     mem_percent_candidates = [parsed_stats["mem_percent"], parsed_tpl["mem_percent"], parsed_compact["mem_percent"]]
     net_candidates = [
         (parsed_stats["net_rx_total_bytes"], parsed_stats["net_tx_total_bytes"]),
@@ -2558,6 +2585,10 @@ def collect_container(
     for m in mem_candidates:
         if int(m) > 0:
             mem = int(m)
+            break
+    for limit in mem_limit_candidates:
+        if int(limit) > 0:
+            mem_limit = int(limit)
             break
     for mp in mem_percent_candidates:
         if float(mp) > 0:
@@ -2633,6 +2664,8 @@ def collect_container(
             mem = pid_mem_bytes
         if mem_percent <= 0 and pid_mem_percent > 0:
             mem_percent = pid_mem_percent
+    if mem_limit <= 0 and mem > 0 and mem_percent > 0:
+        mem_limit = int((float(mem) * 100.0) / float(mem_percent))
 
     disk = collect_disk_alert()
     container_disk = collect_container_disk_usage(name, runtime, project)
@@ -2663,7 +2696,9 @@ def collect_container(
         "runtime": runtime_name,
         "project": project,
         "cpu_percent": cpu_percent,
+        "cpu_effective_cpus": float(parsed_stats.get("cpu_effective_cpus", 0.0) or 0.0),
         "mem_bytes": mem,
+        "mem_limit_bytes": mem_limit,
         "mem_percent": mem_percent,
         "net_rx_bps": net_rx,
         "net_tx_bps": net_tx,
@@ -3082,6 +3117,13 @@ def main() -> None:
             "no",
             "off",
         )
+        incus_metrics_by_runtime: Dict[str, Dict[Tuple[str, str], Dict[str, float]]] = {}
+        for item in containers:
+            if item.get("runtime") != "incus":
+                continue
+            runtime_bin = str(item.get("runtime_bin") or "incus")
+            if runtime_bin not in incus_metrics_by_runtime:
+                incus_metrics_by_runtime[runtime_bin] = _get_incus_metrics(runtime_bin)
         collected = []
         for c in containers:
             if c.get("runtime") == "docker" and docker_mode == "notice":
@@ -3101,6 +3143,9 @@ def main() -> None:
                     c.get("security_risks") if isinstance(c.get("security_risks"), list) else None,
                     c.get("network_exposure") if isinstance(c.get("network_exposure"), list) else None,
                     c.get("image", ""),
+                    incus_metrics_by_runtime.get(str(c.get("runtime_bin") or "incus"))
+                    if c.get("runtime") == "incus"
+                    else None,
                 )
             container_security = container_report.get("security")
             if security_enabled and isinstance(container_security, dict):

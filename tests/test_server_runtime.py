@@ -30,7 +30,13 @@ class ServerRuntimeTests(unittest.TestCase):
 
     def _insert(self, runtime: str, cpu: float, project: str = ""):
         now = int(time.time())
-        payload = {"id": f"{runtime}-id", "name": "same-name", "runtime": runtime}
+        payload = {
+            "id": f"{runtime}-id",
+            "name": "same-name",
+            "runtime": runtime,
+            "mem_limit_bytes": 4,
+            "cpu_effective_cpus": 2,
+        }
         conn = sqlite3.connect(server.DB_PATH)
         conn.execute(
             """
@@ -182,7 +188,18 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("panel.hidden=!expanded", html)
         self.assertIn("overflow-x:hidden", html)
         self.assertIn("aria-labelledby", html)
+        self.assertIn("/container-detail?", html)
         self.assertNotIn("<table id='t'", html)
+
+    def test_container_detail_is_a_dedicated_internal_metrics_page(self):
+        html = server.container_detail_page()
+        self.assertIn("容器内部进程", html)
+        self.assertIn("容器网络命名空间", html)
+        self.assertIn("Incus 容器级 cgroup/OpenMetrics", html)
+        self.assertIn("/api/v1/latest?include_stale=true", html)
+        self.assertIn("/api/v1/history?", html)
+        self.assertIn("overflow-x:hidden", html)
+        self.assertIn("/container-detail?", server.stats_page())
 
     def test_panel_action_queue_and_agent_poll_are_signed(self):
         now = int(time.time())
@@ -221,6 +238,12 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertEqual(queued_body["action"]["params"]["domains"], ["panel.example.net"])
         self.assertEqual(queued_body["action"]["params"]["process_pids"], [222])
 
+        refreshed_alert = dict(alert, process_pids=[333])
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", now + 1, [refreshed_alert])
+        conn.commit()
+        conn.close()
+
         poll_body = json.dumps({"host_id": "host1"}, separators=(",", ":")).encode()
 
         class PollRequest:
@@ -234,6 +257,7 @@ class ServerRuntimeTests(unittest.TestCase):
         response = asyncio.run(server.poll_security_actions(PollRequest(), timestamp, signature))
         response_body = json.loads(response.body)
         self.assertEqual(len(response_body["actions"]), 1)
+        self.assertEqual(response_body["actions"][0]["params"]["process_pids"], [333])
         expected = hmac.new(
             server.SHARED_SECRET.encode(), response.body + timestamp.encode(), hashlib.sha256
         ).hexdigest()
@@ -516,6 +540,12 @@ class ServerRuntimeTests(unittest.TestCase):
         body = json.loads(response.body)
         self.assertEqual(len(body["items"]), 2)
         self.assertEqual({x["project"] for x in body["items"]}, {"default", "prod"})
+
+    def test_latest_exposes_container_memory_limit_and_effective_cpus(self):
+        self._insert("incus", 20, "default")
+        item = json.loads(server.latest().body)["items"][0]
+        self.assertEqual(item["mem_limit_bytes"], 4)
+        self.assertEqual(item["cpu_effective_cpus"], 2)
 
     def test_schema_has_runtime_column(self):
         conn = sqlite3.connect(server.DB_PATH)

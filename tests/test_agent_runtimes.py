@@ -159,7 +159,9 @@ class IncusMetricsTests(unittest.TestCase):
 incus_cpu_seconds_total{cpu="0",mode="user",name="c1",project="default",type="container"} 12.5
 incus_cpu_seconds_total{cpu="0",mode="system",name="c1",project="default",type="container"} 2.5
 incus_cpu_seconds_total{cpu="0",mode="idle",name="c1",project="default",type="container"} 100
+incus_cpu_effective_total{name="c1",project="default",type="container"} 2
 incus_memory_MemTotal_bytes{name="c1",project="default",type="container"} 1048576
+incus_memory_MemAvailable_bytes{name="c1",project="default",type="container"} 262144
 incus_network_receive_bytes_total{device="eth0",name="c1",project="default",type="container"} 1000
 incus_network_receive_bytes_total{device="lo",name="c1",project="default",type="container"} 999
 incus_network_transmit_bytes_total{device="eth0",name="c1",project="default",type="container"} 2000
@@ -173,11 +175,35 @@ incus_cpu_seconds_total{cpu="0",mode="user",name="vm1",project="default",type="v
         self.assertEqual(set(parsed), {("default", "c1")})
         item = parsed[("default", "c1")]
         self.assertEqual(item["cpu_seconds"], 15.0)
-        self.assertEqual(item["mem_bytes"], 1048576)
+        self.assertEqual(item["effective_cpus"], 2)
+        self.assertEqual(item["mem_total_bytes"], 1048576)
+        self.assertEqual(item["mem_available_bytes"], 262144)
+        self.assertEqual(item["mem_bytes"], 786432)
         self.assertEqual(item["net_rx_total_bytes"], 1000)
         self.assertEqual(item["net_tx_total_bytes"], 2000)
         self.assertEqual(item["net_rx_total_packets"], 10)
         self.assertEqual(item["net_tx_total_packets"], 20)
+
+    def test_incus_stats_uses_total_minus_available_without_container_exec(self):
+        snapshot = agent._parse_incus_metrics(self.SAMPLE)
+        with mock.patch.object(agent, "_derive_cpu_percent", return_value=12.5), mock.patch.object(
+            agent, "run"
+        ) as run_mock:
+            result = agent._incus_stats("incus", "c1", "default", snapshot)
+        self.assertEqual(result["cpu_percent"], 12.5)
+        self.assertEqual(result["cpu_effective_cpus"], 2)
+        self.assertEqual(result["mem_bytes"], 786432)
+        self.assertEqual(result["mem_limit_bytes"], 1048576)
+        self.assertEqual(result["mem_percent"], 75.0)
+        run_mock.assert_not_called()
+
+    def test_oci_stats_keeps_memory_limit_and_calculates_percent(self):
+        parsed = agent._parse_stats_json(
+            json.dumps([{"CPUPerc": "1.25%", "MemUsage": "20MiB / 100MiB", "NetIO": "1MB / 2MB"}])
+        )
+        self.assertEqual(parsed["mem_bytes"], 20 * 1024 * 1024)
+        self.assertEqual(parsed["mem_limit_bytes"], 100 * 1024 * 1024)
+        self.assertEqual(parsed["mem_percent"], 20.0)
 
     def test_incus_exec_uses_argument_separator_and_project(self):
         self.assertEqual(

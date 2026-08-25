@@ -273,7 +273,8 @@ WantedBy=multi-user.target
 EOF_SERVICE
 
 systemctl daemon-reload
-systemctl enable --now narwhal-monitor-client.service
+systemctl enable narwhal-monitor-client.service >/dev/null
+systemctl restart narwhal-monitor-client.service
 
 cat <<EOF_SUM
 

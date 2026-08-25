@@ -206,6 +206,7 @@ class ServerRuntimeTests(unittest.TestCase):
         queued_body = json.loads(queued.body)
         self.assertTrue(queued_body["queued"])
         self.assertEqual(queued_body["action"]["action_type"], "remediate_panel_pairing")
+        self.assertEqual(queued_body["action"]["params"]["domains"], ["panel.example.net"])
 
         poll_body = json.dumps({"host_id": "host1"}, separators=(",", ":")).encode()
 

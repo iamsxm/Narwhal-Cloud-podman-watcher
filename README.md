@@ -115,6 +115,19 @@ sudo env SKIP_CLEANUP_ON_UPDATE=1 bash scripts/install.sh
 
 更新完成后，用首次部署后的检查命令确认 Server 与 Client 正常运行。若 `git pull --ff-only` 报错，请先处理仓库中的本地修改或分支分叉，不要使用会覆盖配置或代码的强制重置命令。
 
+人工执行 Server 的 `install` 或 `update` 时，安装摘要会直接显示当前 `Dashboard Username` 和 `Dashboard Password`。systemd 后台自动更新会隐藏这些凭据，避免密码进入自动更新日志。
+
+### 重置 Server 面板密码
+
+在一键安装器中选择独立操作 `reset-server-password`，或直接执行：
+
+```bash
+cd /opt/Narwhal-Cloud-podman-watcher
+sudo bash scripts/install-server.sh reset-password
+```
+
+该操作保留现有 Dashboard 用户名，生成新的随机密码，并按现有配置重建 Server 容器使密码立即生效。共享密钥、TLS、数据库、告警历史和 Client 配置均不会重置。完成后终端会显示当前用户名和新密码。
+
 ### 自动更新
 
 首次安装或手动更新后，安装器会为对应端启用 systemd timer：
@@ -204,6 +217,7 @@ sudo bash scripts/install-client.sh update
 | Client Agent 与虚拟环境 | `/opt/narwhal-monitor/client-agent` |
 | Client systemd 单元 | `/etc/systemd/system/narwhal-monitor-client.service` |
 | 节点动态面板域名白名单 | `/opt/narwhal-monitor/panel-allowlist.json` |
+| 已确认域名自动清理策略 | `/opt/narwhal-monitor/panel-auto-remediate.json` |
 | 自动更新配置/版本/日志 | `/opt/narwhal-monitor/{server,client}-auto-update.{env,version,log}` |
 | 自动更新 systemd timer | `/etc/systemd/system/narwhal-monitor-{server,client}-update.timer` |
 | Caddy 配置与证书数据 | `/opt/narwhal-monitor/caddy` |
@@ -292,6 +306,7 @@ SECURITY_SUSPICIOUS_PROCESS_PATTERNS=xmrig,kinsing,kdevtmpfsi,watchbog,cryptonig
 SECURITY_PANEL_PAIRING_DETECTION_ENABLED=true
 SECURITY_ALLOWED_PANEL_DOMAINS=
 SECURITY_PANEL_ALLOWLIST_FILE=/opt/narwhal-monitor/panel-allowlist.json
+SECURITY_PANEL_AUTO_REMEDIATE_FILE=/opt/narwhal-monitor/panel-auto-remediate.json
 SECURITY_PANEL_PROCESS_PATTERNS=xboard-node,xrayr,v2bx,soga,sspanel-uim-node
 SECURITY_PANEL_CONFIG_PATHS=/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml
 ACTION_POLL_INTERVAL=10
@@ -307,12 +322,12 @@ Agent 会同时读取宿主机 `SECURITY_ACCESS_LOG_PATHS`，并通过对应的 
 
 活动的 `unauthorized_panel_pairing` 告警在总览页提供两个按钮：
 
-- **快速清理**：Server 把经过 HMAC 签名的定向动作发送给对应节点。Agent 不停止或删除容器，只在目标 Podman/Incus 容器内部终止本次检测命中的机场节点进程，停用并删除同名 systemd/OpenRC 服务定义，并删除本次检测到且同时属于 `SECURITY_PANEL_CONFIG_PATHS` 的配置文件。Agent 会再次校验容器、运行时、进程特征和配置路径，不接受任意 Shell 或任意文件路径。
+- **快速清理**：Server 把经过 HMAC 签名的定向动作发送给对应节点。Agent 不停止或删除容器，只在目标 Podman/Incus 容器内部终止本次检测命中的机场节点进程，停用并删除同名 systemd/OpenRC 服务定义，并删除本次检测到且同时属于 `SECURITY_PANEL_CONFIG_PATHS` 的配置文件。Agent 会再次校验容器、运行时、进程特征和配置路径，不接受任意 Shell 或任意文件路径。首次人工清理成功后，本次命中的具体面板域名会写入节点侧 `SECURITY_PANEL_AUTO_REMEDIATE_FILE`；同一域名以后再次出现时会自动执行清理且不再向 Server 提醒。如果同批检测还出现从未确认过的新域名，新域名仍会正常告警。
 - **放行**：把告警中提取到的域名写入该节点的 `SECURITY_PANEL_ALLOWLIST_FILE`；下一次安全采样后告警自动恢复。该文件以 `0600` 权限原子写入，更新 Client 时保留。
 
 按钮提交、节点领取和执行结果记录在 Server 的 `security_actions` 审计表中，页面会显示“等待节点 / 节点处理中 / 已完成 / 失败”及结果。动作响应由共享密钥签名校验，即使使用 internal CA，也不会接受被篡改的动作。Docker 告警没有处置按钮，仍只提醒。
 
-> “快速清理”会删除容器内对应配置与服务定义，属于不可逆操作，页面提交前会列出目标并要求二次确认。它不会删除程序二进制，也不会停止 Incus/Podman 容器。
+> “快速清理”会删除容器内对应配置与服务定义，属于不可逆操作，页面提交前会列出目标及后续自动清理规则并要求二次确认。它不会删除程序二进制，也不会停止 Incus/Podman 容器。需要取消某个域名的自动清理时，请从节点的 `/opt/narwhal-monitor/panel-auto-remediate.json` 中删除该域名并保持 JSON 格式有效。
 
 机场面板/节点识别**不假设 80、443 或任何固定端口**。Agent 会枚举容器网络命名空间中的全部 TCP 监听端口，并展示 Podman publish 以及 Incus proxy device 中可见的外部端口到内部端口映射；公网 NAT 端口与容器端口可以完全不同。由宿主机自定义 nftables/iptables、上游路由器或云厂商实现且没有运行时元数据的 DNAT 无法可靠归属到具体容器，此时仍通过进程、配置文件、环境变量和面板域名判断是否存在机场对接。
 Agent 启动时会把现有日志位置记为基线，只统计之后追加的新请求，避免把历史日志误判为当前攻击。

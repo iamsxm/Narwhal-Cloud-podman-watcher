@@ -91,7 +91,7 @@ if [[ "$SIDE" == "server" ]]; then
       exit 1
     fi
   fi
-  bash "$REPO_DIR/scripts/install-server.sh" update
+  NARWHAL_AUTO_UPDATE=1 bash "$REPO_DIR/scripts/install-server.sh" update
 else
   bash "$REPO_DIR/scripts/install-client.sh" update
 fi

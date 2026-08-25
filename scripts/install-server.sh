@@ -12,13 +12,17 @@ TLS_CONTAINER_NAME="narwhal-monitor-caddy"
 
 MODE="${1:-install}"
 RESET_DATA_ARG="${2:-}"
-if [[ "$MODE" != "install" && "$MODE" != "update" ]]; then
-  echo "[ERROR] 用法: bash scripts/install-server.sh [install|update] [--reset-data]"
+if [[ "$MODE" != "install" && "$MODE" != "update" && "$MODE" != "reset-password" ]]; then
+  echo "[ERROR] 用法: bash scripts/install-server.sh [install|update|reset-password] [--reset-data]"
   exit 1
 fi
 if [[ -n "$RESET_DATA_ARG" && "$RESET_DATA_ARG" != "--reset-data" ]]; then
   echo "[ERROR] 未知参数: $RESET_DATA_ARG"
-  echo "[ERROR] 用法: bash scripts/install-server.sh [install|update] [--reset-data]"
+  echo "[ERROR] 用法: bash scripts/install-server.sh [install|update|reset-password] [--reset-data]"
+  exit 1
+fi
+if [[ "$MODE" == "reset-password" && -n "$RESET_DATA_ARG" ]]; then
+  echo "[ERROR] reset-password 不接受 --reset-data"
   exit 1
 fi
 
@@ -270,6 +274,45 @@ CADDY
   fi
 }
 
+replace_kv_in_file() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local temp_file
+  temp_file="$(mktemp "${file}.tmp.XXXXXX")"
+  awk -v k="$key" -v v="$value" '
+    BEGIN { replaced = 0 }
+    {
+      pos = index($0, "=")
+      current_key = pos > 0 ? substr($0, 1, pos - 1) : ""
+      if (current_key == k) {
+        if (!replaced) print k "=" v
+        replaced = 1
+      } else {
+        print
+      }
+    }
+    END { if (!replaced) print k "=" v }
+  ' "$file" >"$temp_file"
+  chmod 0600 "$temp_file"
+  mv -f "$temp_file" "$file"
+}
+
+reset_server_password() {
+  if [[ ! -f "$SERVER_ENV_FILE" ]]; then
+    echo "[ERROR] Server 尚未安装，找不到 $SERVER_ENV_FILE"
+    exit 1
+  fi
+  local dashboard_username dashboard_password
+  dashboard_username="$(load_kv_from_file "$SERVER_ENV_FILE" DASHBOARD_USERNAME || true)"
+  dashboard_username="${dashboard_username:-$(generate_dashboard_username)}"
+  dashboard_password="$(generate_dashboard_password)"
+  replace_kv_in_file "$SERVER_ENV_FILE" DASHBOARD_USERNAME "$dashboard_username"
+  replace_kv_in_file "$SERVER_ENV_FILE" DASHBOARD_PASSWORD "$dashboard_password"
+  echo "[INFO] 已生成新的 Server Dashboard 随机密码，正在重建 Server 容器使其生效..."
+  bash "$ROOT_DIR/scripts/install-server.sh" update
+}
+
 print_https_guide() {
   cat <<'EOF_HTTPS_GUIDE'
 
@@ -313,6 +356,10 @@ EOF_HTTPS_GUIDE
 
 main() {
   ensure_root_and_deps
+  if [[ "$MODE" == "reset-password" ]]; then
+    reset_server_password
+    return
+  fi
   local reset_data="no"
   if [[ "$RESET_DATA_ARG" == "--reset-data" ]] || is_truthy "${RESET_SERVER_DATA:-}"; then
     reset_data="yes"
@@ -496,9 +543,9 @@ Mode: $MODE
 Container Name: $CONTAINER_NAME
 Backend Port: $port
 Backend Binding: $port_binding
-Shared Secret: $(if [[ "$MODE" == "install" ]]; then echo "$secret"; else echo "preserved (see $SERVER_ENV_FILE)"; fi)
-Dashboard Username: $(if [[ "$MODE" == "install" ]]; then echo "$default_dashboard_username"; else echo "preserved (see $SERVER_ENV_FILE)"; fi)
-Dashboard Password: $(if [[ "$MODE" == "install" ]]; then echo "$default_dashboard_password"; else echo "preserved (see $SERVER_ENV_FILE)"; fi)
+Shared Secret: $(if [[ "$MODE" == "install" && "${NARWHAL_AUTO_UPDATE:-0}" != "1" ]]; then echo "$secret"; else echo "preserved (see $SERVER_ENV_FILE)"; fi)
+Dashboard Username: $(if [[ "${NARWHAL_AUTO_UPDATE:-0}" == "1" ]]; then echo "preserved (see $SERVER_ENV_FILE)"; else echo "$default_dashboard_username"; fi)
+Dashboard Password: $(if [[ "${NARWHAL_AUTO_UPDATE:-0}" == "1" ]]; then echo "preserved (see $SERVER_ENV_FILE)"; else echo "$default_dashboard_password"; fi)
 Security Webhook: ${alert_webhook_url:-disabled}
 Webhook Minimum Severity: $alert_webhook_min_severity
 Disk Alert Threshold: $th%

@@ -1651,16 +1651,47 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
         unapproved_domains = (
             panel_pairing.get("unapproved_domains") if isinstance(panel_pairing.get("unapproved_domains"), list) else []
         )
+        process_patterns = (
+            panel_pairing.get("process_patterns") if isinstance(panel_pairing.get("process_patterns"), list) else []
+        )
+        identity_patterns = (
+            panel_pairing.get("identity_patterns") if isinstance(panel_pairing.get("identity_patterns"), list) else []
+        )
+        config_files = panel_pairing.get("config_files") if isinstance(panel_pairing.get("config_files"), list) else []
+        auto_domains = set(_configured_auto_remediate_panel_domains())
+        normalized_unapproved = [str(item).strip().lower().rstrip(".") for item in unapproved_domains]
+        auto_matched_domains = sorted(set(normalized_unapproved) & auto_domains)
+        remaining_unapproved_domains = [
+            item for item in normalized_unapproved if item not in auto_domains
+        ]
+        suppress_panel_alert = bool(
+            panel_detection_enabled and auto_matched_domains and not remaining_unapproved_domains
+        )
+        if panel_detection_enabled and auto_matched_domains:
+            auto_ok, auto_message = remediate_panel_pairing(
+                {
+                    "runtime": container.get("runtime"),
+                    "project": container.get("project"),
+                    "container_name": container.get("name"),
+                    "params": {
+                        "process_patterns": process_patterns,
+                        "config_files": config_files,
+                    },
+                }
+            )
+            print(
+                f"automatic panel remediation {'succeeded' if auto_ok else 'failed'} for "
+                f"{container.get('runtime')}/{container.get('name')}: {auto_message}"
+            )
+            unapproved_domains = remaining_unapproved_domains
         allowlist_configured = bool(_configured_allowed_panel_domains())
         pairing_is_allowed = allowlist_configured and bool(panel_domains) and not unapproved_domains
-        if panel_detection_enabled and panel_pairing.get("detected") and not pairing_is_allowed:
-            process_patterns = (
-                panel_pairing.get("process_patterns") if isinstance(panel_pairing.get("process_patterns"), list) else []
-            )
-            identity_patterns = (
-                panel_pairing.get("identity_patterns") if isinstance(panel_pairing.get("identity_patterns"), list) else []
-            )
-            config_files = panel_pairing.get("config_files") if isinstance(panel_pairing.get("config_files"), list) else []
+        if (
+            panel_detection_enabled
+            and panel_pairing.get("detected")
+            and not pairing_is_allowed
+            and not suppress_panel_alert
+        ):
             evidence = []
             if unapproved_domains:
                 evidence.append(f"未授权面板域名 {','.join(str(item) for item in unapproved_domains[:5])}")
@@ -1881,6 +1912,60 @@ def add_allowed_panel_domains(domains: List[str]) -> List[str]:
     parent = os.path.dirname(policy_path)
     os.makedirs(parent, mode=0o700, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(prefix=".panel-allowlist-", dir=parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as policy_file:
+            json.dump({"domains": merged, "updated_at": int(time.time())}, policy_file, ensure_ascii=False)
+            policy_file.write("\n")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, policy_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return merged
+
+
+def _configured_auto_remediate_panel_domains() -> List[str]:
+    policy_path = os.getenv(
+        "SECURITY_PANEL_AUTO_REMEDIATE_FILE",
+        "/opt/narwhal-monitor/panel-auto-remediate.json",
+    ).strip()
+    if not policy_path:
+        return []
+    try:
+        with open(policy_path, "r", encoding="utf-8") as policy_file:
+            stored = json.load(policy_file)
+        stored_domains = stored.get("domains", []) if isinstance(stored, dict) else stored
+    except (OSError, TypeError, ValueError):
+        return []
+    if not isinstance(stored_domains, list):
+        return []
+    return sorted(
+        {
+            str(item).strip().lower().rstrip(".")
+            for item in stored_domains
+            if isinstance(item, str) and _valid_panel_domain(item)
+        }
+    )
+
+
+def add_auto_remediate_panel_domains(domains: List[str]) -> List[str]:
+    normalized = {
+        str(item).strip().lower().rstrip(".")
+        for item in domains
+        if isinstance(item, str) and _valid_panel_domain(item)
+    }
+    if not normalized:
+        return _configured_auto_remediate_panel_domains()
+    merged = sorted(set(_configured_auto_remediate_panel_domains()) | normalized)
+    policy_path = os.getenv(
+        "SECURITY_PANEL_AUTO_REMEDIATE_FILE",
+        "/opt/narwhal-monitor/panel-auto-remediate.json",
+    ).strip()
+    if not policy_path or not (posixpath.isabs(policy_path) or os.path.isabs(policy_path)):
+        raise ValueError("SECURITY_PANEL_AUTO_REMEDIATE_FILE must be an absolute path")
+    parent = os.path.dirname(policy_path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".panel-auto-remediate-", dir=parent, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as policy_file:
             json.dump({"domains": merged, "updated_at": int(time.time())}, policy_file, ensure_ascii=False)
@@ -2762,7 +2847,13 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
     if not patterns and not config_files:
         return False, "no locally approved remediation targets"
 
-    script_parts = ["set -u", "removed_services=0", "removed_configs=0", "killed_processes=0"]
+    script_parts = [
+        "set -u",
+        "removed_services=0",
+        "removed_configs=0",
+        "killed_processes=0",
+        "cleanup_errors=0",
+    ]
     for pattern in patterns:
         quoted_pattern = shlex.quote(pattern)
         process_regex = shlex.quote(rf"^(/[^ ]*/)?{re.escape(pattern)}([[:space:]]|$)")
@@ -2781,22 +2872,26 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
             f"for unit in $(find \"$unit_dir\" -maxdepth 1 -iname {shlex.quote(pattern + '.service')} -print 2>/dev/null); do "
             "[ -e \"$unit\" ] || [ -L \"$unit\" ] || continue; unit_name=${unit##*/}; "
             "command -v systemctl >/dev/null 2>&1 && systemctl disable --now \"$unit_name\" >/dev/null 2>&1 || true; "
-            "rm -f -- \"$unit\" && removed_services=$((removed_services+1)); done; done; "
+            "if rm -f -- \"$unit\"; then removed_services=$((removed_services+1)); "
+            "else cleanup_errors=$((cleanup_errors+1)); fi; done; done; "
             f"for init_file in $(find /etc/init.d -maxdepth 1 -iname {quoted_pattern} -print 2>/dev/null); do "
             "[ -e \"$init_file\" ] || [ -L \"$init_file\" ] || continue; \"$init_file\" stop >/dev/null 2>&1 || true; "
-            "rm -f -- \"$init_file\" && removed_services=$((removed_services+1)); done; "
+            "if rm -f -- \"$init_file\"; then removed_services=$((removed_services+1)); "
+            "else cleanup_errors=$((cleanup_errors+1)); fi; done; "
             f"command -v rc-update >/dev/null 2>&1 && rc-update del {quoted_pattern} >/dev/null 2>&1 || true"
         )
     for config_file in config_files:
         quoted_file = shlex.quote(config_file)
         script_parts.append(
             f"if [ -f {quoted_file} ] || [ -L {quoted_file} ]; then "
-            f"rm -f -- {quoted_file} && removed_configs=$((removed_configs+1)); fi"
+            f"if rm -f -- {quoted_file}; then removed_configs=$((removed_configs+1)); "
+            "else cleanup_errors=$((cleanup_errors+1)); fi; fi"
         )
     script_parts.extend(
         [
             "command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true",
-            "printf 'killed_processes=%s removed_services=%s removed_configs=%s\\n' \"$killed_processes\" \"$removed_services\" \"$removed_configs\"",
+            "printf 'killed_processes=%s removed_services=%s removed_configs=%s cleanup_errors=%s\\n' \"$killed_processes\" \"$removed_services\" \"$removed_configs\" \"$cleanup_errors\"",
+            "[ \"$cleanup_errors\" -eq 0 ]",
         ]
     )
     runtime_bin = get_runtime_bins().get(runtime_kind, "")
@@ -2818,7 +2913,18 @@ def execute_security_action(action: Dict) -> Tuple[bool, str]:
             return False, f"allowlist update failed: {exc}"
         return True, f"allowed {len(domains)} exact domain(s); allowlist now contains {len(merged)}"
     if action_type == "remediate_panel_pairing":
-        return remediate_panel_pairing(action)
+        ok, message = remediate_panel_pairing(action)
+        if not ok:
+            return ok, message
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        domains = params.get("domains") if isinstance(params.get("domains"), list) else []
+        try:
+            add_auto_remediate_panel_domains(domains)
+        except (OSError, ValueError) as exc:
+            return False, f"remediation completed but automatic policy update failed: {exc}"
+        if domains:
+            message = f"{message}; remembered {len(domains)} domain(s) for silent automatic remediation"
+        return True, message
     return False, "unsupported action type"
 
 

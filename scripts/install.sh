@@ -246,7 +246,7 @@ main() {
 
   local action
   local reset_server_data="no"
-  read -rp "请选择操作 [install/update/uninstall] (默认 install): " action
+  read -rp "请选择操作 [install/update/reset-server-password/uninstall] (默认 install): " action
   action=${action:-install}
 
   case "$action" in
@@ -283,6 +283,10 @@ main() {
       update_repo_self
       run_installer "$mode" update "$reset_server_data"
       cleanup_after_update
+      ;;
+    reset-server-password|reset-password)
+      install_deps
+      bash "$ROOT_DIR/scripts/install-server.sh" reset-password
       ;;
     uninstall)
       uninstall_narwhal_related

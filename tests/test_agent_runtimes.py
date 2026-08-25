@@ -272,6 +272,90 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertIn("/etc/V2bX/config.json", command[-1])
         self.assertNotIn(" stop node1", " ".join(command))
 
+    def test_confirmed_panel_domain_is_silently_auto_remediated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = str(Path(tmp) / "auto-remediate.json")
+            env = {
+                "SECURITY_PANEL_AUTO_REMEDIATE_FILE": policy,
+                "SECURITY_PANEL_PROCESS_PATTERNS": "v2bx",
+                "SECURITY_PANEL_CONFIG_PATHS": "/etc/V2bX/config.json",
+                "SECURITY_ACCESS_LOG_PATHS": "",
+            }
+            container = {
+                "runtime": "incus",
+                "project": "default",
+                "name": "node1",
+                "security": {
+                    "panel_pairing": {
+                        "detected": True,
+                        "panel_domains": ["panel.example.net"],
+                        "unapproved_domains": ["panel.example.net"],
+                        "process_patterns": ["v2bx"],
+                        "config_files": ["/etc/V2bX/config.json"],
+                    }
+                },
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                agent.add_auto_remediate_panel_domains(["panel.example.net"])
+                with mock.patch.object(
+                    agent, "remediate_panel_pairing", return_value=(True, "cleaned")
+                ) as remediate:
+                    summary = agent.collect_security_summary([container], 60)
+            self.assertEqual(
+                [item for item in summary["alerts"] if item["type"] == "unauthorized_panel_pairing"],
+                [],
+            )
+            remediate.assert_called_once()
+
+    def test_manual_remediation_remembers_domains_for_future_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = str(Path(tmp) / "auto-remediate.json")
+            action = {
+                "action_type": "remediate_panel_pairing",
+                "params": {"domains": ["panel.example.net"]},
+            }
+            with mock.patch.dict(
+                os.environ, {"SECURITY_PANEL_AUTO_REMEDIATE_FILE": policy}, clear=False
+            ), mock.patch.object(agent, "remediate_panel_pairing", return_value=(True, "cleaned")):
+                ok, message = agent.execute_security_action(action)
+                remembered = agent._configured_auto_remediate_panel_domains()
+            self.assertTrue(ok)
+            self.assertIn("silent automatic remediation", message)
+            self.assertEqual(remembered, ["panel.example.net"])
+
+    def test_new_panel_domain_still_alerts_when_known_domain_is_auto_remediated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = str(Path(tmp) / "auto-remediate.json")
+            env = {
+                "SECURITY_PANEL_AUTO_REMEDIATE_FILE": policy,
+                "SECURITY_PANEL_PROCESS_PATTERNS": "v2bx",
+                "SECURITY_PANEL_CONFIG_PATHS": "/etc/V2bX/config.json",
+                "SECURITY_ACCESS_LOG_PATHS": "",
+            }
+            container = {
+                "runtime": "podman",
+                "name": "node1",
+                "security": {
+                    "panel_pairing": {
+                        "detected": True,
+                        "panel_domains": ["known.example.net", "new.example.net"],
+                        "unapproved_domains": ["known.example.net", "new.example.net"],
+                        "process_patterns": ["v2bx"],
+                        "config_files": ["/etc/V2bX/config.json"],
+                    }
+                },
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                agent.add_auto_remediate_panel_domains(["known.example.net"])
+                with mock.patch.object(
+                    agent, "remediate_panel_pairing", return_value=(True, "cleaned")
+                ):
+                    summary = agent.collect_security_summary([container], 60)
+            panel_alert = next(
+                item for item in summary["alerts"] if item["type"] == "unauthorized_panel_pairing"
+            )
+            self.assertEqual(panel_alert["unapproved_domains"], ["new.example.net"])
+
     def test_parses_caddy_and_nginx_access_logs(self):
         caddy = agent._parse_access_log_line(
             json.dumps(

@@ -687,6 +687,7 @@ async def queue_security_action(alert_id: int, request: Request) -> JSONResponse
             conn.close()
             raise HTTPException(status_code=400, detail="alert has no safe remediation evidence")
         params = {
+            "domains": sorted(set(unapproved_domains)),
             "process_patterns": sorted(set(process_patterns)),
             "config_files": sorted(set(config_files)),
         }
@@ -1150,7 +1151,7 @@ async function queueAlertAction(alertId, actionName){
   if(actionName==='remediate'){
     const processes=(details.process_patterns||[]).join(', ')||'无';
     const files=(details.config_files||[]).join(', ')||'无';
-    promptText=`确认清理 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的机场对接组件？\n\n将终止进程特征：${processes}\n停用并删除对应服务，删除配置：${files}\n容器本身不会停止。`;
+    promptText=`确认清理 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的机场对接组件？\n\n将终止进程特征：${processes}\n停用并删除对应服务，删除配置：${files}\n容器本身不会停止。清理成功后，同一面板域名再次出现将自动清理且不再提醒。`;
   }else{
     const domains=(details.unapproved_domains||[]).join(', ');
     promptText=`确认放行以下面板域名？\n${domains}\n\n放行后该节点以后不再对此域名告警。`;

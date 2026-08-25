@@ -745,6 +745,62 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertNotIn("user:pass", command)
         self.assertGreater(result["items"][0]["rss_bytes"], 0)
 
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "Linux /proc is required")
+    def test_deep_process_snapshot_falls_back_to_bounded_host_proc(self):
+        result, private_items = agent._collect_host_proc_process_snapshot(os.getpid(), 20)
+        self.assertTrue(result["available"])
+        self.assertGreaterEqual(result["captured"], 1)
+        self.assertEqual(result["source"], "host_proc")
+        self.assertNotIn("host_pid", result["items"][0])
+        self.assertIn("host_pid", private_items[0])
+
+    def test_socks_process_detection_flags_no_auth_without_exposing_credentials(self):
+        no_auth = agent._socks_process_evidence(
+            "12 S microsocks /usr/bin/microsocks -p 1080\n", "container"
+        )
+        weak = agent._socks_process_evidence(
+            "13 S microsocks /usr/bin/microsocks -u admin -P password\n", "container"
+        )
+        self.assertTrue(no_auth["detected"])
+        self.assertEqual(no_auth["auth_mode"], "no_auth")
+        self.assertEqual(weak["auth_mode"], "weak_password")
+        self.assertNotIn("password", json.dumps(weak["process_matches"]))
+
+    def test_socks_config_detection_returns_markers_not_credentials(self):
+        markers = "@@SOCKS:/etc/danted.conf\n@@NOAUTH:/etc/danted.conf\n"
+        with mock.patch.object(agent, "run", return_value=markers):
+            result = agent._collect_socks_config_evidence("incus", "proxy", "default", True)
+        self.assertTrue(result["detected"])
+        self.assertEqual(result["auth_mode"], "no_auth")
+        self.assertEqual(result["config_files"], ["/etc/danted.conf"])
+
+    def test_socks_inbound_fanout_replaces_generic_alert(self):
+        container = {
+            "name": "proxy",
+            "runtime": "incus",
+            "security": {
+                "inbound_unique_ips": 11,
+                "communication_processes": [],
+                "socks_proxy": {
+                    "detected": True,
+                    "auth_mode": "no_auth",
+                    "public_exposure": True,
+                    "process_matches": [{"pid": 12, "process": "microsocks"}],
+                },
+                "panel_pairing": {},
+            },
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"ALERT_INBOUND_UNIQUE_IPS": "10", "SECURITY_ACCESS_LOG_PATHS": ""},
+            clear=False,
+        ):
+            result = agent.collect_security_summary([container], 60)
+        types = {item["type"] for item in result["alerts"]}
+        self.assertIn("socks_weak_auth", types)
+        self.assertIn("socks_inbound_fanout", types)
+        self.assertNotIn("inbound_ip_fanout", types)
+
     def test_parses_caddy_and_nginx_access_logs(self):
         caddy = agent._parse_access_log_line(
             json.dumps(

@@ -171,6 +171,7 @@ panel_detection_enabled="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY
 default_allowed_panel_domains="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_ALLOWED_PANEL_DOMAINS "")"
 panel_process_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_PANEL_PROCESS_PATTERNS "xboard-node,xrayr,v2bx,soga,sspanel-uim-node")"
 panel_config_paths="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_PANEL_CONFIG_PATHS "/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/V2bX/config.json.bak,/usr/local/V2bX/config.json,/usr/local/V2bX/config.json.bak,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml")"
+socks_config_paths="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_SOCKS_CONFIG_PATHS "/etc/danted.conf,/etc/sockd.conf,/etc/3proxy/3proxy.cfg,/etc/3proxy.cfg,/etc/xray/config.json,/usr/local/etc/xray/config.json,/etc/v2ray/config.json,/usr/local/etc/v2ray/config.json,/etc/sing-box/config.json,/etc/sing-box.json,/etc/gost/config.yaml,/etc/gost/config.json")"
 for required_panel_path in /etc/V2bX/config.json.bak /usr/local/V2bX/config.json /usr/local/V2bX/config.json.bak; do
   if [[ ",${panel_config_paths}," != *",${required_panel_path},"* ]]; then
     panel_config_paths="${panel_config_paths},${required_panel_path}"
@@ -267,6 +268,7 @@ SECURITY_PANEL_ALLOWLIST_FILE=$panel_allowlist_file
 SECURITY_PANEL_AUTO_REMEDIATE_FILE=$panel_auto_remediate_file
 SECURITY_PANEL_PROCESS_PATTERNS=$panel_process_patterns
 SECURITY_PANEL_CONFIG_PATHS=$panel_config_paths
+SECURITY_SOCKS_CONFIG_PATHS=$socks_config_paths
 ENV
 
 cat >"$CLIENT_INSTALL_ENV_FILE" <<ENV

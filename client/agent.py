@@ -1042,6 +1042,7 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
         "scan_unique_ports_max": 0,
         "scan_source_ip": "",
         "listening_ports": [],
+        "listening_endpoints": [],
     }
     if pid <= 0:
         return result
@@ -1076,6 +1077,15 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
         for x in entries
         if x["proto"] == "tcp" and x["state"] == "0A" and int(x["local_port"]) > 0
     }
+    listening_endpoints = sorted(
+        {
+            f"[{entry['local_ip']}]:{int(entry['local_port'])}"
+            if ":" in str(entry["local_ip"])
+            else f"{entry['local_ip']}:{int(entry['local_port'])}"
+            for entry in entries
+            if entry["proto"] == "tcp" and entry["state"] == "0A" and int(entry["local_port"]) > 0
+        }
+    )
     container_ips = {
         str(entry["local_ip"])
         for entry in entries
@@ -1172,6 +1182,7 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
             "scan_unique_ports_max": scan_unique_ports_max,
             "scan_source_ip": scan_source_ip,
             "listening_ports": sorted(listening_ports),
+            "listening_endpoints": listening_endpoints,
         }
     )
     return result
@@ -2129,6 +2140,33 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
                     container,
                 )
             )
+        socks_proxy = security.get("socks_proxy") if isinstance(security.get("socks_proxy"), dict) else {}
+        socks_detected = bool(socks_proxy.get("detected"))
+        socks_auth_mode = str(socks_proxy.get("auth_mode") or "unknown")
+        if socks_detected and socks_auth_mode in ("no_auth", "weak_password"):
+            public_exposure = bool(socks_proxy.get("public_exposure"))
+            reason = "允许无认证访问" if socks_auth_mode == "no_auth" else "命中短密码或常见弱密码"
+            process_names = sorted(
+                {
+                    str(item.get("process") or "")
+                    for item in socks_proxy.get("process_matches", [])
+                    if isinstance(item, dict) and item.get("process")
+                }
+            )
+            alerts.append(
+                _security_alert(
+                    "socks_weak_auth",
+                    "critical" if public_exposure else "warning",
+                    "SOCKS 代理认证风险",
+                    f"检测到 SOCKS 服务{reason}；"
+                    f"公网/NAT 暴露 {'是' if public_exposure else '未确认'}；"
+                    f"进程 {','.join(process_names) if process_names else 'unknown'}；"
+                    "不会上报用户名或密码内容",
+                    1,
+                    0,
+                    container,
+                )
+            )
         inbound_unique_ips = int(security.get("inbound_unique_ips") or 0)
         if inbound_unique_ips > inbound_unique_ip_threshold:
             communication_processes = (
@@ -2147,15 +2185,18 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
                     f"；主要通信进程 {top_process.get('process')}"
                     f"(PID {int(top_process.get('pid') or 0)})"
                 )
+            alert_type = "socks_inbound_fanout" if socks_detected else "inbound_ip_fanout"
+            alert_title = "SOCKS 入站来源 IP 数量过多" if socks_detected else "入站来源 IP 数量过多"
+            socks_hint = "；已识别 SOCKS 服务，此告警替代通用入站 IP 告警" if socks_detected else ""
             alerts.append(
                 _security_alert(
-                    "inbound_ip_fanout",
+                    alert_type,
                     "critical"
                     if inbound_unique_ips > inbound_unique_ip_threshold * 2
                     else "warning",
-                    "入站来源 IP 数量过多",
+                    alert_title,
                     f"容器当前有 {inbound_unique_ips} 个不同入站 IP，"
-                    f"超过重点提醒阈值 {int(inbound_unique_ip_threshold)}{process_hint}",
+                    f"超过重点提醒阈值 {int(inbound_unique_ip_threshold)}{process_hint}{socks_hint}",
                     inbound_unique_ips,
                     inbound_unique_ip_threshold,
                     container,
@@ -2665,6 +2706,160 @@ def add_auto_remediate_panel_domains(domains: List[str]) -> List[str]:
     return merged
 
 
+_SOCKS_WEAK_PASSWORDS = {
+    "123456", "12345678", "123123", "admin", "admin123", "changeme", "default",
+    "guest", "letmein", "pass", "password", "qwerty", "root", "socks", "socks5", "test", "toor",
+}
+
+
+def _socks_process_evidence(process_output: str, combined_identity: str) -> Dict[str, object]:
+    direct_names = {"microsocks", "sockd", "danted", "srelay", "hev-socks5-server"}
+    configurable_names = {"3proxy", "gost", "xray", "v2ray", "sing-box"}
+    matches: List[Dict[str, object]] = []
+    candidate_found = any(name in combined_identity for name in direct_names | configurable_names)
+    detected = any(name in combined_identity for name in direct_names)
+    auth_modes = set()
+    reasons = set()
+    for line in process_output.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 3 or not parts[0].isdigit() or "z" in parts[1].lower():
+            continue
+        args = parts[3] if len(parts) > 3 else parts[2]
+        try:
+            tokens = shlex.split(args)
+        except ValueError:
+            tokens = args.split()
+        executable_names = {parts[2].lower()}
+        executable_names.update(
+            posixpath.basename(token).lower() for token in tokens if token and not token.startswith("-")
+        )
+        matched = next((name for name in direct_names | configurable_names if name in executable_names), "")
+        if not matched:
+            continue
+        candidate_found = True
+        lowered_args = args.lower()
+        process_detected = matched in direct_names or "socks" in lowered_args
+        if not process_detected and matched in configurable_names:
+            continue
+        detected = True
+        matches.append({"pid": int(parts[0]), "process": matched})
+        if matched == "microsocks":
+            username_present = "-u" in tokens
+            password = tokens[tokens.index("-P") + 1] if "-P" in tokens and tokens.index("-P") + 1 < len(tokens) else ""
+            if not username_present or not password:
+                auth_modes.add("no_auth")
+                reasons.add("microsocks 未同时配置用户名和密码")
+            elif password.lower() in _SOCKS_WEAK_PASSWORDS or len(password) < 8:
+                auth_modes.add("weak_password")
+                reasons.add("microsocks 使用短密码或常见弱密码")
+            else:
+                auth_modes.add("configured")
+        elif matched == "gost":
+            urls = re.findall(r"socks(?:4|5|5h)?://[^\s]+", args, flags=re.IGNORECASE)
+            if any("@" not in url.split("/", 3)[2] for url in urls):
+                auth_modes.add("no_auth")
+                reasons.add("gost SOCKS 监听地址未见认证信息")
+            for url in urls:
+                try:
+                    password = urlparse(url).password or ""
+                except ValueError:
+                    password = ""
+                if password and (password.lower() in _SOCKS_WEAK_PASSWORDS or len(password) < 8):
+                    auth_modes.add("weak_password")
+                    reasons.add("gost 使用短密码或常见弱密码")
+                elif password:
+                    auth_modes.add("configured")
+    if "weak_password" in auth_modes:
+        auth_mode = "weak_password"
+    elif "no_auth" in auth_modes:
+        auth_mode = "no_auth"
+    elif "configured" in auth_modes:
+        auth_mode = "configured"
+    else:
+        auth_mode = "unknown"
+    return {
+        "candidate_found": candidate_found,
+        "detected": detected,
+        "process_matches": matches[:20],
+        "auth_mode": auth_mode,
+        "risk_reasons": sorted(reasons),
+    }
+
+
+def _collect_socks_config_evidence(
+    runtime: str, name: str, project: str, enabled: bool
+) -> Dict[str, object]:
+    result: Dict[str, object] = {
+        "detected": False,
+        "config_files": [],
+        "auth_mode": "unknown",
+        "risk_reasons": [],
+    }
+    if not enabled:
+        return result
+    raw_paths = os.getenv(
+        "SECURITY_SOCKS_CONFIG_PATHS",
+        "/etc/danted.conf,/etc/sockd.conf,/etc/3proxy/3proxy.cfg,/etc/3proxy.cfg,"
+        "/etc/xray/config.json,/usr/local/etc/xray/config.json,/etc/v2ray/config.json,"
+        "/usr/local/etc/v2ray/config.json,/etc/sing-box/config.json,/etc/sing-box.json,"
+        "/etc/gost/config.yaml,/etc/gost/config.json",
+    )
+    paths = [
+        path.strip()
+        for path in raw_paths.split(",")
+        if re.fullmatch(r"/[A-Za-z0-9_./-]+", path.strip())
+    ][:30]
+    if not paths:
+        return result
+    quoted_paths = " ".join(shlex.quote(path) for path in paths)
+    socks_pattern = r"socks5|socksmethod|(^|[[:space:]])socks([[:space:]]|$)|['\"]?(protocol|type)['\"]?[[:space:]]*:[[:space:]]*['\"]?socks"
+    no_auth_pattern = r"socksmethod[[:space:]]*:[^#]*(none)|auth[[:space:]]+(none)|['\"]?(auth|method)['\"]?[[:space:]]*:[[:space:]]*['\"]?(noauth|none)"
+    weak_pattern = r"((password|passwd|pass)[[:space:]\"']*[:=][[:space:]\"']*|users[[:space:]]+[^[:space:]:]+:CL:)(123456|12345678|123123|admin|admin123|changeme|default|guest|letmein|pass|password|qwerty|root|socks5?|test|toor)([[:space:]\"',}]|$)"
+    auth_pattern = r"socksmethod[[:space:]]*:[^#]*(username|pam)|['\"]?(username|password|users)['\"]?[[:space:]]*[:=]"
+    command = (
+        f"for p in {quoted_paths}; do [ -r \"$p\" ] || continue; "
+        f"head -c 262144 \"$p\" 2>/dev/null | grep -Eiq {shlex.quote(socks_pattern)} && echo \"@@SOCKS:$p\"; "
+        f"head -c 262144 \"$p\" 2>/dev/null | grep -Eiq {shlex.quote(no_auth_pattern)} && echo \"@@NOAUTH:$p\"; "
+        f"head -c 262144 \"$p\" 2>/dev/null | grep -Eiq {shlex.quote(weak_pattern)} && echo \"@@WEAK:$p\"; "
+        f"head -c 262144 \"$p\" 2>/dev/null | grep -Eiq {shlex.quote(auth_pattern)} && echo \"@@AUTH:$p\"; done"
+    )
+    output = run(_runtime_exec_cmd(runtime, name, command, project))
+    files = set()
+    modes = set()
+    reasons = set()
+    for raw_line in output.splitlines():
+        marker, separator, path = raw_line.strip().partition(":")
+        if not separator or path not in paths:
+            continue
+        if marker == "@@SOCKS":
+            files.add(path)
+        elif marker == "@@NOAUTH":
+            files.add(path)
+            modes.add("no_auth")
+            reasons.add("SOCKS 配置允许无认证访问")
+        elif marker == "@@WEAK":
+            files.add(path)
+            modes.add("weak_password")
+            reasons.add("SOCKS 配置命中短密码或常见弱密码")
+        elif marker == "@@AUTH":
+            modes.add("configured")
+    result.update(
+        {
+            "detected": bool(files),
+            "config_files": sorted(files),
+            "auth_mode": "weak_password"
+            if "weak_password" in modes
+            else "no_auth"
+            if "no_auth" in modes
+            else "configured"
+            if "configured" in modes
+            else "unknown",
+            "risk_reasons": sorted(reasons),
+        }
+    )
+    return result
+
+
 def collect_panel_pairing_indicators(
     name: str, runtime: str = "", project: str = "", image: str = ""
 ) -> Dict[str, object]:
@@ -2679,6 +2874,7 @@ def collect_panel_pairing_indicators(
         "panel_domains": [],
         "unapproved_domains": [],
         "approved": False,
+        "socks_proxy": {},
     }
     if not runtime:
         return result
@@ -2694,6 +2890,25 @@ def collect_panel_pairing_indicators(
         _runtime_exec_cmd(runtime, name, "ps -eo pid=,stat=,comm=,args= 2>/dev/null", project)
     )
     combined_identity = f"{name} {image}".lower()
+    socks_process = _socks_process_evidence(process_output, combined_identity)
+    socks_config = _collect_socks_config_evidence(
+        runtime, name, project, bool(socks_process.get("candidate_found"))
+    )
+    socks_auth_modes = {str(socks_process.get("auth_mode") or "unknown"), str(socks_config.get("auth_mode") or "unknown")}
+    socks_auth_mode = (
+        "weak_password" if "weak_password" in socks_auth_modes else
+        "no_auth" if "no_auth" in socks_auth_modes else
+        "configured" if "configured" in socks_auth_modes else "unknown"
+    )
+    result["socks_proxy"] = {
+        "detected": bool(socks_process.get("detected") or socks_config.get("detected")),
+        "process_matches": socks_process.get("process_matches", []),
+        "config_files": socks_config.get("config_files", []),
+        "auth_mode": socks_auth_mode,
+        "risk_reasons": sorted(
+            set(socks_process.get("risk_reasons", [])) | set(socks_config.get("risk_reasons", []))
+        ),
+    }
     process_matches: List[Dict[str, object]] = []
     process_patterns_set = set()
     for line in process_output.splitlines():
@@ -3459,6 +3674,7 @@ def collect_container(
     top_cpu_process = collect_top_cpu_process(name, runtime, project)
     suspicious_processes = collect_suspicious_processes(name, runtime, project)
     panel_pairing = collect_panel_pairing_indicators(name, runtime, project, image)
+    socks_proxy = panel_pairing.pop("socks_proxy", {})
     socket_security = _collect_socket_security(pid)
     _apply_host_conntrack_security(
         socket_security,
@@ -3466,6 +3682,16 @@ def collect_container(
         network_addresses,
         network_exposure,
     )
+    if isinstance(socks_proxy, dict) and socks_proxy.get("detected"):
+        listening_endpoints = (
+            socket_security.get("listening_endpoints")
+            if isinstance(socket_security.get("listening_endpoints"), list)
+            else []
+        )
+        socks_proxy["listening_ports"] = socket_security.get("listening_ports", [])
+        socks_proxy["public_exposure"] = bool(network_exposure) or any(
+            str(endpoint).startswith(("0.0.0.0:", "[::]:")) for endpoint in listening_endpoints
+        )
     has_remote_connections = any(
         int(socket_security.get(key) or 0) > 0
         for key in (
@@ -3510,6 +3736,7 @@ def collect_container(
             "protocol_rates": protocol_rates,
             "process_count": process_count,
             "panel_pairing": panel_pairing,
+            "socks_proxy": socks_proxy,
             "network_exposure": network_exposure,
             **communication,
         }
@@ -3589,6 +3816,225 @@ def _collect_deep_process_snapshot(
     }
 
 
+def _read_host_proc_text(path: str, limit: int = 8192) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            return handle.read(limit)
+    except (OSError, ValueError):
+        return ""
+
+
+def _collect_host_proc_process_snapshot(
+    init_pid: int, process_limit: int
+) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    """Read a target container process tree from host /proc when the image has no ps."""
+    if init_pid <= 1 or not os.path.isdir(f"/proc/{init_pid}"):
+        return {"available": False, "captured": 0, "truncated": False, "items": []}, []
+    scan_limit = max(1000, min(50000, int(_env_float("DEEP_HOST_PROC_SCAN_MAX", 20000))))
+    parent_map: Dict[int, int] = {}
+    status_map: Dict[int, str] = {}
+    try:
+        proc_ids = sorted(int(value) for value in os.listdir("/proc") if value.isdigit())[:scan_limit]
+    except OSError:
+        proc_ids = []
+    for host_pid in proc_ids:
+        status = _read_host_proc_text(f"/proc/{host_pid}/status")
+        parent_match = re.search(r"(?m)^PPid:\s+(\d+)", status)
+        if not parent_match:
+            continue
+        parent_map[host_pid] = int(parent_match.group(1))
+        status_map[host_pid] = status
+
+    descendants = {init_pid}
+    changed = True
+    while changed and len(descendants) <= scan_limit:
+        changed = False
+        for host_pid, parent_pid in parent_map.items():
+            if host_pid not in descendants and parent_pid in descendants:
+                descendants.add(host_pid)
+                changed = True
+    capture_limit = max(20, min(200, int(process_limit)))
+    try:
+        uptime = float(_read_host_proc_text("/proc/uptime", 128).split()[0])
+        clock_ticks = float(os.sysconf("SC_CLK_TCK"))
+    except (IndexError, OSError, TypeError, ValueError):
+        uptime, clock_ticks = 0.0, 100.0
+    host_processes: List[Dict[str, object]] = []
+    for host_pid in sorted(descendants):
+        status = status_map.get(host_pid) or _read_host_proc_text(f"/proc/{host_pid}/status")
+        namespace_match = re.search(r"(?m)^NSpid:\s+(.+)$", status)
+        namespace_values = re.findall(r"\d+", namespace_match.group(1)) if namespace_match else []
+        namespace_pid = int(namespace_values[-1]) if namespace_values else (1 if host_pid == init_pid else host_pid)
+        uid_match = re.search(r"(?m)^Uid:\s+(\d+)", status)
+        state_match = re.search(r"(?m)^State:\s+([^\s]+)", status)
+        rss_match = re.search(r"(?m)^VmRSS:\s+(\d+)\s+kB", status, flags=re.IGNORECASE)
+        comm = _read_host_proc_text(f"/proc/{host_pid}/comm", 256).strip()[:120] or "unknown"
+        try:
+            with open(f"/proc/{host_pid}/cmdline", "rb") as handle:
+                command = handle.read(8192).replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+        except OSError:
+            command = comm
+        cpu_percent = 0.0
+        stat = _read_host_proc_text(f"/proc/{host_pid}/stat", 4096)
+        close_paren = stat.rfind(")")
+        stat_fields = stat[close_paren + 2 :].split() if close_paren >= 0 else []
+        if len(stat_fields) > 19 and uptime > 0 and clock_ticks > 0:
+            try:
+                cpu_seconds = (float(stat_fields[11]) + float(stat_fields[12])) / clock_ticks
+                lifetime = max(0.001, uptime - (float(stat_fields[19]) / clock_ticks))
+                cpu_percent = max(0.0, (cpu_seconds / lifetime) * 100.0)
+            except (TypeError, ValueError):
+                pass
+        host_processes.append(
+            {
+                "host_pid": host_pid,
+                "pid": namespace_pid,
+                "ppid": int(parent_map.get(host_pid, 0)),
+                "user": uid_match.group(1) if uid_match else "-",
+                "state": state_match.group(1) if state_match else "-",
+                "cpu_percent": cpu_percent,
+                "rss_bytes": int(rss_match.group(1)) * 1024 if rss_match else 0,
+                "process": comm,
+                "command": _redact_process_command(command or comm),
+            }
+        )
+    namespace_by_host = {
+        int(item.get("host_pid") or 0): int(item.get("pid") or 0) for item in host_processes
+    }
+    for item in host_processes:
+        item["ppid"] = namespace_by_host.get(int(item.get("ppid") or 0), 0)
+    host_processes.sort(key=lambda item: float(item.get("cpu_percent") or 0), reverse=True)
+    public_items = [{key: value for key, value in item.items() if key != "host_pid"} for item in host_processes]
+    return (
+        {
+            "available": bool(host_processes),
+            "source": "host_proc",
+            "captured": min(len(public_items), capture_limit),
+            "truncated": len(public_items) > capture_limit,
+            "items": public_items[:capture_limit],
+        },
+        host_processes,
+    )
+
+
+def _collect_host_proc_socket_details(
+    init_pid: int,
+    host_processes: List[Dict[str, object]],
+    listening_ports: List[int],
+    socket_limit: int,
+) -> Dict[str, object]:
+    """Attribute bounded /proc socket tables to container processes without requiring ss."""
+    if init_pid <= 1 or not host_processes:
+        return {"communication_detail_available": False, "communication_sockets": [], "communication_processes": []}
+    inode_owners: Dict[str, Tuple[int, str]] = {}
+    fd_budget = max(1000, min(20000, int(_env_float("DEEP_HOST_PROC_FD_MAX", 10000))))
+    visited_fds = 0
+    for process in host_processes:
+        host_pid = int(process.get("host_pid") or 0)
+        try:
+            fd_names = os.listdir(f"/proc/{host_pid}/fd")[:1024]
+        except OSError:
+            continue
+        for fd_name in fd_names:
+            if visited_fds >= fd_budget:
+                break
+            visited_fds += 1
+            try:
+                target = os.readlink(f"/proc/{host_pid}/fd/{fd_name}")
+            except OSError:
+                continue
+            match = re.fullmatch(r"socket:\[(\d+)\]", target)
+            if match:
+                inode_owners.setdefault(
+                    match.group(1),
+                    (int(process.get("pid") or 0), str(process.get("process") or "unknown")[:120]),
+                )
+        if visited_fds >= fd_budget:
+            break
+
+    state_names = {
+        "01": "established", "02": "syn-sent", "03": "syn-recv", "04": "fin-wait-1",
+        "05": "fin-wait-2", "06": "time-wait", "07": "close", "08": "close-wait",
+        "09": "last-ack", "0A": "listen", "0B": "closing",
+    }
+    listening = {int(port) for port in listening_ports if int(port) > 0}
+    sockets: List[Dict[str, object]] = []
+    snapshot_count = 0
+    snapshot_cap = max(500, min(2000, socket_limit * 2))
+    for filename, proto, is_v6 in (
+        ("tcp", "tcp", False), ("tcp6", "tcp", True), ("udp", "udp", False), ("udp6", "udp", True)
+    ):
+        table = _read_host_proc_text(f"/proc/{init_pid}/net/{filename}", 2_000_000)
+        for line in table.splitlines()[1:]:
+            if snapshot_count >= snapshot_cap:
+                break
+            parts = line.split()
+            if len(parts) < 10 or ":" not in parts[1] or ":" not in parts[2]:
+                continue
+            snapshot_count += 1
+            local_ip_hex, local_port_hex = parts[1].rsplit(":", 1)
+            remote_ip_hex, remote_port_hex = parts[2].rsplit(":", 1)
+            local_ip = _decode_proc_addr(local_ip_hex, is_v6=is_v6)
+            remote_ip = _decode_proc_addr(remote_ip_hex, is_v6=is_v6)
+            local_port = _parse_port(local_port_hex)
+            remote_port = _parse_port(remote_port_hex)
+            state = parts[3].upper()
+            if proto == "tcp" and state not in ("01", "02", "03"):
+                continue
+            if proto == "udp" and remote_port <= 0:
+                continue
+            if not _is_trackable_ip(remote_ip):
+                continue
+            owner_pid, owner_name = inode_owners.get(parts[9], (0, "unknown"))
+            direction = "inbound" if local_port in listening or state == "03" else "outbound"
+            local_text = f"[{local_ip}]:{local_port}" if ":" in local_ip else f"{local_ip}:{local_port}"
+            remote_text = f"[{remote_ip}]:{remote_port}" if ":" in remote_ip else f"{remote_ip}:{remote_port}"
+            if len(sockets) < socket_limit:
+                sockets.append(
+                    {
+                        "proto": proto,
+                        "state": state_names.get(state, state.lower()),
+                        "direction": direction,
+                        "local": local_text,
+                        "remote": remote_text,
+                        "remote_ip": remote_ip,
+                        "process": owner_name,
+                        "pid": owner_pid,
+                    }
+                )
+        if snapshot_count >= snapshot_cap:
+            break
+    totals: Dict[Tuple[int, str], Dict[str, object]] = {}
+    for item in sockets:
+        key = (int(item.get("pid") or 0), str(item.get("process") or "unknown"))
+        aggregate = totals.setdefault(
+            key,
+            {"pid": key[0], "process": key[1], "inbound_connections": 0, "outbound_connections": 0, "remote_ips": set()},
+        )
+        direction = "inbound" if item.get("direction") == "inbound" else "outbound"
+        aggregate[f"{direction}_connections"] = int(aggregate[f"{direction}_connections"]) + 1
+        remote_ips = aggregate.get("remote_ips")
+        if isinstance(remote_ips, set):
+            remote_ips.add(str(item.get("remote_ip") or ""))
+    process_totals = []
+    for aggregate in totals.values():
+        remote_ips = aggregate.pop("remote_ips", set())
+        aggregate["unique_remote_ips"] = len(remote_ips) if isinstance(remote_ips, set) else 0
+        process_totals.append(aggregate)
+    process_totals.sort(
+        key=lambda item: int(item.get("inbound_connections") or 0) + int(item.get("outbound_connections") or 0),
+        reverse=True,
+    )
+    return {
+        "communication_detail_available": True,
+        "communication_source": "host_proc",
+        "communication_snapshot_count": snapshot_count,
+        "communication_snapshot_truncated": snapshot_count >= snapshot_cap,
+        "communication_processes": process_totals[:50],
+        "communication_sockets": sockets,
+    }
+
+
 def collect_container_deep_sample(
     name: str,
     runtime: str,
@@ -3621,8 +4067,11 @@ def collect_container_deep_sample(
     }
 
     process_snapshot = _collect_deep_process_snapshot(runtime, name, project, process_limit)
+    host_processes: List[Dict[str, object]] = []
     if not process_snapshot.get("available"):
-        errors.append("ps is unavailable inside the container")
+        process_snapshot, host_processes = _collect_host_proc_process_snapshot(pid, process_limit)
+        if not process_snapshot.get("available"):
+            errors.append("process metadata is unavailable from both container ps and host /proc")
     security = base_report.get("security") if isinstance(base_report.get("security"), dict) else {}
     listening_ports = security.get("listening_ports") if isinstance(security.get("listening_ports"), list) else []
     communication = _collect_socket_process_details(
@@ -3633,6 +4082,16 @@ def collect_container_deep_sample(
         snapshot_limit_override=max(500, socket_limit * 2),
         detail_limit_override=socket_limit,
     )
+    if not communication.get("communication_detail_available"):
+        if not host_processes:
+            _, host_processes = _collect_host_proc_process_snapshot(pid, process_limit)
+        host_communication = _collect_host_proc_socket_details(
+            pid, host_processes, listening_ports, socket_limit
+        )
+        if host_communication.get("communication_detail_available"):
+            communication = host_communication
+        else:
+            errors.append("socket ownership is unavailable from both container ss and host /proc")
     _enrich_communication_with_original_sources(
         communication,
         security.get("inbound_public_flows", [])

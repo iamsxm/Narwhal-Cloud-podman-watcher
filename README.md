@@ -287,6 +287,7 @@ Incus 的 CPU 与网络速度由累计指标的相邻采样差值计算，因此
 - **流量型 DDoS**：容器入站 B/s、入站 pps 超阈值。
 - **SYN Flood**：容器网络命名空间中 `SYN_RECV` 数量超阈值。
 - **入站 IP 扇出**：容器当前入站去重 IP 大于 10 时重点告警，并在容器详情中展示对应通信进程、PID、本地/远端端点和方向。
+- **SOCKS 滥用与弱认证**：识别 MicroSocks、Dante/sockd、3proxy、GOST、Xray/V2Ray、sing-box 等 SOCKS 服务。发现无认证、短密码或常见弱密码时告警，但绝不上报用户名和密码；SOCKS 入站 IP 大于通用阈值时将通用告警替换为一条 SOCKS 专项告警，避免重复提醒。
 - **HTTP/CC**：Nginx combined 或 Caddy JSON 访问日志中的总 RPS、单 IP RPS、4xx 比例超阈值。
 - **扫描**：同一来源在采样时刻同时触达的本地端口数超阈值，或访问日志命中敏感 Web 路径探测规则。
 - **滥用**：容器出站连接外部 IP 扇出过大、SMTP/Telnet/SMB/IRC 等敏感端口连接过多，或单 IP 产生大量 401/403/429。
@@ -336,6 +337,7 @@ SECURITY_PANEL_ALLOWLIST_FILE=/opt/narwhal-monitor/panel-allowlist.json
 SECURITY_PANEL_AUTO_REMEDIATE_FILE=/opt/narwhal-monitor/panel-auto-remediate.json
 SECURITY_PANEL_PROCESS_PATTERNS=xboard-node,xrayr,v2bx,soga,sspanel-uim-node
 SECURITY_PANEL_CONFIG_PATHS=/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/V2bX/config.json.bak,/usr/local/V2bX/config.json,/usr/local/V2bX/config.json.bak,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml
+SECURITY_SOCKS_CONFIG_PATHS=/etc/danted.conf,/etc/sockd.conf,/etc/3proxy/3proxy.cfg,/etc/3proxy.cfg,/etc/xray/config.json,/usr/local/etc/xray/config.json,/etc/v2ray/config.json,/usr/local/etc/v2ray/config.json,/etc/sing-box/config.json,/etc/sing-box.json,/etc/gost/config.yaml,/etc/gost/config.json
 ACTION_POLL_INTERVAL=10
 ALERT_WEB_SCAN_REQUESTS=10
 ALERT_AUTH_FAILURES_PER_IP=20
@@ -344,6 +346,8 @@ ALERT_AUTH_FAILURES_PER_IP=20
 Agent 会同时读取宿主机 `SECURITY_ACCESS_LOG_PATHS`，并通过对应的 Podman/Docker/Incus 运行时进入每个容器读取 `SECURITY_CONTAINER_ACCESS_LOG_PATHS`。因此面板或反代日志既可以位于宿主机，也可以只存在于容器内部；文件不存在的容器会自动跳过。也可以把容器日志只读挂载到宿主机后，仅保留宿主机路径。日志不可读时网络层检测仍正常运行，但该容器不会产生 HTTP/CC 日志告警。
 
 `SECURITY_ALLOWED_PANEL_DOMAINS` 是允许对接的面板域名白名单，支持父域匹配，例如配置 `example.com` 会允许 `panel.example.com`，但不会允许 `example.com.evil.test`。默认留空表示没有允许的第三方面板；发现明确面板域名时产生 critical 告警，只发现节点程序或配置特征但无法提取域名时产生 warning。检测过程不会把配置文件正文、API Key 或 Token 写入上报数据。
+
+SOCKS 检测复用本轮已经读取的容器进程列表；只有发现 SOCKS 候选进程或容器身份特征时，才对 `SECURITY_SOCKS_CONFIG_PATHS` 中最多 30 个精确路径各读取前 256 KiB 并在容器内返回风险标记，不传输配置正文或凭据。无认证/弱密码且确认存在公网或 NAT 暴露时为 critical，未确认公网暴露时为 warning。弱密码判断包含常见默认密码和少于 8 位的命令行密码。
 
 ### Critical 机场对接告警的处理
 
@@ -372,6 +376,7 @@ Agent 会同时读取宿主机 `SECURITY_ACCESS_LOG_PATHS`，并通过对应的 
 - 宿主机磁盘结果缓存 30 秒，同一轮多个容器复用；容器侧只读取文件系统元数据，不遍历目录、不计算目录大小。镜像层 `inspect --size` 默认关闭；确需采集时可在 Client 环境中设置 `CONTAINER_LAYER_SIZE_ENABLED=true`，但这可能增加 IO。
 - 统计页的 Top10、“全部容器”和总览容器卡片均跳转到独立的容器详情页，不再借用首页弹窗。详情展示容器内部 CPU/内存/连接/进程/网络命名空间、历史速率曲线、监听端口、NAT/代理映射、通信进程与端点、文件系统和配置风险；页面刷新只复用既有上报，不额外触发节点采集。
 - 怀疑某个容器时，可在详情页点击“请求深度上报”。Server 会排入经过现有 HMAC 通道下发的一次性任务；Client 通常在 10 秒内领取，并立即进入下一上报周期，只对目标容器采集约 1 秒的瞬时 RX/TX 与 pps、最多 100 条进程、最多 250 条连接、连接 IP 及进程归属。上报失败会保留任务重试，上报成功即清除任务并恢复普通轻量采集。该能力不进行持续抓包、不读取业务文件，进程命令行中的常见密码、令牌和 API Key 参数会先脱敏。
+- 极简容器没有安装 `ps` 或 `ss` 时，按需深度上报会只读宿主机 `/proc`，按目标容器 init PID 的进程树和 socket inode 做有界回退归属；最多扫描 20000 个宿主机 PID、10000 个目标进程文件描述符和 2000 条目标网络命名空间 socket 记录。该回退只在人工请求时执行，不增加普通周期的持续 IO/CPU 压力。
 - 详情页会显示“已排队、节点已领取、报告已收到或失败”的明确状态。任务处于等待状态时按钮不可重复提交；历史深度报告随普通报告保留周期保存，可作为当时的排查快照，但不代表持续实时状态。
 - 历史图表与统计聚合默认只使用当前 Client 版本产生的样本，避免升级前后的指标口径混在同一曲线或平均值中；旧数据仍保留在数据库，不执行破坏性清理。
 

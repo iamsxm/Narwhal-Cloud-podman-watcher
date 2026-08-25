@@ -419,8 +419,6 @@ TLS_CERT_MODE=$tls_cert_mode
 CLOUDFLARE_API_TOKEN=$cloudflare_api_token
 ENV
 
-  podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-
   if [[ "$reset_data" == "yes" ]]; then
     echo "[INFO] 检测到 reset-data，请求清空历史采集数据（初始化数据库）..."
     wipe_server_data
@@ -451,6 +449,9 @@ ENV
   if [[ "$tls_enable" == "yes" ]]; then
     port_binding="127.0.0.1:${port}:8080"
   fi
+
+  # Keep the currently running Server available until the replacement image is ready.
+  podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
   podman run -d --name "$CONTAINER_NAME" \
     --restart=always \

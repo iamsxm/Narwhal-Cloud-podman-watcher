@@ -28,8 +28,15 @@ class ServerRuntimeTests(unittest.TestCase):
         server.TLS_CA_CERT_PATH = self.original_tls_ca_path
         self.tmp.cleanup()
 
-    def _insert(self, runtime: str, cpu: float, project: str = ""):
-        now = int(time.time())
+    def _insert(
+        self,
+        runtime: str,
+        cpu: float,
+        project: str = "",
+        agent_version: str = "",
+        timestamp: int | None = None,
+    ):
+        now = timestamp or int(time.time())
         payload = {
             "id": f"{runtime}-id",
             "name": "same-name",
@@ -37,6 +44,8 @@ class ServerRuntimeTests(unittest.TestCase):
             "mem_limit_bytes": 4,
             "cpu_effective_cpus": 2,
         }
+        if agent_version:
+            payload["_agent_version"] = agent_version
         conn = sqlite3.connect(server.DB_PATH)
         conn.execute(
             """
@@ -58,6 +67,18 @@ class ServerRuntimeTests(unittest.TestCase):
         body = json.loads(response.body)
         self.assertEqual(len(body["items"]), 2)
         self.assertEqual({x["runtime"] for x in body["items"]}, {"docker", "incus"})
+
+    def test_history_and_stats_do_not_mix_metric_versions(self):
+        now = int(time.time())
+        self._insert("incus", 99, "default", "1.0.0", now - 10)
+        self._insert("incus", 5, "default", "1.0.1", now)
+
+        history = json.loads(server.history("host", "same-name", "incus", "default", 60).body)
+        self.assertEqual([x["agent_version"] for x in history["items"]], ["1.0.0", "1.0.1"])
+
+        stats = json.loads(server.stats(60).body)
+        self.assertEqual(stats["containers"][0]["samples"], 1)
+        self.assertEqual(stats["containers"][0]["avg"]["cpu_percent"], 5)
 
     def test_report_accepts_runtime_and_project_fields(self):
         now = int(time.time())
@@ -214,6 +235,7 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("/api/v1/history?", html)
         self.assertIn("overflow-x:hidden", html)
         self.assertIn("detail-version", html)
+        self.assertIn("已忽略 ${excludedSamples} 条旧版本口径样本", html)
         self.assertIn("/container-detail?", server.stats_page())
 
     def test_release_version_is_shared_by_server_client_and_installers(self):

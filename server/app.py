@@ -35,6 +35,14 @@ def format_utc8(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=UTC8).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def report_agent_version(payload_json: str | None) -> str:
+    try:
+        payload = json.loads(payload_json or "{}")
+    except (TypeError, ValueError):
+        return "unknown"
+    return str(payload.get("_agent_version") or "unknown")
+
+
 app = FastAPI(title="Narwhal Container Monitor")
 
 _AGENT_ONLY_PATHS = {
@@ -622,7 +630,7 @@ def history(host_id: str, container_name: str, runtime: str = "", project: str =
     if runtime:
         rows = conn.execute(
             """
-            SELECT ts, cpu_percent, mem_percent, net_rx_bps, net_tx_bps, conn_count
+            SELECT ts, cpu_percent, mem_percent, net_rx_bps, net_tx_bps, conn_count, payload_json
             FROM reports
             WHERE host_id=? AND runtime=? AND project=? AND container_name=? AND ts>=?
             ORDER BY ts ASC
@@ -632,7 +640,7 @@ def history(host_id: str, container_name: str, runtime: str = "", project: str =
     else:
         rows = conn.execute(
             """
-            SELECT ts, cpu_percent, mem_percent, net_rx_bps, net_tx_bps, conn_count
+            SELECT ts, cpu_percent, mem_percent, net_rx_bps, net_tx_bps, conn_count, payload_json
             FROM reports
             WHERE host_id=? AND container_name=? AND ts>=?
             ORDER BY ts ASC
@@ -646,6 +654,7 @@ def history(host_id: str, container_name: str, runtime: str = "", project: str =
                 {
                     "timestamp": r["ts"],
                     "timestamp_iso_utc8": format_utc8(r["ts"]),
+                    "agent_version": report_agent_version(r["payload_json"]),
                     "cpu_percent": r["cpu_percent"],
                     "mem_percent": r["mem_percent"],
                     "net_rx_bps": r["net_rx_bps"],
@@ -1231,6 +1240,11 @@ def stats(minutes: int = 720) -> JSONResponse:
     for (host_id, runtime, project, container_name), series in grouped.items():
         if not series:
             continue
+        latest_agent_version = report_agent_version(series[-1]["payload_json"])
+        if latest_agent_version != "unknown":
+            series = [
+                row for row in series if report_agent_version(row["payload_json"]) == latest_agent_version
+            ]
         cpu_values = [float(x["cpu_percent"] or 0) for x in series]
         mem_values = [int(x["mem_bytes"] or 0) for x in series]
         mem_percent_values = [float(x["mem_percent"] or 0) for x in series]
@@ -1890,13 +1904,13 @@ async function loadDetail(){
  const params=new URLSearchParams({host_id:host,runtime,project,container_name:container,minutes:'1440'});
  try{
   const [latestData,historyData]=await Promise.all([fetch('/api/v1/latest?include_stale=true').then(r=>r.json()),fetch(`/api/v1/history?${params}`).then(r=>r.json())]);
-  const current=(latestData.items||[]).find(x=>x.host_id===host&&x.runtime===runtime&&(x.project||'')===project&&x.container_name===container);const pts=historyData.items||[];
+  const current=(latestData.items||[]).find(x=>x.host_id===host&&x.runtime===runtime&&(x.project||'')===project&&x.container_name===container);const allPts=historyData.items||[];const currentVersion=String(current?.agent_version||'unknown');const pts=currentVersion==='unknown'?allPts:allPts.filter(x=>String(x.agent_version||'unknown')===currentVersion);const excludedSamples=allPts.length-pts.length;
   const status=document.getElementById('status'),version=document.getElementById('detail-version');
   const clientVersion=String(current?.agent_version||'unknown'),serverVersion=String(latestData.server_version||'dev');
   if(clientVersion!=='unknown'&&clientVersion!=='dev'&&clientVersion===serverVersion){version.className='version-pill ok';version.innerText=`Client / Server v${serverVersion}`}
   else if(clientVersion==='unknown'||clientVersion==='dev'){version.className='version-pill warn';version.innerText=`Client 版本未知 · Server ${serverVersion==='dev'?'dev':`v${serverVersion}`}`}
   else{version.className='version-pill bad';version.innerText=`Client v${clientVersion} · Server v${serverVersion}`}
-  if(current){status.innerHTML=`<span class='source'>${esc(sourceText(runtime))}</span>　最新采样 ${esc(current.timestamp_iso_utc8||'-')}${current.alerts?.stale?'　<span class="bad-text">当前离线或上报已过期</span>':''}`}
+  if(current){status.innerHTML=`<span class='source'>${esc(sourceText(runtime))}</span>　最新采样 ${esc(current.timestamp_iso_utc8||'-')}${excludedSamples?`　已忽略 ${excludedSamples} 条旧版本口径样本`:''}${current.alerts?.stale?'　<span class="bad-text">当前离线或上报已过期</span>':''}`}
   else{status.className='status bad';status.innerText='未找到该容器的当前采样，仅显示保留的历史数据。'}
   const sec=current?.security||{},limit=Number(current?.mem_limit_bytes||0),used=Number(current?.mem_bytes||0),rootTotal=Number(current?.container_fs_root_total_bytes||0),rootAvail=Number(current?.container_fs_root_avail_bytes||0);
   const cards=[['CPU',`${num(current?.cpu_percent)}%`],['内存',`${num(current?.mem_percent)}%`],['内存 已用/总量',`${fmtBytes(used)} / ${fmtBytes(limit)}`],['RX',`${num(mbps(current?.net_rx_bps))} Mbps`],['TX',`${num(mbps(current?.net_tx_bps))} Mbps`],['连接数',Number(current?.conn_count||0)],['进程数',Number(sec.process_count||0)],['有效 CPU',Number(current?.cpu_effective_cpus||0)||'未限制']];

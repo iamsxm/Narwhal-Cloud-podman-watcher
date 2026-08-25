@@ -295,6 +295,8 @@ main() {
   local default_tls_email=""
   local default_tls_cert_mode="auto"
   local default_cloudflare_api_token=""
+  local default_alert_webhook_url=""
+  local default_alert_webhook_min_severity="warning"
 
   default_image_source="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" IMAGE_SOURCE "$default_image_source")"
   default_github_image="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" GITHUB_IMAGE "$default_github_image")"
@@ -305,13 +307,17 @@ main() {
   default_tls_cert_mode="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" TLS_CERT_MODE "$default_tls_cert_mode")"
   default_cloudflare_api_token="$(load_non_empty_or_default "$SERVER_INSTALL_ENV_FILE" CLOUDFLARE_API_TOKEN "$default_cloudflare_api_token")"
 
-  local env_secret env_th
+  local env_secret env_th env_alert_webhook_url env_alert_webhook_min_severity
   env_secret="$(load_kv_from_file "$SERVER_ENV_FILE" SHARED_SECRET || true)"
   env_th="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_DISK_THRESHOLD_PERCENT || true)"
+  env_alert_webhook_url="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_WEBHOOK_URL || true)"
+  env_alert_webhook_min_severity="$(load_kv_from_file "$SERVER_ENV_FILE" ALERT_WEBHOOK_MIN_SEVERITY || true)"
   default_secret="${env_secret:-$default_secret}"
   default_th="${env_th:-$default_th}"
+  default_alert_webhook_url="${env_alert_webhook_url:-$default_alert_webhook_url}"
+  default_alert_webhook_min_severity="${env_alert_webhook_min_severity:-$default_alert_webhook_min_severity}"
 
-  local image_source github_image port secret th tls_enable tls_host tls_email tls_cert_mode cloudflare_api_token caddy_image
+  local image_source github_image port secret th tls_enable tls_host tls_email tls_cert_mode cloudflare_api_token caddy_image alert_webhook_url alert_webhook_min_severity
 
   image_source="$(ask_with_default "Image source [local/github]" "$default_image_source")"
   image_source=$(echo "$image_source" | tr '[:upper:]' '[:lower:]')
@@ -319,6 +325,13 @@ main() {
   port="$(ask_with_default "Server listen port" "$default_port")"
   secret="$(ask_with_default "Shared secret (for client auth)" "$default_secret")"
   th="$(ask_with_default "Disk alert threshold percent" "$default_th")"
+  if [[ "$MODE" == "update" ]]; then
+    alert_webhook_url="$default_alert_webhook_url"
+    alert_webhook_min_severity="$default_alert_webhook_min_severity"
+  else
+    alert_webhook_url="$(ask_with_default "Security alert webhook URL (empty to disable)" "$default_alert_webhook_url")"
+    alert_webhook_min_severity="$(ask_with_default "Webhook minimum severity [warning/critical]" "$default_alert_webhook_min_severity")"
+  fi
   tls_enable="$(ask_with_default "Enable HTTPS reverse proxy [yes/no]" "$default_tls_enable")"
   tls_enable=$(echo "$tls_enable" | tr '[:upper:]' '[:lower:]')
 
@@ -364,6 +377,8 @@ main() {
   cat >"$SERVER_ENV_FILE" <<ENV
 SHARED_SECRET=$secret
 ALERT_DISK_THRESHOLD_PERCENT=$th
+ALERT_WEBHOOK_URL=$alert_webhook_url
+ALERT_WEBHOOK_MIN_SEVERITY=$alert_webhook_min_severity
 DB_PATH=/data/monitor.db
 ENV
 
@@ -428,6 +443,8 @@ Mode: $MODE
 Container Name: $CONTAINER_NAME
 Backend Port: $port
 Shared Secret: $secret
+Security Webhook: ${alert_webhook_url:-disabled}
+Webhook Minimum Severity: $alert_webhook_min_severity
 Disk Alert Threshold: $th%
 Image Source: $image_source
 Env File: $SERVER_ENV_FILE

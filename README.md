@@ -1,16 +1,20 @@
-# Narwhal Cloud Podman Watcher (CS)
+# Narwhal Cloud Container Watcher (CS)
 
-一个轻量级的 **CS 架构 Podman 监控工具**：
+一个轻量级的 **CS 架构多运行时容器监控工具**，可在同一宿主机同时采集 **Podman、Docker 和 Incus 容器**：
 
 - **Server 主控端**：汇总多机容器状态、网络状态与预警，提供 Web 页面。
 - **Client 宿主机 Agent**：以 systemd 服务方式运行在宿主机，按固定间隔采集数据并上报。
 - **通信安全**：`HMAC-SHA256` 共享密钥签名鉴权。
 - **部署方式**：Server 容器化 + Client 宿主机 Agent，支持一键安装与一键更新。
+- **多运行时发现**：默认 `auto` 自动发现全部已安装运行时，也可显式指定组合。
 
-## 新增能力（本次增强）
+## 主要能力
 
-- **一键更新**：`install.sh` 支持 `update` 操作，会先 `git pull --ff-only` 更新仓库（包含 `sh` 脚本本身），再自动重建/重启服务。
-- **自动复用历史配置**：更新模式会自动读取已有 `/opt/narwhal-monitor/*.env` 配置，不再要求重复输入。
+- **Podman / Incus 完整监测**：采集资源、网络、进程、监听端口、运行时暴露信息与安全风险。
+- **Docker 默认仅提醒**：默认只发现 Docker 容器并展示信息提醒，不执行深度检查；可显式切换为完整监测或关闭发现。
+- **节点侧安全检测**：针对 DDoS、CC、扫描、异常出站、可疑进程、危险容器配置和机场面板对接进行检测与预警。
+- **NAT 场景识别**：不依赖 80/443 等固定端口，结合全部监听端口、运行时端口映射、进程、配置与面板域名判断。
+- **一键安装与更新**：`install.sh` 支持安装、更新和卸载；更新会复用 `/opt/narwhal-monitor/*.env` 配置并重建或重启服务。
 - **Server HTTPS 自动化**：支持自动拉起 Caddy 反向代理：
   - 域名场景：自动申请公网证书（ACME HTTP-01）。
   - Cloudflare 域名场景：支持 DNS Challenge（可橙云），自动签发并续期公网证书。
@@ -18,66 +22,264 @@
 
 > 注意：IP 场景下的内部证书不是公网 CA 证书，浏览器默认可能提示不受信任；如需“绿锁”建议使用域名。
 
-## 快速安装
+## 部署、更新与卸载
 
-> 适用环境：Debian / Ubuntu（脚本使用 `apt-get` 自动补齐依赖）
+### 支持环境与部署方式
 
-### 1) 克隆仓库
+- 自动安装脚本面向 Debian / Ubuntu，依赖安装使用 `apt-get`，需要 root 权限。
+- Server 部署为 Podman 容器；Client 部署为宿主机 systemd Agent。
+- 推荐先在主控机部署一个 Server，再在每台客户节点部署 Client。Server 和 Client 可以安装在同一台机器，但生产环境通常分开部署。
+- Client 节点应已安装需要监测的 Podman 或 Incus。若 Podman、Docker、Incus 均不存在，安装器会安装 Podman；安装器不会自动初始化 Incus。
+- Server 与所有 Client 必须使用相同的 `SHARED_SECRET`。生产环境建议通过 HTTPS 上报，并妥善保存密钥。
+
+### 首次部署
+
+方式一：直接执行引导脚本。脚本会把仓库克隆到 `/opt/Narwhal-Cloud-podman-watcher`；目录已经存在时会以 fast-forward 方式更新，然后进入交互式安装器。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/podcctv/Narwhal-Cloud-podman-watcher/main/scripts/bootstrap-install.sh \
+  -o /tmp/narwhal-bootstrap-install.sh
+sudo bash /tmp/narwhal-bootstrap-install.sh
+```
+
+方式二：手动克隆后安装。
 
 ```bash
 git clone https://github.com/podcctv/Narwhal-Cloud-podman-watcher.git
 cd Narwhal-Cloud-podman-watcher
-```
-
-### 2) 运行一键安装/更新器
-
-```bash
 sudo bash scripts/install.sh
 ```
 
-脚本会自动：
-- 检查并安装依赖：`podman` / `git` / `curl`
-- 选择操作：`install` 或 `update`
-- 选择目标：`server` / `client` / `both`
+安装 Server 时依次选择：
 
-### 3) 真·单命令安装（无需手动 clone）
+1. 操作选择 `install`。
+2. 目标选择 `server`；同机安装两端时选择 `both`。
+3. “是否删除 Server 已有全部采集数据”首次安装可保持默认 `no`；已有数据时选择 `yes` 会清空数据库。
+4. 记录输入的共享密钥、访问地址和端口。镜像来源可选 `local` 本地构建，或 `github` 拉取镜像；拉取失败时会回退到本地构建。
+5. 按需配置 Caddy HTTPS 与告警 Webhook。公网部署建议启用 HTTPS。
+
+安装每台 Client 时依次选择：
+
+1. 操作选择 `install`，目标选择 `client`。
+2. `Server URL` 填写 Server 的完整地址，例如 `https://monitor.example.com` 或 `http://10.0.0.2:8080`。
+3. `Shared secret` 必须与 Server 完全一致；`Host ID` 必须在所有节点中唯一。
+4. 运行时建议保留 `auto`。Podman 与 Incus 默认完整监测；Docker 默认仅发现并提醒，不做深度扫描。
+5. `Allowed airport panel domains` 填写允许对接的面板域名，多个域名用英文逗号分隔；留空表示不允许任何外部面板域名。
+
+首次部署后的检查命令：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/podcctv/Narwhal-Cloud-podman-watcher/main/scripts/bootstrap-install.sh -o /tmp/narwhal-bootstrap-install.sh
-sudo bash /tmp/narwhal-bootstrap-install.sh
+# Server 主控机
+sudo podman ps --filter name=narwhal-monitor-server
+sudo podman logs --tail 100 narwhal-monitor-server
+
+# Client 节点
+sudo systemctl status narwhal-monitor-client --no-pager
+sudo journalctl -u narwhal-monitor-client -n 100 --no-pager
 ```
 
-## 交互式参数（首次 install）
+Server 默认监听 `http://SERVER_IP:8080/`；启用 Caddy 后使用配置的 HTTPS 地址访问。Client 日志持续出现 `reported ... containers` 表示上报成功。
 
-### Server
+### 更新现有部署
 
-- 镜像来源（`local` / `github`）
-- GitHub 镜像地址
-- 后端监听端口（Server 容器内部服务绑定到宿主机端口）
-- 共享密钥
-- 磁盘告警阈值
-- 是否启用 HTTPS 反代（Caddy）
-- TLS Host（域名或 IP）
-- TLS Email（域名证书可选）
-- TLS 证书模式（`auto` / `internal` / `cloudflare_dns`）
-- Cloudflare API Token（当选择 `cloudflare_dns` 时必填，需具备 Zone DNS Edit 权限）
+在之前克隆的仓库目录执行；如果首次使用的是其他目录，请替换下面的 `cd` 路径：
 
-### Client
+```bash
+cd /opt/Narwhal-Cloud-podman-watcher
+sudo bash scripts/install.sh
+```
 
-- Server URL（建议 `https://...`）
-- 共享密钥
-- Host ID
-- 上报间隔
+依次选择 `update`，再选择 `server`、`client` 或 `both`。更新流程会：
 
-## update 模式行为
+- 执行 `git fetch --all --prune` 和 `git pull --ff-only`，不会强制覆盖本地提交或冲突修改。
+- 复用 `/opt/narwhal-monitor/server.env`、`server-install.env`、`client.env` 和 `client-install.env` 中的现有配置。
+- 重新构建或拉取 Server 镜像并重建容器；更新 Client 代码和 Python 依赖后重启 systemd 服务。
+- 默认保留 Server 历史数据库。脚本询问是否初始化数据库时必须选择 `no`；选择 `yes` 会永久清空历史采集和告警数据。
+- 默认执行 Podman 未使用容器、镜像、卷、网络及 apt 无用依赖清理。宿主机同时承载其他业务时，建议使用下面的安全更新命令跳过全局清理：
 
-- 自动执行仓库更新（`git fetch` + `git pull --ff-only`）。
-- 自动读取并复用配置：
-  - Server: `/opt/narwhal-monitor/server.env` + `/opt/narwhal-monitor/server-install.env`
-  - Client: `/opt/narwhal-monitor/client.env` + `/opt/narwhal-monitor/client-install.env`
-- 自动重建/重启服务（Server 容器 / Client systemd Agent），无需重新输入历史参数。
-- 默认自动清理无用资源（旧镜像、未使用容器/网络/卷、apt 缓存与无用依赖），缓解磁盘空间压力。
-  - 如需跳过：运行前设置 `SKIP_CLEANUP_ON_UPDATE=1`。
+```bash
+sudo env SKIP_CLEANUP_ON_UPDATE=1 bash scripts/install.sh
+```
+
+也可以再次执行引导脚本，它会先更新 `/opt/Narwhal-Cloud-podman-watcher`，再打开相同的安装/更新菜单。
+
+更新完成后，用首次部署后的检查命令确认 Server 与 Client 正常运行。若 `git pull --ff-only` 报错，请先处理仓库中的本地修改或分支分叉，不要使用会覆盖配置或代码的强制重置命令。
+
+### 卸载
+
+> **警告：卸载不可撤销。** 卸载器会停止并删除本项目 Server/Caddy 容器、Client systemd 服务、项目镜像，并递归删除 `/opt/narwhal-monitor`。该目录包含 Server SQLite 数据库、Client/Server 配置、共享密钥和 Agent 虚拟环境。需要保留历史时必须先备份。
+
+备份示例：
+
+```bash
+sudo tar -C /opt -czf "/root/narwhal-monitor-backup-$(date +%F-%H%M%S).tar.gz" narwhal-monitor
+```
+
+执行卸载：
+
+```bash
+cd /opt/Narwhal-Cloud-podman-watcher
+sudo bash scripts/install.sh
+```
+
+在菜单中选择 `uninstall`。卸载作用于当前宿主机上已经安装的本项目组件；Server 与各 Client 位于不同机器时，需要分别登录每台机器执行。卸载不会删除仓库目录、Podman/Incus/Docker 本身，也不会停止或删除客户的业务容器。
+
+卸载后可验证：
+
+```bash
+sudo systemctl status narwhal-monitor-client --no-pager || true
+sudo podman ps -a --filter name=narwhal-monitor
+sudo test ! -e /opt/narwhal-monitor && echo "Narwhal data/config removed"
+```
+
+如确认不再需要源码，可在卸载完成后自行删除 `/opt/Narwhal-Cloud-podman-watcher`；安装器不会自动删除 Git 仓库。
+
+### 仅操作单端
+
+已在仓库目录内时，可直接调用单端安装器：
+
+```bash
+# 首次安装
+sudo bash scripts/install-server.sh install
+sudo bash scripts/install-client.sh install
+
+# 更新并复用已有配置
+sudo bash scripts/install-server.sh update
+sudo bash scripts/install-client.sh update
+```
+
+直接运行单端 `update` 不会自动执行 `git pull`，请先自行更新仓库。完整卸载统一通过 `scripts/install.sh` 的 `uninstall` 菜单执行。
+
+### 安装配置位置
+
+| 内容 | 路径 |
+| --- | --- |
+| Server 运行配置 | `/opt/narwhal-monitor/server.env` |
+| Server 安装参数 | `/opt/narwhal-monitor/server-install.env` |
+| Server SQLite 数据 | `/opt/narwhal-monitor/server-data/monitor.db` |
+| Client 运行配置 | `/opt/narwhal-monitor/client.env` |
+| Client 安装参数 | `/opt/narwhal-monitor/client-install.env` |
+| Client Agent 与虚拟环境 | `/opt/narwhal-monitor/client-agent` |
+| Client systemd 单元 | `/etc/systemd/system/narwhal-monitor-client.service` |
+| Caddy 配置与证书数据 | `/opt/narwhal-monitor/caddy` |
+
+### 首次安装交互参数
+
+Server 参数：
+
+- 镜像来源（`local` / `github`）与 GitHub 镜像地址
+- 后端监听端口、共享密钥、磁盘告警阈值
+- HTTPS 反代开关、TLS Host、TLS Email 与证书模式（`auto` / `internal` / `cloudflare_dns`）
+- Cloudflare API Token（选择 `cloudflare_dns` 时必填，需要 Zone DNS Edit 权限）
+- 安全告警 Webhook URL 与最低告警级别
+
+Client 参数：
+
+- Server URL、共享密钥、唯一 Host ID 与上报间隔
+- 容器运行时（`auto` 或 `podman,docker,incus` 的任意组合）
+- Podman/Docker 镜像过滤规则、Incus 实例名/镜像过滤规则与项目名
+- DDoS/CC/滥用/扫描监测开关、访问日志路径与机场面板域名白名单
+
+Client 配置写入 `/opt/narwhal-monitor/client.env`：
+
+```dotenv
+CONTAINER_RUNTIMES=auto
+DOCKER_MONITOR_MODE=notice
+MONITORED_IMAGE_PATTERNS=*
+MONITORED_INCUS_PATTERNS=*
+INCUS_PROJECT=default
+```
+
+`auto` 会发现主机上可用的 Podman、Docker、Incus。Podman 和 Incus 默认做完整采集，两个过滤项默认都是 `*`，所以其中的 Xboard、xboard-node、Nginx/Caddy、数据库及其他运行中容器都会进入监测；只有明确需要缩小范围时才改成镜像或实例名关键字。Incus 虚拟机不在本项目的容器采集范围内。
+
+Docker 默认采用 `notice`：只枚举容器并在仪表盘产生信息提醒，不执行 `inspect/stats/exec`、日志读取或安全判断。可改为 `full` 启用与 Podman 相同的完整监测，或改为 `off` 完全忽略。信息级 Docker 提醒默认不会触发 `warning` 级别的 Webhook；需要推送时把 Server 的 `ALERT_WEBHOOK_MIN_SEVERITY` 改为 `info`。
+
+Incus 的 CPU 与网络速度由累计指标的相邻采样差值计算，因此 Agent 启动后的第一次上报可能暂时为 0；从第二次采样起会得到区间值。内存、连接数、磁盘和进程信息仍会在首次采样采集。
+
+## DDoS / CC / 滥用 / 扫描监测与预警
+
+所有安全监测都在节点宿主机执行，不会向远端 Xboard 发起额外探测。Agent 会对 Podman 和 Incus 容器执行完整采集，无论其中运行的是 Xboard 面板、xboard-node、协议服务、反向代理还是其他组件，都会检查其网络命名空间、连接、进程和配置线索。Docker 默认只枚举并提醒，不进入容器、不读取日志且不做安全判断；只有将 `DOCKER_MONITOR_MODE=full` 后才执行同类深度采集。
+
+安全监测默认启用，作用是**发现并告警**，不会自动封禁 IP 或修改防火墙：
+
+- **流量型 DDoS**：容器入站 B/s、入站 pps 超阈值。
+- **SYN Flood**：容器网络命名空间中 `SYN_RECV` 数量超阈值。
+- **HTTP/CC**：Nginx combined 或 Caddy JSON 访问日志中的总 RPS、单 IP RPS、4xx 比例超阈值。
+- **扫描**：同一来源在采样时刻同时触达的本地端口数超阈值，或访问日志命中敏感 Web 路径探测规则。
+- **滥用**：容器出站连接外部 IP 扇出过大、SMTP/Telnet/SMB/IRC 等敏感端口连接过多，或单 IP 产生大量 401/403/429。
+- **疑似恶意程序**：Podman/Incus 容器进程命令命中可配置的高风险挖矿木马、僵尸网络或入侵工具特征。
+- **连接行为**：主动 TCP 建连速率、TCP 连接失败速率和 UDP 出站数据报速率异常，辅助发现端口扫描、撞库代理、反射流量与僵尸网络活动。
+- **出站流量**：TX B/s 和 TX pps 超阈值，辅助发现代理滥用、数据外传和对外攻击。
+- **隔离配置审计**：Podman privileged、高风险 capabilities、宿主机命名空间/敏感目录挂载，以及 Incus `security.privileged`、`security.nesting`、`raw.*` 和宿主机设备暴露。
+- **进程风暴**：通过容器 cgroup 的 `pids.current` 检测进程数异常，辅助发现 fork bomb、批量任务和失控脚本。
+- **机场面板对接**：识别 Xboard-Node、XrayR、V2bX、Soga 等节点程序，以及 `ApiHost/ApiKey/NodeID`、`panel.url/token/node_id` 等配置特征；只上报面板域名和命中特征，不上报 API Key、Token 或配置正文。
+
+Client 默认阈值位于 `/opt/narwhal-monitor/client.env`：
+
+```dotenv
+SECURITY_MONITOR_ENABLED=true
+SECURITY_ACCESS_LOG_PATHS=/var/log/nginx/access.log,/var/log/caddy/access.log
+SECURITY_CONTAINER_ACCESS_LOG_PATHS=/var/log/nginx/access.log,/var/log/caddy/access.log
+SECURITY_ACCESS_LOG_MAX_BYTES=1048576
+
+ALERT_DDOS_RX_BPS=100000000
+ALERT_DDOS_RX_PPS=50000
+ALERT_DDOS_SYN_RECV=200
+ALERT_CC_TOTAL_RPS=100
+ALERT_CC_IP_RPS=30
+ALERT_CC_4XX_RATE=0.5
+ALERT_CC_MIN_REQUESTS=50
+ALERT_SCAN_UNIQUE_PORTS=20
+ALERT_ABUSE_OUTBOUND_UNIQUE_IPS=200
+ALERT_ABUSE_SUSPICIOUS_CONNECTIONS=20
+ALERT_ABUSE_TX_BPS=100000000
+ALERT_ABUSE_TX_PPS=50000
+ALERT_ABUSE_TCP_OPENS_PER_SEC=200
+ALERT_ABUSE_TCP_FAILS_PER_SEC=50
+ALERT_ABUSE_UDP_OUT_PER_SEC=10000
+ALERT_ABUSE_PROCESS_COUNT=500
+SECURITY_CONFIG_AUDIT_ENABLED=true
+SECURITY_SUSPICIOUS_OUTBOUND_PORTS=25,465,587,23,445,6667
+SECURITY_WEB_SCAN_PATTERNS=.env,.git,wp-login,wp-admin,phpmyadmin,actuator,server-status,cgi-bin,vendor/phpunit,etc/passwd,boaform,hnap1
+SECURITY_SUSPICIOUS_PROCESS_PATTERNS=xmrig,kinsing,kdevtmpfsi,watchbog,cryptonight,minerd,pwnrig,teamtnt,stratum+tcp,stratum+ssl,/dev/tcp/,nc -e,ncat -e,socat exec:,mkfifo /tmp
+SECURITY_PANEL_PAIRING_DETECTION_ENABLED=true
+SECURITY_ALLOWED_PANEL_DOMAINS=
+SECURITY_PANEL_PROCESS_PATTERNS=xboard-node,xrayr,v2bx,soga,sspanel-uim-node
+SECURITY_PANEL_CONFIG_PATHS=/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml
+ALERT_WEB_SCAN_REQUESTS=10
+ALERT_AUTH_FAILURES_PER_IP=20
+```
+
+Agent 会同时读取宿主机 `SECURITY_ACCESS_LOG_PATHS`，并通过对应的 Podman/Docker/Incus 运行时进入每个容器读取 `SECURITY_CONTAINER_ACCESS_LOG_PATHS`。因此面板或反代日志既可以位于宿主机，也可以只存在于容器内部；文件不存在的容器会自动跳过。也可以把容器日志只读挂载到宿主机后，仅保留宿主机路径。日志不可读时网络层检测仍正常运行，但该容器不会产生 HTTP/CC 日志告警。
+
+`SECURITY_ALLOWED_PANEL_DOMAINS` 是允许对接的面板域名白名单，支持父域匹配，例如配置 `example.com` 会允许 `panel.example.com`，但不会允许 `example.com.evil.test`。默认留空表示没有允许的第三方面板；发现明确面板域名时产生 critical 告警，只发现节点程序或配置特征但无法提取域名时产生 warning。检测过程不会把配置文件正文、API Key 或 Token 写入上报数据。
+
+机场面板/节点识别**不假设 80、443 或任何固定端口**。Agent 会枚举容器网络命名空间中的全部 TCP 监听端口，并展示 Podman publish 以及 Incus proxy device 中可见的外部端口到内部端口映射；公网 NAT 端口与容器端口可以完全不同。由宿主机自定义 nftables/iptables、上游路由器或云厂商实现且没有运行时元数据的 DNAT 无法可靠归属到具体容器，此时仍通过进程、配置文件、环境变量和面板域名判断是否存在机场对接。
+Agent 启动时会把现有日志位置记为基线，只统计之后追加的新请求，避免把历史日志误判为当前攻击。
+如果面板经过 Cloudflare/CDN/上游代理，请先在 Caddy 配置 `trusted_proxies`，或在 Nginx 配置 real IP 模块并让日志记录真实客户端地址；否则“单 IP CC”看到的可能只是代理节点地址。
+
+Server 的 `/opt/narwhal-monitor/server.env` 可配置：
+
+```dotenv
+ALERT_WEBHOOK_URL=https://example.com/your-webhook
+ALERT_WEBHOOK_MIN_SEVERITY=warning
+```
+
+Webhook 仅在告警首次出现、级别升级或恢复后再次出现时发送，正文格式为：
+
+```json
+{"event":"narwhal.security_alert","alert":{"host_id":"host-1","type":"ddos_packets","severity":"warning","message":"..."}}
+```
+
+活动告警可在总览页面查看，也可查询：
+
+```bash
+curl -s http://127.0.0.1:8080/api/v1/security/alerts | jq
+curl -s 'http://127.0.0.1:8080/api/v1/security/alerts?active_only=false&limit=200' | jq
+curl -s http://127.0.0.1:8080/api/v1/security/status | jq
+```
+
+> 阈值必须按机器带宽、正常高峰 RPS 和业务连接模型校准。配置风险仅告警，不会自动修改 Incus/Podman 配置或封禁流量。扫描检测基于内核累计计数器与采样时仍存在的 socket，是轻量级异常检测；如果需要逐次 `execve/connect/open` 事件、反弹 Shell、落地新二进制和容器逃逸检测，应在节点额外部署 Falco/eBPF 运行时安全组件。“滥用”表示行为异常线索，最终定性仍需结合供应商投诉、认证日志和业务审计。
 
 ## HTTPS 配置指引（两种公网证书方式）
 
@@ -147,19 +349,29 @@ sudo journalctl -u narwhal-monitor-client -n 120 --no-pager
 - `reported X containers to ...`（上报成功）
 - `report failed: ...`（上报失败，优先处理网络/证书/签名）
 
-### 2) 在 Client 宿主机直接验证 Podman 原始采集
+### 2) 在 Client 宿主机直接验证容器原始采集
 
 ```bash
 podman ps --format '{{.ID}}|{{.Names}}|{{.Image}}'
 podman stats --no-stream --format json <容器名>
 podman stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}' <容器名>
 podman inspect <容器名> --format '{{.State.Pid}}'
+
+docker ps --format '{{.ID}}|{{.Names}}|{{.Image}}'
+docker stats --no-stream --format json <容器名>
+docker inspect <容器名> --format '{{.State.Pid}}'
+
+incus list type=container status=running --format json
+incus query /1.0/metrics | grep 'name="<容器名>"'
+incus query /1.0/instances/<容器名>/state
 ```
 
 可直接用仓库脚本对**单个容器**做与 Agent 同口径的排查（例如你机器上的 `fuckip-agent`）：
 
 ```bash
 sudo bash scripts/query-single-container.sh fuckip-agent
+sudo bash scripts/query-single-container.sh fuckip-agent docker
+sudo bash scripts/query-single-container.sh my-incus-container incus
 ```
 
 判断标准：
@@ -177,7 +389,7 @@ curl -s http://127.0.0.1:8080/api/v1/latest | jq '.items[] | {host_id,container_
 ### 4) 直接查数据库，确认是否入库为 0
 
 ```bash
-sqlite3 /opt/narwhal-monitor/data/monitor.db "
+sqlite3 /opt/narwhal-monitor/server-data/monitor.db "
 SELECT host_id, container_name, cpu_percent, net_rx_bps, net_tx_bps, conn_count, ts
 FROM reports
 ORDER BY id DESC
@@ -204,27 +416,17 @@ sudo bash scripts/collect-podman-raw.sh
 - 容器内当前 CPU 占用最高进程（PID / CPU% / 命令）
 - 离线容器生命周期管理：离线后默认保留 1 天并标记离线时长（按小时刷新），超过 1 天默认隐藏，超过 30 天自动删除历史数据
 - 指定磁盘文件容量与挂载点使用率
-- Podman 网络健康（IPv4 / IPv6）
-
-## 仅安装单端（可选）
-
-```bash
-sudo bash scripts/install-server.sh install
-sudo bash scripts/install-client.sh install
-```
-
-仅更新单端（复用已有配置）：
-
-```bash
-sudo bash scripts/install-server.sh update
-sudo bash scripts/install-client.sh update
-```
+- 容器网络健康（IPv4 / IPv6，跨 Podman/Docker/Incus 探测）
+- 运行时与 Incus 项目维度，支持同主机同名容器隔离展示和历史统计
+- DDoS、SYN Flood、HTTP/CC、端口扫描及出站滥用监测
+- 告警去重、自动恢复、历史查询与可选 Webhook 通知
 
 ## 容器权限说明
 
 Server 为容器化部署，Client 改为宿主机 Agent（systemd）部署。
 
-Client Agent 默认以 root 运行，直接读取宿主机 Podman 信息（无需 docker/podman in podman）。
+Client Agent 默认以 root 运行，直接通过宿主机 Podman、Docker、Incus CLI/socket 读取信息（无需嵌套运行容器引擎）。
+Docker 需要可访问 Docker daemon；Incus 需要已完成 `incus admin init`（或连接到可用 remote）且 root 能访问目标项目。
 如需进一步收敛权限，可在 Agent 中改为最小权限用户 + sudoers 精细授权。
 
 ## 架构选型建议（1G Server / <20 台设备）

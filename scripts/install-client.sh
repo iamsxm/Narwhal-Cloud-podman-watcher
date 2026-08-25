@@ -69,8 +69,11 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exit 1
 fi
 
-if ! command -v podman >/dev/null 2>&1; then
-  echo "Installing podman..."
+if ! command -v podman >/dev/null 2>&1 \
+  && ! command -v podman-remote >/dev/null 2>&1 \
+  && ! command -v docker >/dev/null 2>&1 \
+  && ! command -v incus >/dev/null 2>&1; then
+  echo "No supported runtime found; installing podman as the default runtime..."
   apt-get update
   apt-get install -y podman
 fi
@@ -124,13 +127,55 @@ default_server_url="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SERVER_URL "h
 default_secret="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SHARED_SECRET "$(generate_secret)")"
 default_host_id="$(load_non_empty_or_default "$CLIENT_ENV_FILE" HOST_ID "$(hostname)")"
 default_interval="$(load_non_empty_or_default "$CLIENT_ENV_FILE" REPORT_INTERVAL "300")"
-default_monitored_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" MONITORED_IMAGE_PATTERNS "docker.io/narwhalcloud/debian,docker.io/library/alpine,alpine,sing-box,vpn")"
+default_runtimes="$(load_non_empty_or_default "$CLIENT_ENV_FILE" CONTAINER_RUNTIMES "auto")"
+default_docker_monitor_mode="$(load_non_empty_or_default "$CLIENT_ENV_FILE" DOCKER_MONITOR_MODE "notice")"
+default_monitored_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" MONITORED_IMAGE_PATTERNS "*")"
+default_monitored_incus_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" MONITORED_INCUS_PATTERNS "*")"
+default_incus_project="$(load_non_empty_or_default "$CLIENT_ENV_FILE" INCUS_PROJECT "default")"
+default_security_enabled="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_MONITOR_ENABLED "true")"
+default_access_log_paths="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_ACCESS_LOG_PATHS "/var/log/nginx/access.log,/var/log/caddy/access.log")"
+default_container_access_log_paths="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_CONTAINER_ACCESS_LOG_PATHS "/var/log/nginx/access.log,/var/log/caddy/access.log")"
+ddos_rx_bps="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_DDOS_RX_BPS "100000000")"
+ddos_rx_pps="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_DDOS_RX_PPS "50000")"
+ddos_syn_recv="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_DDOS_SYN_RECV "200")"
+cc_total_rps="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_CC_TOTAL_RPS "100")"
+cc_ip_rps="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_CC_IP_RPS "30")"
+cc_4xx_rate="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_CC_4XX_RATE "0.5")"
+cc_min_requests="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_CC_MIN_REQUESTS "50")"
+scan_unique_ports="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_SCAN_UNIQUE_PORTS "20")"
+abuse_unique_ips="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_ABUSE_OUTBOUND_UNIQUE_IPS "200")"
+abuse_suspicious="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_ABUSE_SUSPICIOUS_CONNECTIONS "20")"
+abuse_tx_bps="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_ABUSE_TX_BPS "100000000")"
+abuse_tx_pps="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_ABUSE_TX_PPS "50000")"
+abuse_tcp_opens="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_ABUSE_TCP_OPENS_PER_SEC "200")"
+abuse_tcp_fails="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_ABUSE_TCP_FAILS_PER_SEC "50")"
+abuse_udp_out="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_ABUSE_UDP_OUT_PER_SEC "10000")"
+abuse_process_count="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_ABUSE_PROCESS_COUNT "500")"
+config_audit_enabled="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_CONFIG_AUDIT_ENABLED "true")"
+suspicious_ports="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_SUSPICIOUS_OUTBOUND_PORTS "25,465,587,23,445,6667")"
+access_log_max_bytes="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_ACCESS_LOG_MAX_BYTES "1048576")"
+web_scan_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_WEB_SCAN_PATTERNS ".env,.git,wp-login,wp-admin,phpmyadmin,actuator,server-status,cgi-bin,vendor/phpunit,etc/passwd,boaform,hnap1")"
+web_scan_requests="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_WEB_SCAN_REQUESTS "10")"
+auth_failures_per_ip="$(load_non_empty_or_default "$CLIENT_ENV_FILE" ALERT_AUTH_FAILURES_PER_IP "20")"
+suspicious_process_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_SUSPICIOUS_PROCESS_PATTERNS "xmrig,kinsing,kdevtmpfsi,watchbog,cryptonight,minerd,pwnrig,teamtnt,stratum+tcp,stratum+ssl,/dev/tcp/,nc -e,ncat -e,socat exec:,mkfifo /tmp")"
+panel_detection_enabled="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_PANEL_PAIRING_DETECTION_ENABLED "true")"
+default_allowed_panel_domains="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_ALLOWED_PANEL_DOMAINS "")"
+panel_process_patterns="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_PANEL_PROCESS_PATTERNS "xboard-node,xrayr,v2bx,soga,sspanel-uim-node")"
+panel_config_paths="$(load_non_empty_or_default "$CLIENT_ENV_FILE" SECURITY_PANEL_CONFIG_PATHS "/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml")"
 
 server_url="$(ask_with_default "Server URL (e.g. https://server.example.com or https://1.2.3.4)" "$default_server_url")"
 secret="$(ask_with_default "Shared secret" "$default_secret")"
 host_id="$(ask_with_default "Host ID" "$default_host_id")"
 interval="$(ask_with_default "Collect interval seconds" "$default_interval")"
-monitored_patterns="$(ask_with_default "Monitored image patterns (comma-separated substring match)" "$default_monitored_patterns")"
+runtimes="$(ask_with_default "Container runtimes (auto or comma-separated podman,docker,incus)" "$default_runtimes")"
+docker_monitor_mode="$(ask_with_default "Docker handling (notice/full/off)" "$default_docker_monitor_mode")"
+monitored_patterns="$(ask_with_default "Podman/Docker image patterns (comma-separated substring match)" "$default_monitored_patterns")"
+monitored_incus_patterns="$(ask_with_default "Incus name/image patterns (* for all)" "$default_monitored_incus_patterns")"
+incus_project="$(ask_with_default "Incus project" "$default_incus_project")"
+security_enabled="$(ask_with_default "Enable DDoS/CC/abuse/scan monitoring [true/false]" "$default_security_enabled")"
+access_log_paths="$(ask_with_default "Nginx/Caddy access log paths (comma-separated)" "$default_access_log_paths")"
+container_access_log_paths="$(ask_with_default "Access log paths inside every container (comma-separated)" "$default_container_access_log_paths")"
+allowed_panel_domains="$(ask_with_default "Allowed airport panel domains (comma-separated; empty means none)" "$default_allowed_panel_domains")"
 
 mkdir -p /opt/narwhal-monitor
 cat >"$CLIENT_ENV_FILE" <<ENV
@@ -139,7 +184,41 @@ SHARED_SECRET=$secret
 HOST_ID=$host_id
 REPORT_INTERVAL=$interval
 WATCH_DISK_FILE=/xfs_disk.img
+CONTAINER_RUNTIMES=$runtimes
+DOCKER_MONITOR_MODE=$docker_monitor_mode
 MONITORED_IMAGE_PATTERNS=$monitored_patterns
+MONITORED_INCUS_PATTERNS=$monitored_incus_patterns
+INCUS_PROJECT=$incus_project
+SECURITY_MONITOR_ENABLED=$security_enabled
+SECURITY_ACCESS_LOG_PATHS=$access_log_paths
+SECURITY_CONTAINER_ACCESS_LOG_PATHS=$container_access_log_paths
+ALERT_DDOS_RX_BPS=$ddos_rx_bps
+ALERT_DDOS_RX_PPS=$ddos_rx_pps
+ALERT_DDOS_SYN_RECV=$ddos_syn_recv
+ALERT_CC_TOTAL_RPS=$cc_total_rps
+ALERT_CC_IP_RPS=$cc_ip_rps
+ALERT_CC_4XX_RATE=$cc_4xx_rate
+ALERT_CC_MIN_REQUESTS=$cc_min_requests
+ALERT_SCAN_UNIQUE_PORTS=$scan_unique_ports
+ALERT_ABUSE_OUTBOUND_UNIQUE_IPS=$abuse_unique_ips
+ALERT_ABUSE_SUSPICIOUS_CONNECTIONS=$abuse_suspicious
+ALERT_ABUSE_TX_BPS=$abuse_tx_bps
+ALERT_ABUSE_TX_PPS=$abuse_tx_pps
+ALERT_ABUSE_TCP_OPENS_PER_SEC=$abuse_tcp_opens
+ALERT_ABUSE_TCP_FAILS_PER_SEC=$abuse_tcp_fails
+ALERT_ABUSE_UDP_OUT_PER_SEC=$abuse_udp_out
+ALERT_ABUSE_PROCESS_COUNT=$abuse_process_count
+SECURITY_CONFIG_AUDIT_ENABLED=$config_audit_enabled
+SECURITY_SUSPICIOUS_OUTBOUND_PORTS=$suspicious_ports
+SECURITY_ACCESS_LOG_MAX_BYTES=$access_log_max_bytes
+SECURITY_WEB_SCAN_PATTERNS=$web_scan_patterns
+ALERT_WEB_SCAN_REQUESTS=$web_scan_requests
+ALERT_AUTH_FAILURES_PER_IP=$auth_failures_per_ip
+SECURITY_SUSPICIOUS_PROCESS_PATTERNS=$suspicious_process_patterns
+SECURITY_PANEL_PAIRING_DETECTION_ENABLED=$panel_detection_enabled
+SECURITY_ALLOWED_PANEL_DOMAINS=$allowed_panel_domains
+SECURITY_PANEL_PROCESS_PATTERNS=$panel_process_patterns
+SECURITY_PANEL_CONFIG_PATHS=$panel_config_paths
 ENV
 
 cat >"$CLIENT_INSTALL_ENV_FILE" <<ENV
@@ -149,6 +228,7 @@ ENV
 
 # 为兼容旧版本，先尝试删除原容器化 client。
 podman rm -f narwhal-monitor-client >/dev/null 2>&1 || true
+docker rm -f narwhal-monitor-client >/dev/null 2>&1 || true
 
 mkdir -p "$CLIENT_APP_DIR"
 cp "$ROOT_DIR/client/agent.py" "$CLIENT_APP_DIR/agent.py"
@@ -194,7 +274,14 @@ Host ID: $host_id
 Report Interval: $interval s
 Watch Disk File: /xfs_disk.img
 Monitored Image Patterns: $monitored_patterns
-Podman Socket: /run/podman/podman.sock (auto-detected by agent)
+Monitored Incus Patterns: $monitored_incus_patterns
+Container Runtimes: $runtimes
+Docker Handling: $docker_monitor_mode
+Incus Project: $incus_project
+Runtime Access: host CLI/socket (auto-detected by agent)
+Security Monitoring: $security_enabled
+Access Logs: $access_log_paths
+Container Access Logs: $container_access_log_paths
 Env File: $CLIENT_ENV_FILE
 Install Config: $CLIENT_INSTALL_ENV_FILE
 Agent Directory: $CLIENT_APP_DIR

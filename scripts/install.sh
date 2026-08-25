@@ -24,11 +24,10 @@ ensure_cmd() {
 
 install_deps() {
   if ! command -v apt-get >/dev/null 2>&1; then
-    echo "[ERROR] 仅支持 Debian/Ubuntu (apt-get) 自动安装依赖，请手动安装 podman/git/curl 后重试。"
+    echo "[ERROR] 仅支持 Debian/Ubuntu (apt-get) 自动安装依赖，请手动安装 git/curl 和所需容器运行时后重试。"
     exit 1
   fi
 
-  ensure_cmd podman podman
   ensure_cmd git git
   ensure_cmd curl curl
 }

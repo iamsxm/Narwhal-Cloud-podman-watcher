@@ -1,9 +1,10 @@
-import hmac
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
@@ -18,6 +19,8 @@ ALERT_CONN_THRESHOLD = int(os.getenv("ALERT_CONN_THRESHOLD", "500"))
 STALE_SECONDS = int(os.getenv("STALE_SECONDS", "900"))
 OFFLINE_HIDE_SECONDS = int(os.getenv("OFFLINE_HIDE_SECONDS", str(24 * 3600)))
 PURGE_SECONDS = int(os.getenv("PURGE_SECONDS", str(30 * 24 * 3600)))
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+ALERT_WEBHOOK_MIN_SEVERITY = os.getenv("ALERT_WEBHOOK_MIN_SEVERITY", "warning").strip().lower()
 UTC8 = timezone(timedelta(hours=8))
 
 
@@ -25,7 +28,7 @@ def format_utc8(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=UTC8).strftime("%Y-%m-%d %H:%M:%S")
 
 
-app = FastAPI(title="Narwhal Podman Monitor")
+app = FastAPI(title="Narwhal Container Monitor")
 
 
 def db() -> sqlite3.Connection:
@@ -42,6 +45,8 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             host_id TEXT NOT NULL,
             container_name TEXT NOT NULL,
+            runtime TEXT NOT NULL DEFAULT 'podman',
+            project TEXT NOT NULL DEFAULT '',
             cpu_percent REAL NOT NULL,
             mem_bytes INTEGER NOT NULL,
             mem_percent REAL NOT NULL DEFAULT 0,
@@ -58,12 +63,50 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_reports_host_ts ON reports(host_id, ts);
         CREATE INDEX IF NOT EXISTS idx_reports_host_container_ts ON reports(host_id, container_name, ts);
+        CREATE TABLE IF NOT EXISTS security_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint TEXT NOT NULL UNIQUE,
+            host_id TEXT NOT NULL,
+            runtime TEXT NOT NULL DEFAULT '',
+            project TEXT NOT NULL DEFAULT '',
+            container_name TEXT NOT NULL DEFAULT '',
+            alert_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            value REAL NOT NULL DEFAULT 0,
+            threshold REAL NOT NULL DEFAULT 0,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'active',
+            details_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_security_alerts_status_last_seen
+            ON security_alerts(status, last_seen);
+        CREATE INDEX IF NOT EXISTS idx_security_alerts_host_last_seen
+            ON security_alerts(host_id, last_seen);
+        CREATE TABLE IF NOT EXISTS host_security (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_id TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_host_security_host_ts ON host_security(host_id, ts);
         """
     )
     cols = conn.execute("PRAGMA table_info(reports)").fetchall()
     col_names = {str(c["name"]) for c in cols}
     if "mem_percent" not in col_names:
         conn.execute("ALTER TABLE reports ADD COLUMN mem_percent REAL NOT NULL DEFAULT 0")
+    if "runtime" not in col_names:
+        conn.execute("ALTER TABLE reports ADD COLUMN runtime TEXT NOT NULL DEFAULT 'podman'")
+    if "project" not in col_names:
+        conn.execute("ALTER TABLE reports ADD COLUMN project TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reports_host_runtime_project_container_ts "
+        "ON reports(host_id, runtime, project, container_name, ts)"
+    )
     conn.commit()
     conn.close()
 
@@ -80,6 +123,8 @@ def cleanup_old_reports(now_ts: int | None = None) -> int:
     cutoff = now - PURGE_SECONDS
     conn = db()
     cur = conn.execute("DELETE FROM reports WHERE ts < ?", (cutoff,))
+    conn.execute("DELETE FROM security_alerts WHERE status='resolved' AND last_seen < ?", (cutoff,))
+    conn.execute("DELETE FROM host_security WHERE ts < ?", (cutoff,))
     conn.commit()
     deleted = int(cur.rowcount or 0)
     conn.close()
@@ -102,6 +147,140 @@ def verify_signature(body: bytes, x_timestamp: str, x_signature: str) -> None:
         raise HTTPException(status_code=401, detail="bad signature")
 
 
+_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
+
+
+def _alert_fingerprint(host_id: str, alert: Dict[str, Any]) -> str:
+    identity = "|".join(
+        [
+            host_id,
+            str(alert.get("runtime") or ""),
+            str(alert.get("project") or ""),
+            str(alert.get("container_name") or ""),
+            str(alert.get("type") or "unknown"),
+        ]
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def process_security_alerts(
+    conn: sqlite3.Connection,
+    host_id: str,
+    ts: int,
+    alerts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    active_fingerprints: List[str] = []
+    notifications: List[Dict[str, Any]] = []
+    for raw_alert in alerts:
+        if not isinstance(raw_alert, dict):
+            continue
+        alert_type = str(raw_alert.get("type") or "unknown")[:80]
+        severity = str(raw_alert.get("severity") or "warning").lower()
+        if severity not in _SEVERITY_RANK:
+            severity = "warning"
+        normalized = {
+            "host_id": host_id,
+            "runtime": str(raw_alert.get("runtime") or "")[:40],
+            "project": str(raw_alert.get("project") or "")[:100],
+            "container_name": str(raw_alert.get("container_name") or "")[:200],
+            "type": alert_type,
+            "severity": severity,
+            "title": str(raw_alert.get("title") or alert_type)[:200],
+            "message": str(raw_alert.get("message") or "")[:2000],
+            "value": float(raw_alert.get("value") or 0),
+            "threshold": float(raw_alert.get("threshold") or 0),
+        }
+        fingerprint = _alert_fingerprint(host_id, normalized)
+        active_fingerprints.append(fingerprint)
+        existing = conn.execute(
+            "SELECT status, severity, occurrence_count FROM security_alerts WHERE fingerprint=?",
+            (fingerprint,),
+        ).fetchone()
+        should_notify = existing is None
+        if existing is not None:
+            should_notify = str(existing["status"]) != "active" or _SEVERITY_RANK[severity] > _SEVERITY_RANK.get(str(existing["severity"]), 0)
+            conn.execute(
+                """
+                UPDATE security_alerts
+                SET severity=?, title=?, message=?, value=?, threshold=?, last_seen=?,
+                    occurrence_count=occurrence_count+1, status='active', details_json=?
+                WHERE fingerprint=?
+                """,
+                (
+                    severity,
+                    normalized["title"],
+                    normalized["message"],
+                    normalized["value"],
+                    normalized["threshold"],
+                    ts,
+                    json.dumps(raw_alert, ensure_ascii=False),
+                    fingerprint,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO security_alerts(
+                    fingerprint, host_id, runtime, project, container_name, alert_type,
+                    severity, title, message, value, threshold, first_seen, last_seen,
+                    occurrence_count, status, details_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'active',?)
+                """,
+                (
+                    fingerprint,
+                    host_id,
+                    normalized["runtime"],
+                    normalized["project"],
+                    normalized["container_name"],
+                    alert_type,
+                    severity,
+                    normalized["title"],
+                    normalized["message"],
+                    normalized["value"],
+                    normalized["threshold"],
+                    ts,
+                    ts,
+                    json.dumps(raw_alert, ensure_ascii=False),
+                ),
+            )
+        if should_notify:
+            notifications.append(normalized)
+
+    if active_fingerprints:
+        placeholders = ",".join("?" for _ in active_fingerprints)
+        conn.execute(
+            f"UPDATE security_alerts SET status='resolved', last_seen=? "
+            f"WHERE host_id=? AND status='active' AND fingerprint NOT IN ({placeholders})",
+            (ts, host_id, *active_fingerprints),
+        )
+    else:
+        conn.execute(
+            "UPDATE security_alerts SET status='resolved', last_seen=? WHERE host_id=? AND status='active'",
+            (ts, host_id),
+        )
+    return notifications
+
+
+def send_alert_webhook(alert: Dict[str, Any]) -> None:
+    if not ALERT_WEBHOOK_URL:
+        return
+    severity = str(alert.get("severity") or "warning")
+    if _SEVERITY_RANK.get(severity, 0) < _SEVERITY_RANK.get(ALERT_WEBHOOK_MIN_SEVERITY, 1):
+        return
+    payload = json.dumps({"event": "narwhal.security_alert", "alert": alert}, ensure_ascii=False).encode()
+    request = urllib.request.Request(
+        ALERT_WEBHOOK_URL,
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "Narwhal-Container-Monitor/1.0"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            response.read(1)
+    except Exception as exc:
+        print(f"alert webhook failed: {exc}")
+
+
 @app.post("/api/v1/report")
 async def report(
     request: Request,
@@ -115,8 +294,9 @@ async def report(
 
     host_id = data.get("host_id", "unknown")
     ts = int(data.get("timestamp", time.time()))
-    podman_v4 = 1 if data.get("podman_network", {}).get("ipv4_ok") else 0
-    podman_v6 = 1 if data.get("podman_network", {}).get("ipv6_ok") else 0
+    network_status = data.get("container_network") or data.get("podman_network") or {}
+    podman_v4 = 1 if network_status.get("ipv4_ok") else 0
+    podman_v6 = 1 if network_status.get("ipv6_ok") else 0
 
     containers: List[Dict[str, Any]] = data.get("containers", [])
     conn = db()
@@ -124,14 +304,16 @@ async def report(
         conn.execute(
             """
             INSERT INTO reports(
-                host_id, container_name, cpu_percent, mem_bytes, mem_percent, net_rx_bps, net_tx_bps,
+                host_id, container_name, runtime, project, cpu_percent, mem_bytes, mem_percent, net_rx_bps, net_tx_bps,
                 conn_count, disk_file, disk_size_bytes, disk_used_percent,
                 podman_network_ok_v4, podman_network_ok_v6, ts, payload_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 host_id,
                 c.get("name", "unknown"),
+                c.get("runtime", "podman"),
+                c.get("project", ""),
                 float(c.get("cpu_percent", 0)),
                 int(c.get("mem_bytes", 0)),
                 float(c.get("mem_percent", 0)),
@@ -147,9 +329,20 @@ async def report(
                 json.dumps(c, ensure_ascii=False),
             ),
         )
+    notifications: List[Dict[str, Any]] = []
+    security = data.get("security")
+    if isinstance(security, dict):
+        security_alerts = security.get("alerts") if isinstance(security.get("alerts"), list) else []
+        notifications = process_security_alerts(conn, host_id, ts, security_alerts)
+        conn.execute(
+            "INSERT INTO host_security(host_id, ts, payload_json) VALUES(?,?,?)",
+            (host_id, ts, json.dumps(security, ensure_ascii=False)),
+        )
     conn.commit()
     conn.close()
-    return {"ok": True, "records": len(containers)}
+    for alert in notifications:
+        send_alert_webhook(alert)
+    return {"ok": True, "records": len(containers), "new_alerts": len(notifications)}
 
 
 @app.get("/api/v1/latest")
@@ -160,11 +353,12 @@ def latest(include_stale: bool = False) -> JSONResponse:
         """
         SELECT r.* FROM reports r
         JOIN (
-            SELECT host_id, container_name, MAX(ts) AS max_ts
+            SELECT host_id, runtime, project, container_name, MAX(ts) AS max_ts
             FROM reports
-            GROUP BY host_id, container_name
-        ) m ON r.host_id=m.host_id AND r.container_name=m.container_name AND r.ts=m.max_ts
-        ORDER BY r.host_id, r.container_name
+            GROUP BY host_id, runtime, project, container_name
+        ) m ON r.host_id=m.host_id AND r.runtime=m.runtime AND r.project=m.project
+            AND r.container_name=m.container_name AND r.ts=m.max_ts
+        ORDER BY r.host_id, r.runtime, r.project, r.container_name
         """
     ).fetchall()
 
@@ -208,6 +402,9 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "host_id": r["host_id"],
             "container_id": payload.get("id", ""),
             "container_name": r["container_name"],
+            "runtime": r["runtime"],
+            "project": r["project"],
+            "monitor_mode": str(payload.get("monitor_mode") or "full"),
             "cpu_percent": r["cpu_percent"],
             "mem_bytes": r["mem_bytes"],
             "mem_percent": float(r["mem_percent"] or 0),
@@ -216,6 +413,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "conn_count": int(r["conn_count"]),
             "tcp_country_stats": payload.get("tcp_country_stats", []),
             "udp_country_stats": payload.get("udp_country_stats", []),
+            "security": payload.get("security", {}),
             "disk_file": r["disk_file"],
             "disk_used_percent": r["disk_used_percent"],
             "disk_root_device": host_disk.get("root_device") or disk.get("root_device", ""),
@@ -234,6 +432,8 @@ def latest(include_stale: bool = False) -> JSONResponse:
             "top_cpu_process_command": str(top_cpu_process.get("command") or ""),
             "podman_network_ok_v4": bool(r["podman_network_ok_v4"]),
             "podman_network_ok_v6": bool(r["podman_network_ok_v6"]),
+            "container_network_ok_v4": bool(r["podman_network_ok_v4"]),
+            "container_network_ok_v6": bool(r["podman_network_ok_v6"]),
             "timestamp": r["ts"],
             "timestamp_iso": datetime.fromtimestamp(r["ts"], tz=timezone.utc).isoformat(),
             "timestamp_iso_utc8": format_utc8(r["ts"]),
@@ -252,19 +452,30 @@ def latest(include_stale: bool = False) -> JSONResponse:
 
 
 @app.get("/api/v1/history")
-def history(host_id: str, container_name: str, minutes: int = 720) -> JSONResponse:
+def history(host_id: str, container_name: str, runtime: str = "", project: str = "", minutes: int = 720) -> JSONResponse:
     minutes = max(5, min(minutes, 1440))
     start_ts = int(time.time()) - (minutes * 60)
     conn = db()
-    rows = conn.execute(
-        """
-        SELECT ts, cpu_percent, mem_percent, net_rx_bps, net_tx_bps, conn_count
-        FROM reports
-        WHERE host_id=? AND container_name=? AND ts>=?
-        ORDER BY ts ASC
-        """,
-        (host_id, container_name, start_ts),
-    ).fetchall()
+    if runtime:
+        rows = conn.execute(
+            """
+            SELECT ts, cpu_percent, mem_percent, net_rx_bps, net_tx_bps, conn_count
+            FROM reports
+            WHERE host_id=? AND runtime=? AND project=? AND container_name=? AND ts>=?
+            ORDER BY ts ASC
+            """,
+            (host_id, runtime, project, container_name, start_ts),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT ts, cpu_percent, mem_percent, net_rx_bps, net_tx_bps, conn_count
+            FROM reports
+            WHERE host_id=? AND container_name=? AND ts>=?
+            ORDER BY ts ASC
+            """,
+            (host_id, container_name, start_ts),
+        ).fetchall()
     conn.close()
     return JSONResponse(
         content={
@@ -284,6 +495,88 @@ def history(host_id: str, container_name: str, minutes: int = 720) -> JSONRespon
     )
 
 
+@app.get("/api/v1/security/alerts")
+def security_alerts(active_only: bool = True, limit: int = 200) -> JSONResponse:
+    limit = max(1, min(limit, 1000))
+    conn = db()
+    if active_only:
+        rows = conn.execute(
+            "SELECT * FROM security_alerts WHERE status='active' ORDER BY last_seen DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM security_alerts ORDER BY last_seen DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    conn.close()
+    items = []
+    for row in rows:
+        items.append(
+            {
+                "id": int(row["id"]),
+                "host_id": row["host_id"],
+                "runtime": row["runtime"],
+                "project": row["project"],
+                "container_name": row["container_name"],
+                "type": row["alert_type"],
+                "severity": row["severity"],
+                "title": row["title"],
+                "message": row["message"],
+                "value": float(row["value"] or 0),
+                "threshold": float(row["threshold"] or 0),
+                "first_seen": int(row["first_seen"]),
+                "first_seen_utc8": format_utc8(int(row["first_seen"])),
+                "last_seen": int(row["last_seen"]),
+                "last_seen_utc8": format_utc8(int(row["last_seen"])),
+                "occurrence_count": int(row["occurrence_count"]),
+                "status": row["status"],
+            }
+        )
+    active_count = sum(1 for item in items if item["status"] == "active") if not active_only else len(items)
+    return JSONResponse(content={"items": items, "active_count": active_count})
+
+
+@app.get("/api/v1/security/status")
+def security_status() -> JSONResponse:
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT h.host_id, h.ts, h.payload_json
+        FROM host_security h
+        JOIN (
+            SELECT host_id, MAX(id) AS max_id
+            FROM host_security
+            GROUP BY host_id
+        ) latest ON h.id=latest.max_id
+        ORDER BY h.host_id
+        """
+    ).fetchall()
+    conn.close()
+    items = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except Exception:
+            payload = {}
+        items.append(
+            {
+                "host_id": row["host_id"],
+                "timestamp": int(row["ts"]),
+                "timestamp_utc8": format_utc8(int(row["ts"])),
+                "enabled": bool(payload.get("enabled")),
+                "total_rx_bps": float(payload.get("total_rx_bps") or 0),
+                "total_tx_bps": float(payload.get("total_tx_bps") or 0),
+                "total_rx_pps": float(payload.get("total_rx_pps") or 0),
+                "total_tx_pps": float(payload.get("total_tx_pps") or 0),
+                "syn_recv_count": int(payload.get("syn_recv_count") or 0),
+                "access_log": payload.get("access_log") if isinstance(payload.get("access_log"), dict) else {},
+                "active_alerts_in_sample": len(payload.get("alerts") or []),
+            }
+        )
+    return JSONResponse(content={"items": items})
+
+
 @app.get("/api/v1/stats")
 def stats(minutes: int = 720) -> JSONResponse:
     minutes = max(5, min(minutes, 10080))
@@ -291,24 +584,24 @@ def stats(minutes: int = 720) -> JSONResponse:
     conn = db()
     rows = conn.execute(
         """
-        SELECT host_id, container_name, ts, cpu_percent, mem_bytes, mem_percent, net_rx_bps, net_tx_bps, conn_count
+        SELECT host_id, runtime, project, container_name, ts, cpu_percent, mem_bytes, mem_percent, net_rx_bps, net_tx_bps, conn_count
         FROM reports
         WHERE ts>=?
-        ORDER BY host_id, container_name, ts ASC
+        ORDER BY host_id, runtime, project, container_name, ts ASC
         """,
         (start_ts,),
     ).fetchall()
     conn.close()
 
-    grouped: Dict[tuple[str, str], List[sqlite3.Row]] = {}
+    grouped: Dict[tuple[str, str, str, str], List[sqlite3.Row]] = {}
     for row in rows:
-        key = (str(row["host_id"]), str(row["container_name"]))
+        key = (str(row["host_id"]), str(row["runtime"]), str(row["project"]), str(row["container_name"]))
         grouped.setdefault(key, []).append(row)
 
     items: List[Dict[str, Any]] = []
     host_totals: Dict[str, Dict[str, float]] = {}
     total_samples = 0
-    for (host_id, container_name), series in grouped.items():
+    for (host_id, runtime, project, container_name), series in grouped.items():
         if not series:
             continue
         cpu_values = [float(x["cpu_percent"] or 0) for x in series]
@@ -335,6 +628,8 @@ def stats(minutes: int = 720) -> JSONResponse:
         latest = series[-1]
         item = {
             "host_id": host_id,
+            "runtime": runtime,
+            "project": project,
             "container_name": container_name,
             "samples": len(series),
             "estimated_interval_seconds": estimated_interval,
@@ -415,7 +710,7 @@ def stats(minutes: int = 720) -> JSONResponse:
 def dashboard() -> str:
     return """
 <!doctype html>
-<html><head><meta charset='utf-8'><title>Podman Monitor</title>
+<html><head><meta charset='utf-8'><title>Narwhal Container Monitor</title>
 <style>
 body{font-family:sans-serif;margin:1rem;background:#0f1a2e;color:#dbe7ff}
 table{border-collapse:collapse;width:100%;background:#13213b;color:#dbe7ff}
@@ -423,6 +718,8 @@ th,td{border:1px solid #233b61;padding:8px;vertical-align:middle;text-align:cent
 th{background:#1a2c4e}
 .bad{color:#b00020;font-weight:bold}
 .ok{color:#0a8f08}
+.severity-critical{color:#ff5f6d;font-weight:bold}
+.severity-warning{color:#ffbf4b;font-weight:bold}
 .btn{border:1px solid #4b6fa8;padding:4px 8px;border-radius:6px;background:#1a2c4e;color:#dbe7ff;cursor:pointer}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center}
 #card{background:#0d1730;border-radius:12px;padding:16px;width:min(1380px,96vw)}
@@ -436,9 +733,14 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 #traffic{height:280px}
 </style>
 </head><body>
-<h2>Podman Monitor Dashboard</h2>
+<h2>Narwhal Container Monitor Dashboard</h2>
 <p>每 15 秒自动刷新。CPU/内存使用率/连接数/网速展示采集到的原始上报值，服务端不再做 5 分钟平均。红色表示预警（CPU ≥ {ALERT_CPU_THRESHOLD_PERCENT:.2f}% 或连接数 ≥ {ALERT_CONN_THRESHOLD}）。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。<a href='/stats' style='color:#8cc7ff'>查看统计页</a></p>
-<table id='t'><thead><tr><th>主机</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>内存%</th><th>连接数</th><th>国家Top3(TCP/UDP)</th><th>RX Mbps</th><th>TX Mbps</th><th>总容量/可用</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
+<h3>安全告警（活动：<span id='active-alert-count'>0</span>）</h3>
+<table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th></tr></thead><tbody></tbody></table>
+<h3>主机安全遥测</h3>
+<table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table>
+<h3>容器状态</h3>
+  <table id='t'><thead><tr><th>主机</th><th>运行时</th><th>容器ID</th><th>容器名</th><th>CPU%</th><th>内存%</th><th>连接数</th><th>进程数</th><th>RX pps</th><th>SYN_RECV</th><th>出站IP</th><th>监听端口</th><th>NAT/代理映射</th><th>TCP建连/s</th><th>TCP失败/s</th><th>可疑进程</th><th>配置风险</th><th>面板对接</th><th>国家Top3(TCP/UDP)</th><th>RX Mbps</th><th>TX Mbps</th><th>总容量/可用</th><th>主盘(/data 总量/可用)</th><th>IPv4</th><th>IPv6</th><th>上报时间(UTC+8)</th><th>详情</th></tr></thead><tbody></tbody></table>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
   <div class='detail-grid'>
@@ -493,6 +795,40 @@ function formatCountryLine(protocol, stats){
 function formatCountryStats(tcpStats, udpStats){
   return `${formatCountryLine('TCP', tcpStats)}<br/>${formatCountryLine('UDP', udpStats)}`;
 }
+function escapeHtml(value){
+  return String(value??'').replace(/[&<>'"]/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+}
+async function loadAlerts(){
+  const response=await fetch('/api/v1/security/alerts?active_only=true&limit=100');
+  const data=await response.json();
+  document.getElementById('active-alert-count').innerText=Number(data.active_count||0);
+  const body=document.querySelector('#security-alerts tbody'); body.innerHTML='';
+  for(const alert of (data.items||[])){
+    const tr=document.createElement('tr');
+    const runtime=alert.project?`${alert.runtime}/${alert.project}`:(alert.runtime||'-');
+    tr.innerHTML=`<td class='severity-${escapeHtml(alert.severity)}'>${escapeHtml(alert.severity)}</td>`+
+      `<td>${escapeHtml(alert.host_id)}</td><td>${escapeHtml(runtime)}</td>`+
+      `<td>${escapeHtml(alert.container_name||'-')}</td><td>${escapeHtml(alert.type)}</td>`+
+      `<td>${escapeHtml(alert.message)}</td><td>${escapeHtml(alert.last_seen_utc8)}</td>`+
+      `<td>${Number(alert.occurrence_count||0)}</td>`;
+    body.appendChild(tr);
+  }
+  const statusResponse=await fetch('/api/v1/security/status');
+  const statusData=await statusResponse.json();
+  const statusBody=document.querySelector('#security-status tbody'); statusBody.innerHTML='';
+  for(const item of (statusData.items||[])){
+    const access=item.access_log||{};
+    const logState=!access.enabled?'未配置':(Number(access.readable_files||0)>0?'正常':'不可读');
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${escapeHtml(item.host_id)}</td>`+
+      `<td>${formatSmallNumber(bpsToMbps(item.total_rx_bps),2)}</td>`+
+      `<td>${formatSmallNumber(item.total_rx_pps,1)}</td><td>${Number(item.syn_recv_count||0)}</td>`+
+      `<td>${formatSmallNumber(access.requests_per_second,1)}</td>`+
+      `<td>${formatSmallNumber(access.top_ip_requests_per_second,1)} ${escapeHtml(access.top_ip||'')}</td>`+
+      `<td class='${logState==='正常'?'ok':'bad'}'>${logState}</td><td>${escapeHtml(item.timestamp_utc8)}</td>`;
+    statusBody.appendChild(tr);
+  }
+}
 function groupByHost(items){
   const m=new Map();
   for(const x of items){
@@ -517,14 +853,22 @@ async function load(){
         html += `<td rowspan='${rows.length}'>${host}</td>`;
       }
       const offlineTag = x.alerts.stale ? ` <span class='bad'>(离线 ${x.offline_hours} 小时)</span>` : '';
-      html += `<td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cpuCls}'>${formatSmallNumber(x.cpu_percent, 2)}</td><td>${formatSmallNumber(x.mem_percent, 2)}</td><td class='${connCls}'>${x.conn_count}</td><td>${formatCountryStats(x.tcp_country_stats, x.udp_country_stats)}</td><td>${formatSmallNumber(bpsToMbps(x.net_rx_bps), 2)}</td><td>${formatSmallNumber(bpsToMbps(x.net_tx_bps), 2)}</td><td>${containerDiskText}</td>`;
+      const runtimeBase = x.project && x.runtime==='incus' ? `${x.runtime}/${x.project}` : (x.runtime||'podman');
+      const runtimeText = x.monitor_mode==='notice' ? `${runtimeBase}（仅提醒）` : runtimeBase;
+      const security=x.security||{};
+      const protocolRates=security.protocol_rates||{};
+      const panelPairing=security.panel_pairing||{};
+      const pairingText=panelPairing.detected?(panelPairing.approved?'白名单':((panelPairing.unapproved_domains||[]).join(',')||'发现特征')):'-';
+      const listeningPorts=Array.isArray(security.listening_ports)?security.listening_ports.slice(0,8).join(','):'-';
+      const exposureText=Array.isArray(security.network_exposure)&&security.network_exposure.length?security.network_exposure.slice(0,6).map(item=>`${item.listen||'?'}→${item.target||'?'}`).join(', '):'-';
+      html += `<td>${runtimeText}</td><td>${x.container_id || '-'}</td><td>${x.container_name}${offlineTag}</td><td class='${cpuCls}'>${formatSmallNumber(x.cpu_percent, 2)}</td><td>${formatSmallNumber(x.mem_percent, 2)}</td><td class='${connCls}'>${x.conn_count}</td><td>${Number(security.process_count||0)}</td><td>${formatSmallNumber(security.net_rx_pps, 1)}</td><td>${Number(security.syn_recv_count||0)}</td><td>${Number(security.outbound_unique_ips||0)}</td><td>${escapeHtml(listeningPorts||'-')}</td><td>${escapeHtml(exposureText)}</td><td>${formatSmallNumber(protocolRates.Tcp_ActiveOpens_per_second,1)}</td><td>${formatSmallNumber(protocolRates.Tcp_AttemptFails_per_second,1)}</td><td>${Array.isArray(security.suspicious_processes)?security.suspicious_processes.length:0}</td><td>${Array.isArray(security.configuration_risks)?security.configuration_risks.length:0}</td><td class='${panelPairing.detected&&!panelPairing.approved?'bad':''}'>${escapeHtml(pairingText)}</td><td>${formatCountryStats(x.tcp_country_stats, x.udp_country_stats)}</td><td>${formatSmallNumber(bpsToMbps(x.net_rx_bps), 2)}</td><td>${formatSmallNumber(bpsToMbps(x.net_tx_bps), 2)}</td><td>${containerDiskText}</td>`;
       if(idx===0){
         html += `<td rowspan='${rows.length}' class='${x.alerts.disk?'bad':''}'>${hostDiskText}</td>`;
-        html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v4?'ok':'bad'}'>${x.podman_network_ok_v4?'✅️':'❌️'}</td>`;
-        html += `<td rowspan='${rows.length}' class='${x.podman_network_ok_v6?'ok':'bad'}'>${x.podman_network_ok_v6?'✅️':'❌️'}</td>`;
+        html += `<td rowspan='${rows.length}' class='${x.container_network_ok_v4?'ok':'bad'}'>${x.container_network_ok_v4?'✅️':'❌️'}</td>`;
+        html += `<td rowspan='${rows.length}' class='${x.container_network_ok_v6?'ok':'bad'}'>${x.container_network_ok_v6?'✅️':'❌️'}</td>`;
         html += `<td rowspan='${rows.length}' class='${x.alerts.stale?'bad':''}'>${x.timestamp_iso_utc8}</td>`;
       }
-      html += `<td><button class='btn' onclick='openDetail(${JSON.stringify(host)}, ${JSON.stringify(x.container_name)})'>详情</button></td>`;
+      html += `<td><button class='btn' onclick='openDetail(${JSON.stringify(host)}, ${JSON.stringify(x.runtime)}, ${JSON.stringify(x.project||'')}, ${JSON.stringify(x.container_name)})'>详情</button></td>`;
       tr.innerHTML=html;
       b.appendChild(tr);
     });
@@ -551,14 +895,15 @@ function estimateStepSeconds(points){
   }
   return intervals.reduce((a,b)=>a+b,0)/intervals.length;
 }
-async function openDetail(host, container){
+async function openDetail(host, runtime, project, container){
   const latestRes=await fetch('/api/v1/latest');
   const latestData=await latestRes.json();
-  const target=(latestData.items||[]).find(x=>x.host_id===host&&x.container_name===container);
+  const target=(latestData.items||[]).find(x=>x.host_id===host&&x.runtime===runtime&&(x.project||'')===project&&x.container_name===container);
   const countryTop=formatCountryStats(target?.tcp_country_stats||[], target?.udp_country_stats||[]);
-  const res=await fetch(`/api/v1/history?host_id=${encodeURIComponent(host)}&container_name=${encodeURIComponent(container)}`);
+  const res=await fetch(`/api/v1/history?host_id=${encodeURIComponent(host)}&runtime=${encodeURIComponent(runtime)}&project=${encodeURIComponent(project)}&container_name=${encodeURIComponent(container)}`);
   const data=await res.json();
-  document.getElementById('detail-title').innerText=`${host} / ${container} 历史数据（TCP国家：${countryTop.replaceAll('<br/>', ', ')}）`;
+  const runtimeLabel=project ? `${runtime}/${project}` : runtime;
+  document.getElementById('detail-title').innerText=`${host} / ${runtimeLabel} / ${container} 历史数据（TCP国家：${countryTop.replaceAll('<br/>', ', ')}）`;
   const pts=data.items||[];
   const recent=pts.slice(-80);
   const svg=document.getElementById('chart');
@@ -619,7 +964,7 @@ async function openDetail(host, container){
   `;
   document.getElementById('modal').style.display='flex';
 }
-load(); setInterval(load, 15000);
+load(); loadAlerts(); setInterval(()=>{load();loadAlerts();}, 15000);
 </script>
 </body></html>
 """
@@ -629,7 +974,7 @@ load(); setInterval(load, 15000);
 def stats_page() -> str:
     return """
 <!doctype html>
-<html><head><meta charset='utf-8'><title>Podman Stats</title>
+<html><head><meta charset='utf-8'><title>Container Stats</title>
 <style>
 body{font-family:sans-serif;margin:1rem;background:#0f1a2e;color:#dbe7ff}
 .topbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}
@@ -656,13 +1001,13 @@ a{color:#8cc7ff}
 </div>
 
 <h3>Top10：平均 CPU</h3>
-<table id='cpu-top'><thead><tr><th>主机</th><th>容器</th><th>平均 CPU%</th><th>峰值 CPU%</th><th>估算间隔(秒)</th></tr></thead><tbody></tbody></table>
+  <table id='cpu-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均 CPU%</th><th>峰值 CPU%</th><th>估算间隔(秒)</th></tr></thead><tbody></tbody></table>
 
 <h3>Top10：平均连接数</h3>
-<table id='conn-top'><thead><tr><th>主机</th><th>容器</th><th>平均连接</th><th>峰值连接</th><th>样本数</th></tr></thead><tbody></tbody></table>
+  <table id='conn-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均连接</th><th>峰值连接</th><th>样本数</th></tr></thead><tbody></tbody></table>
 
 <h3>Top10：累计流量</h3>
-<table id='traffic-top'><thead><tr><th>主机</th><th>容器</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th></tr></thead><tbody></tbody></table>
+  <table id='traffic-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th></tr></thead><tbody></tbody></table>
 
 <h3>Host 汇总</h3>
 <table id='host-summary'><thead><tr><th>主机</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th><th>样本数</th></tr></thead><tbody></tbody></table>
@@ -693,19 +1038,19 @@ async function loadStats(){
   document.getElementById('kpi-window').innerText=(data.window_minutes||minutes)+'m';
 
   renderRows('cpu-top', data.ranks?.avg_cpu_top10||[], x=>`
-    <td>${x.host_id}</td><td>${x.container_name}</td>
+    <td>${x.host_id}</td><td>${x.project?`${x.runtime}/${x.project}`:x.runtime}</td><td>${x.container_name}</td>
     <td>${Number(x.avg.cpu_percent||0).toFixed(2)}</td>
     <td>${Number(x.max.cpu_percent||0).toFixed(2)}</td>
     <td>${Number(x.estimated_interval_seconds||0).toFixed(2)}</td>
   `);
   renderRows('conn-top', data.ranks?.avg_conn_top10||[], x=>`
-    <td>${x.host_id}</td><td>${x.container_name}</td>
+    <td>${x.host_id}</td><td>${x.project?`${x.runtime}/${x.project}`:x.runtime}</td><td>${x.container_name}</td>
     <td>${Number(x.avg.conn_count||0).toFixed(2)}</td>
     <td>${Number(x.max.conn_count||0)}</td>
     <td>${x.samples||0}</td>
   `);
   renderRows('traffic-top', data.ranks?.traffic_top10||[], x=>`
-    <td>${x.host_id}</td><td>${x.container_name}</td>
+    <td>${x.host_id}</td><td>${x.project?`${x.runtime}/${x.project}`:x.runtime}</td><td>${x.container_name}</td>
     <td>${fmtBytes(x.traffic_bytes.rx)}</td>
     <td>${fmtBytes(x.traffic_bytes.tx)}</td>
     <td>${fmtBytes(x.traffic_bytes.total)}</td>

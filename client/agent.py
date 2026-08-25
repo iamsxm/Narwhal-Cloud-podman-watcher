@@ -641,7 +641,12 @@ def _decode_proc_addr(hex_ip: str, is_v6: bool = False) -> str:
     try:
         raw = bytes.fromhex(hex_ip)
         if is_v6:
-            return str(ipaddress.IPv6Address(raw[::-1]))
+            # /proc/net/tcp6 and udp6 store four little-endian 32-bit words.
+            normalized = b"".join(raw[index:index + 4][::-1] for index in range(0, 16, 4))
+            address = ipaddress.IPv6Address(normalized)
+            if address.ipv4_mapped:
+                return str(address.ipv4_mapped)
+            return str(address)
         return str(ipaddress.IPv4Address(raw[::-1]))
     except Exception:
         return ""
@@ -1024,6 +1029,7 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
                 {
                     "proto": proto,
                     "state": parts[3].upper(),
+                    "local_ip": _decode_proc_addr(local_ip_hex, is_v6=is_v6),
                     "local_port": _parse_port(local_port_hex),
                     "remote_port": _parse_port(remote_port_hex),
                     "remote_ip": _decode_proc_addr(remote_ip_hex, is_v6=is_v6),
@@ -1067,6 +1073,7 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
         proto = str(entry["proto"])
         state = str(entry["state"])
         local_port = int(entry["local_port"])
+        local_ip = str(entry["local_ip"])
         remote_port = int(entry["remote_port"])
         remote_ip = str(entry["remote_ip"])
         if proto == "tcp":
@@ -1083,7 +1090,7 @@ def _collect_socket_security(pid: int) -> Dict[str, object]:
         if incoming:
             if state == "01":
                 incoming_established += 1
-            if _is_trackable_ip(remote_ip):
+            if _is_trackable_ip(remote_ip) and remote_ip != local_ip:
                 inbound_source_ports.setdefault(remote_ip, set()).add(local_port)
                 inbound_ip_connections[remote_ip] = inbound_ip_connections.get(remote_ip, 0) + 1
             continue

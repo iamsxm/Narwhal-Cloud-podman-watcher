@@ -276,6 +276,12 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertEqual(result["communication_processes"][0]["process"], "nginx")
         self.assertEqual(result["communication_processes"][0]["inbound_connections"], 1)
 
+    def test_proc_ipv6_decoder_normalizes_ipv4_mapped_address(self):
+        self.assertEqual(
+            agent._decode_proc_addr("0000000000000000FFFF000006005B0A", is_v6=True),
+            "10.91.0.6",
+        )
+
     def test_audits_podman_and_incus_isolation_risks(self):
         oci = agent._oci_security_risks(
             {

@@ -2486,7 +2486,9 @@ def collect_container_disk_usage(
 
 def _incus_instance_pid(runtime: str, name: str, project: str = "") -> int:
     path = f"/1.0/instances/{quote(name, safe='')}/state"
-    output = run(_runtime_base(runtime, project) + ["query", path])
+    if project:
+        path += f"?project={quote(project, safe='')}"
+    output = run([runtime, "query", path])
     if not output:
         return 0
     try:

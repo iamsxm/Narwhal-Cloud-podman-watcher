@@ -224,6 +224,16 @@ incus_cpu_seconds_total{cpu="0",mode="user",name="vm1",project="default",type="v
             ["docker", "exec", "c1", "sh", "-lc", "df -P /"],
         )
 
+    def test_incus_instance_pid_queries_project_in_url(self):
+        payload = json.dumps({"metadata": {"pid": 592319}})
+        with mock.patch.object(agent, "run", return_value=payload) as run_mock:
+            pid = agent._incus_instance_pid("incus", "node 1", "prod/main")
+
+        self.assertEqual(pid, 592319)
+        run_mock.assert_called_once_with(
+            ["incus", "query", "/1.0/instances/node%201/state?project=prod%2Fmain"]
+        )
+
 
 class SecurityTelemetryTests(unittest.TestCase):
     def setUp(self):

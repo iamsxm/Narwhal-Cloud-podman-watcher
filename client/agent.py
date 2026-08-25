@@ -28,6 +28,7 @@ _cpu_counters: Dict[str, Dict[str, float]] = {}
 _warned_parse_paths = set()
 _geoip_country_cache: Dict[str, str] = {}
 _incus_metrics_cache: Dict[str, object] = {"ts": 0.0, "text": "", "parsed": {}}
+_incus_forward_cache: Dict[str, Dict[str, object]] = {}
 _packet_counters: Dict[str, Dict[str, float]] = {}
 _protocol_counters: Dict[str, Dict[str, float]] = {}
 _access_log_states: Dict[str, Dict[str, object]] = {}
@@ -1336,7 +1337,7 @@ def _apply_host_conntrack_security(
         target_proto, target_host, target_port = _parse_exposure_endpoint(str(exposure.get("target") or ""))
         if target_host and _is_trackable_ip(target_host):
             addresses.add(target_host)
-        if listen_port > 0:
+        if listen_port > 0 or (str(exposure.get("source") or "") == "incus-forward" and listen_host):
             mappings.append(
                 {
                     "proto": listen_proto or target_proto,
@@ -1380,14 +1381,15 @@ def _apply_host_conntrack_security(
                 mapping_host = str(mapping.get("host") or "")
                 if mapping_proto and mapping_proto != proto:
                     continue
-                if int(mapping.get("public_port") or 0) != original_dport:
+                mapping_public_port = int(mapping.get("public_port") or 0)
+                if mapping_public_port > 0 and mapping_public_port != original_dport:
                     continue
                 if mapping_host and mapping_host not in ("0.0.0.0", "::", "*") and mapping_host != original_dst:
                     continue
                 if mapping_host in ("", "0.0.0.0", "::", "*") and host_addresses and original_dst not in host_addresses:
                     continue
                 matched = True
-                container_port = int(mapping.get("container_port") or 0)
+                container_port = int(mapping.get("container_port") or 0) or original_dport
                 break
         if not matched or not _is_public_source_ip(source_ip) or source_ip in addresses:
             continue
@@ -2737,6 +2739,107 @@ def _incus_network_exposure(item: Dict[str, object]) -> List[Dict[str, str]]:
     return mappings
 
 
+def _expand_port_spec(value: str, limit: int = 4096) -> List[int]:
+    ports: List[int] = []
+    for part in (value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                continue
+            start = max(1, int(start_text))
+            end = min(65535, int(end_text))
+            if end < start:
+                continue
+            ports.extend(range(start, min(end, start + limit - len(ports) - 1) + 1))
+        elif part.isdigit():
+            port = int(part)
+            if 0 < port <= 65535:
+                ports.append(port)
+        if len(ports) >= limit:
+            break
+    return ports[:limit]
+
+
+def _incus_network_forward_mappings(runtime: str, project: str) -> List[Dict[str, str]]:
+    """Read managed Incus network forwards, cached for one report interval."""
+    cache_key = f"{runtime}:{project}"
+    cached = _incus_forward_cache.get(cache_key, {})
+    now = time.monotonic()
+    if cached and now - float(cached.get("ts") or 0) < 240:
+        value = cached.get("mappings")
+        return list(value) if isinstance(value, list) else []
+    base = _runtime_base(runtime, project)
+    network_output = run(base + ["network", "list", "--format=json"])
+    try:
+        networks = json.loads(network_output) if network_output else []
+    except (TypeError, ValueError):
+        networks = []
+    mappings: List[Dict[str, str]] = []
+    for network in networks if isinstance(networks, list) else []:
+        if not isinstance(network, dict) or not bool(network.get("managed", True)):
+            continue
+        network_name = str(network.get("name") or "")
+        if not network_name:
+            continue
+        forward_output = run(base + ["network", "forward", "list", network_name, "--format=json"])
+        try:
+            forwards = json.loads(forward_output) if forward_output else []
+        except (TypeError, ValueError):
+            forwards = []
+        for forward in forwards if isinstance(forwards, list) else []:
+            if not isinstance(forward, dict):
+                continue
+            listen_address = str(forward.get("listen_address") or "")
+            config = forward.get("config") if isinstance(forward.get("config"), dict) else {}
+            default_target = str(config.get("target_address") or "")
+            if listen_address and _is_trackable_ip(default_target):
+                mappings.append(
+                    {
+                        "source": "incus-forward",
+                        "device": network_name,
+                        "listen": listen_address,
+                        "target": default_target,
+                        "nat": "true",
+                    }
+                )
+            ports = forward.get("ports") if isinstance(forward.get("ports"), list) else []
+            for port_spec in ports:
+                if not isinstance(port_spec, dict):
+                    continue
+                proto = str(port_spec.get("protocol") or "tcp").lower()
+                target_address = str(port_spec.get("target_address") or default_target)
+                listen_ports = _expand_port_spec(str(port_spec.get("listen_port") or ""))
+                target_ports = _expand_port_spec(str(port_spec.get("target_port") or ""))
+                if not target_ports:
+                    target_ports = list(listen_ports)
+                elif len(target_ports) == 1 and len(listen_ports) > 1:
+                    target_ports = target_ports * len(listen_ports)
+                for index, listen_port in enumerate(listen_ports):
+                    target_port = target_ports[index] if index < len(target_ports) else listen_port
+                    mappings.append(
+                        {
+                            "source": "incus-forward",
+                            "device": network_name,
+                            "listen": f"{proto}:{listen_address}:{listen_port}",
+                            "target": f"{proto}:{target_address}:{target_port}",
+                            "nat": str(port_spec.get("snat", False)).lower(),
+                        }
+                    )
+                    if len(mappings) >= 4096:
+                        break
+                if len(mappings) >= 4096:
+                    break
+            if len(mappings) >= 4096:
+                break
+        if len(mappings) >= 4096:
+            break
+    _incus_forward_cache[cache_key] = {"ts": now, "mappings": list(mappings)}
+    return mappings
+
+
 def _oci_security_risks(inspect_data: Dict[str, object]) -> List[Dict[str, str]]:
     host_config = inspect_data.get("HostConfig") if isinstance(inspect_data.get("HostConfig"), dict) else {}
     risks: List[Dict[str, str]] = []
@@ -2868,6 +2971,15 @@ def _incus_containers(runtime: str) -> List[Dict[str, str]]:
                 "network_addresses": sorted(set(network_addresses)),
             }
         )
+    forward_mappings = _incus_network_forward_mappings(runtime, project)
+    for item in items:
+        addresses = set(item.get("network_addresses") or [])
+        exposures = item.get("network_exposure") if isinstance(item.get("network_exposure"), list) else []
+        for mapping in forward_mappings:
+            _, target_host, _ = _parse_exposure_endpoint(str(mapping.get("target") or ""))
+            if target_host in addresses:
+                exposures.append(dict(mapping))
+        item["network_exposure"] = exposures
     return items
 
 

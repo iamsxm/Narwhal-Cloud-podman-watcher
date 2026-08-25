@@ -378,6 +378,31 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertEqual(security["inbound_unique_ips"], 1)
         self.assertEqual(security["inbound_public_flows"][0]["container_port"], 443)
 
+    def test_incus_network_forward_ports_become_container_mappings(self):
+        agent._incus_forward_cache.clear()
+        networks = '[{"name":"incusbr0","managed":true}]'
+        forwards = json.dumps(
+            [
+                {
+                    "listen_address": "9.9.9.9",
+                    "config": {},
+                    "ports": [
+                        {
+                            "protocol": "tcp",
+                            "listen_port": "18080,18443",
+                            "target_address": "10.91.0.5",
+                            "target_port": "80,443",
+                        }
+                    ],
+                }
+            ]
+        )
+        with mock.patch.object(agent, "run", side_effect=[networks, forwards]):
+            mappings = agent._incus_network_forward_mappings("incus", "default")
+        self.assertEqual(len(mappings), 2)
+        self.assertEqual(mappings[0]["listen"], "tcp:9.9.9.9:18080")
+        self.assertEqual(mappings[1]["target"], "tcp:10.91.0.5:443")
+
     def test_proc_ipv6_decoder_normalizes_ipv4_mapped_address(self):
         self.assertEqual(
             agent._decode_proc_addr("0000000000000000FFFF000006005B0A", is_v6=True),

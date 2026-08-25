@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_VERSION="$(tr -d '[:space:]' < "$ROOT_DIR/VERSION")"
 SERVER_ENV_FILE="/opt/narwhal-monitor/server.env"
 SERVER_INSTALL_ENV_FILE="/opt/narwhal-monitor/server-install.env"
 SERVER_DATA_DIR="/opt/narwhal-monitor/server-data"
@@ -463,6 +464,7 @@ main() {
 
   mkdir -p "$SERVER_DATA_DIR" "$TLS_CA_EXPORT_DIR"
   cat >"$SERVER_ENV_FILE" <<ENV
+NARWHAL_VERSION=$PROJECT_VERSION
 SHARED_SECRET=$secret
 ALERT_DISK_THRESHOLD_PERCENT=$th
 ALERT_WEBHOOK_URL=$alert_webhook_url
@@ -493,7 +495,7 @@ ENV
   local image_name="narwhal-monitor-server:latest"
   case "$image_source" in
     local)
-      podman build -t "$image_name" -f server/Dockerfile server
+      podman build --build-arg "APP_VERSION=$PROJECT_VERSION" -t "$image_name" -f server/Dockerfile server
       ;;
     github)
       echo "Trying to pull $github_image..."
@@ -501,7 +503,7 @@ ENV
         image_name="$github_image"
       else
         echo "[WARN] Pull github image failed. Falling back to local build (this avoids GHCR 403/private image issues)."
-        podman build -t "$image_name" -f server/Dockerfile server
+        podman build --build-arg "APP_VERSION=$PROJECT_VERSION" -t "$image_name" -f server/Dockerfile server
       fi
       ;;
     *)
@@ -540,6 +542,7 @@ ENV
 
 ===== Server Install Summary =====
 Mode: $MODE
+Version: $PROJECT_VERSION
 Container Name: $CONTAINER_NAME
 Backend Port: $port
 Backend Binding: $port_binding

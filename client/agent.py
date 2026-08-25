@@ -17,6 +17,8 @@ from urllib.parse import quote, urlparse
 
 import requests
 
+APP_VERSION = os.getenv("NARWHAL_VERSION", "dev").strip() or "dev"
+
 _warned_missing_bins = set()
 _podman_bin = None
 _container_bin = None
@@ -3154,6 +3156,7 @@ def main() -> None:
         security = collect_security_summary(collected, security_interval)
         payload = {
             "host_id": args.host_id,
+            "agent_version": APP_VERSION,
             "timestamp": int(time.time()),
             "container_network": {"ipv4_ok": v4, "ipv6_ok": v6},
             "podman_network": {"ipv4_ok": v4, "ipv6_ok": v6},

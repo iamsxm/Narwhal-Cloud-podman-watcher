@@ -63,6 +63,7 @@ class ServerRuntimeTests(unittest.TestCase):
         now = int(time.time())
         payload = {
             "host_id": "host",
+            "agent_version": "1.0.0",
             "timestamp": now,
             "container_network": {"ipv4_ok": True, "ipv6_ok": False},
             "security": {
@@ -94,7 +95,15 @@ class ServerRuntimeTests(unittest.TestCase):
             server.SHARED_SECRET.encode(), body + timestamp.encode(), hashlib.sha256
         ).hexdigest()
         result = asyncio.run(server.report(Request(), timestamp, signature))
-        self.assertEqual(result, {"ok": True, "records": 1, "new_alerts": 0})
+        self.assertEqual(
+            result,
+            {
+                "ok": True,
+                "server_version": server.APP_VERSION,
+                "records": 1,
+                "new_alerts": 0,
+            },
+        )
 
         conn = sqlite3.connect(server.DB_PATH)
         row = conn.execute("SELECT runtime, project FROM reports").fetchone()
@@ -103,6 +112,9 @@ class ServerRuntimeTests(unittest.TestCase):
         status = json.loads(server.security_status().body)
         self.assertEqual(status["items"][0]["total_rx_bps"], 1234)
         self.assertEqual(status["items"][0]["access_log"]["requests_per_second"], 2)
+        latest_body = json.loads(server.latest().body)
+        self.assertEqual(latest_body["server_version"], server.APP_VERSION)
+        self.assertEqual(latest_body["items"][0]["agent_version"], "1.0.0")
 
     def test_tls_ca_endpoint_authenticates_request_and_response(self):
         certificate = b"-----BEGIN CERTIFICATE-----\ntest-public-ca\n-----END CERTIFICATE-----\n"
@@ -189,6 +201,8 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("overflow-x:hidden", html)
         self.assertIn("aria-labelledby", html)
         self.assertIn("/container-detail?", html)
+        self.assertIn("versionBadge(latest.agent_version,d.server_version)", html)
+        self.assertIn("容器安全与运行状态中心", html)
         self.assertNotIn("<table id='t'", html)
 
     def test_container_detail_is_a_dedicated_internal_metrics_page(self):
@@ -199,7 +213,20 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("/api/v1/latest?include_stale=true", html)
         self.assertIn("/api/v1/history?", html)
         self.assertIn("overflow-x:hidden", html)
+        self.assertIn("detail-version", html)
         self.assertIn("/container-detail?", server.stats_page())
+
+    def test_release_version_is_shared_by_server_client_and_installers(self):
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertRegex(version, r"^\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?$")
+        agent_source = (ROOT / "client" / "agent.py").read_text(encoding="utf-8")
+        server_source = (ROOT / "server" / "app.py").read_text(encoding="utf-8")
+        client_installer = (ROOT / "scripts" / "install-client.sh").read_text(encoding="utf-8")
+        server_installer = (ROOT / "scripts" / "install-server.sh").read_text(encoding="utf-8")
+        self.assertIn('os.getenv("NARWHAL_VERSION", "dev")', agent_source)
+        self.assertIn('os.getenv("NARWHAL_VERSION", "dev")', server_source)
+        self.assertIn("NARWHAL_VERSION=$PROJECT_VERSION", client_installer)
+        self.assertIn("NARWHAL_VERSION=$PROJECT_VERSION", server_installer)
 
     def test_panel_action_queue_and_agent_poll_are_signed(self):
         now = int(time.time())

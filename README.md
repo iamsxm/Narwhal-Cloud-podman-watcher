@@ -18,6 +18,7 @@
 - **一键安装与更新**：`install.sh` 支持安装、更新和卸载；更新会复用 `/opt/narwhal-monitor/*.env` 配置并重建或重启服务。
 - **告警快速处理**：活动告警可选择“禁止”“允许且不再提醒”或“本次取消提醒”；只有 Podman/Incus 的机场面板对接告警可以执行禁止清理，Docker 不执行清理。
 - **自动更新**：Server 与 Client 默认每 15 分钟检查 GitHub `main`，只进行安全的 fast-forward 更新并记录日志。
+- **统一版本状态**：仓库根目录 `VERSION` 是 Server 与 Client 的唯一版本源；每台主机显示“最新、版本不一致或版本未知”，安装摘要也会显示当前版本。
 - **Server HTTPS 自动化**：支持自动拉起 Caddy 反向代理：
   - 域名场景：自动申请公网证书（ACME HTTP-01）。
   - Cloudflare 域名场景：支持 DNS Challenge（可橙云），自动签发并续期公网证书。
@@ -116,6 +117,24 @@ sudo env SKIP_CLEANUP_ON_UPDATE=1 bash scripts/install.sh
 更新完成后，用首次部署后的检查命令确认 Server 与 Client 正常运行。若 `git pull --ff-only` 报错，请先处理仓库中的本地修改或分支分叉，不要使用会覆盖配置或代码的强制重置命令。
 
 人工执行 Server 的 `install` 或 `update` 时，安装摘要会直接显示当前 `Dashboard Username` 和 `Dashboard Password`。systemd 后台自动更新会隐藏这些凭据，避免密码进入自动更新日志。
+
+### 版本发布规则
+
+Server 与 Client 必须使用同一个版本号。仓库根目录的 `VERSION` 是唯一版本源，安装器会把它写入两端环境配置，Client 每次上报也会携带自身版本。总览页每台主机的版本指示器含义如下：
+
+- `vX.Y.Z · 最新`：Client 与当前 Server 版本一致。
+- `Client vX.Y.Z · 应为 vA.B.C`：节点尚未更新到 Server 对应版本。
+- `Client 版本未知`：旧版 Client 尚未携带版本；更新该节点并等待下一次上报即可。
+
+以后每次功能或修复发布前都必须先提升语义化版本号，再提交代码：
+
+```bash
+bash scripts/bump-version.sh 1.0.1
+git add VERSION
+git commit -m "chore: release 1.0.1"
+```
+
+Server 镜像同时发布 `latest`、版本号和提交 SHA 标签；安装、更新摘要中的 `Version` 可用于部署审计。不要分别修改 Server 与 Client 版本。
 
 ### 重置 Server 面板密码
 

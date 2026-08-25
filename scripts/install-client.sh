@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_VERSION="$(tr -d '[:space:]' < "$ROOT_DIR/VERSION")"
 CLIENT_ENV_FILE="/opt/narwhal-monitor/client.env"
 CLIENT_INSTALL_ENV_FILE="/opt/narwhal-monitor/client-install.env"
 CLIENT_APP_DIR="/opt/narwhal-monitor/client-agent"
@@ -194,6 +195,7 @@ if [[ "$server_url" == https://* || "$server_url" != *://* ]]; then
 fi
 
 cat >"$CLIENT_ENV_FILE" <<ENV
+NARWHAL_VERSION=$PROJECT_VERSION
 SERVER_URL=$server_url
 SHARED_SECRET=$secret
 SERVER_TLS_CA_FILE=$tls_ca_file
@@ -288,6 +290,7 @@ cat <<EOF_SUM
 
 ===== Client Install Summary =====
 Mode: $MODE
+Version: $PROJECT_VERSION
 Runtime: host agent (systemd)
 Service Name: narwhal-monitor-client.service
 Server URL: $server_url

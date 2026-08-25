@@ -27,6 +27,7 @@ ALERT_WEBHOOK_MIN_SEVERITY = os.getenv("ALERT_WEBHOOK_MIN_SEVERITY", "warning").
 TLS_CA_CERT_PATH = os.getenv("TLS_CA_CERT_PATH", "/tls-ca/root.crt")
 DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "").strip()
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+APP_VERSION = os.getenv("NARWHAL_VERSION", "dev").strip() or "dev"
 UTC8 = timezone(timedelta(hours=8))
 
 
@@ -442,6 +443,7 @@ async def report(
     data = json.loads(body)
 
     host_id = data.get("host_id", "unknown")
+    agent_version = str(data.get("agent_version") or "unknown").strip() or "unknown"
     ts = int(data.get("timestamp", time.time()))
     network_status = data.get("container_network") or data.get("podman_network") or {}
     podman_v4 = 1 if network_status.get("ipv4_ok") else 0
@@ -450,6 +452,8 @@ async def report(
     containers: List[Dict[str, Any]] = data.get("containers", [])
     conn = db()
     for c in containers:
+        stored_payload = dict(c)
+        stored_payload["_agent_version"] = agent_version
         conn.execute(
             """
             INSERT INTO reports(
@@ -475,7 +479,7 @@ async def report(
                 podman_v4,
                 podman_v6,
                 ts,
-                json.dumps(c, ensure_ascii=False),
+                json.dumps(stored_payload, ensure_ascii=False),
             ),
         )
     notifications: List[Dict[str, Any]] = []
@@ -491,7 +495,12 @@ async def report(
     conn.close()
     for alert in notifications:
         send_alert_webhook(alert)
-    return {"ok": True, "records": len(containers), "new_alerts": len(notifications)}
+    return {
+        "ok": True,
+        "server_version": APP_VERSION,
+        "records": len(containers),
+        "new_alerts": len(notifications),
+    }
 
 
 @app.get("/api/v1/latest")
@@ -549,6 +558,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
         offline_hours = stale_seconds // 3600
         out.append({
             "host_id": r["host_id"],
+            "agent_version": str(payload.get("_agent_version") or "unknown"),
             "container_id": payload.get("id", ""),
             "container_name": r["container_name"],
             "runtime": r["runtime"],
@@ -601,7 +611,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
                 "network": (not r["podman_network_ok_v4"]) or (not r["podman_network_ok_v6"]),
             },
         })
-    return JSONResponse(content={"items": out})
+    return JSONResponse(content={"server_version": APP_VERSION, "items": out})
 
 
 @app.get("/api/v1/history")
@@ -1256,6 +1266,7 @@ def stats(minutes: int = 720) -> JSONResponse:
             "estimated_interval_seconds": estimated_interval,
             "latest": {
                 "timestamp": int(latest["ts"]),
+                "agent_version": str(latest_payload.get("_agent_version") or "unknown"),
                 "cpu_percent": float(latest["cpu_percent"] or 0),
                 "mem_bytes": int(latest["mem_bytes"] or 0),
                 "mem_limit_bytes": int(latest_payload.get("mem_limit_bytes") or 0),
@@ -1310,6 +1321,7 @@ def stats(minutes: int = 720) -> JSONResponse:
     host_summary.sort(key=lambda x: x["traffic_total_bytes"], reverse=True)
     return JSONResponse(
         content={
+            "server_version": APP_VERSION,
             "window_minutes": minutes,
             "container_count": len(items),
             "samples": total_samples,
@@ -1399,6 +1411,21 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
 .kv dd{min-width:0;margin:0;text-align:right;overflow-wrap:anywhere}
 .container-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-top:12px}
 .empty-state{border:1px dashed #365680;border-radius:12px;padding:22px;text-align:center;color:#9fb5d5}
+:root{color-scheme:dark;--bg:#020617;--surface:#0f172a;--surface-2:#172033;--surface-3:#1e293b;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--success:#22c55e;--warning:#f59e0b;--danger:#ef4444;--focus:#7dd3fc}
+body{margin:0;background:var(--bg);color:var(--text)}
+.skip-link{position:fixed;left:12px;top:-60px;z-index:1000;background:var(--accent);color:#082f49;padding:10px 14px;border-radius:8px;font-weight:700}.skip-link:focus{top:12px}
+.app-shell{width:min(1600px,100%);margin:0 auto;padding:20px}
+.app-header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;padding:18px 20px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(135deg,#0f172a,#111d34)}
+.brand{display:flex;align-items:center;gap:12px}.brand-mark{width:38px;height:38px;display:grid;place-items:center;border:1px solid #0ea5e9;border-radius:10px;background:#082f49;color:#7dd3fc;font:800 16px ui-monospace,monospace}.brand h1{font-size:22px;line-height:1.2;margin:0}.brand p{margin:5px 0 0;color:var(--muted);font-size:13px}
+.header-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.nav-link{display:inline-flex;align-items:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;color:var(--text);text-decoration:none;background:var(--surface-3)}
+.nav-link:hover,.btn:hover{filter:brightness(1.12)}.nav-link:focus-visible,.btn:focus-visible,.host-toggle:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+.refresh-time{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}.kpi-card{padding:14px 16px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}.kpi-label{color:var(--muted);font-size:12px}.kpi-value{display:block;margin-top:5px;font-size:24px;font-weight:750;font-variant-numeric:tabular-nums}.kpi-value.danger{color:#fca5a5}
+.section-card{margin-bottom:18px;border:1px solid var(--border);border-radius:14px;background:var(--surface);overflow:hidden}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:15px 16px;border-bottom:1px solid var(--border);background:var(--surface-2)}.section-head h2{margin:0;font-size:17px}.section-head p{margin:4px 0 0;color:var(--muted);font-size:12px}.section-body{padding:14px;min-width:0}
+table{background:var(--surface);color:var(--text)}th,td{border-color:var(--border)}th{background:var(--surface-3);color:#cbd5e1;font-size:12px;letter-spacing:.02em}td{font-size:13px}.bad,.severity-critical{color:#fca5a5}.ok{color:#86efac}.severity-warning{color:#fcd34d}
+.host-group,.container-card,.panel{background:var(--surface);border-color:var(--border);box-shadow:none}.host-toggle{background:var(--surface-2);color:var(--text)}.host-toggle:hover{background:#1e293b}.metric,.info-block{background:#0b1220;border-color:var(--border)}.host-subtitle,.metric-label,.kv dt,.action-status{color:var(--muted)}
+.pill{border-color:var(--border);background:#111827;color:#cbd5e1}.pill-ok{border-color:#166534;background:#052e16;color:#86efac}.pill-warn{border-color:#92400e;background:#451a03;color:#fcd34d}.pill-bad{border-color:#991b1b;background:#450a0a;color:#fca5a5}.version-dot{width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:6px;flex:none}
+#modal{background:rgba(2,6,23,.82);backdrop-filter:blur(3px)}#card{background:var(--surface);border:1px solid var(--border)}
 @media (max-width:1000px){
   .host-toggle{grid-template-columns:24px minmax(0,1fr)}
   .host-summary{grid-column:2;justify-content:flex-start}
@@ -1406,7 +1433,7 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
   .snapshot-grid,.detail-grid{grid-template-columns:1fr}
 }
 @media (max-width:680px){
-  body{margin:8px}
+  .app-shell{padding:8px}.app-header{padding:14px;flex-direction:column}.header-actions{justify-content:flex-start}.kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.section-body{padding:8px}
   th,td{padding:6px;font-size:12px}
   .host-toggle{padding:12px 10px;gap:8px}
   .host-panel{padding:9px}
@@ -1415,17 +1442,17 @@ svg{width:100%;height:220px;border-top:1px solid #28436c}
   .host-summary{gap:5px}
   #security-alerts th:nth-child(4),#security-alerts td:nth-child(4),#security-alerts th:nth-child(7),#security-alerts td:nth-child(7),#security-alerts th:nth-child(8),#security-alerts td:nth-child(8){display:none}
 }
-@media (prefers-reduced-motion:reduce){.host-chevron{transition:none}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
 </style>
 </head><body>
-<h2>Narwhal Container Monitor Dashboard</h2>
-<p>每 15 秒自动刷新。CPU/内存使用率/连接数/网速展示采集到的原始上报值，服务端不再做 5 分钟平均。红色表示预警（CPU ≥ {ALERT_CPU_THRESHOLD_PERCENT:.2f}% 或连接数 ≥ {ALERT_CONN_THRESHOLD}）。离线容器默认保留 1 天并显示离线时长（按小时刷新），超过 1 天隐藏，超过 30 天自动清理。<a href='/stats' style='color:#8cc7ff'>查看统计页</a></p>
-<h3>安全告警（活动：<span id='active-alert-count'>0</span>）</h3>
-<table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th><th>操作</th></tr></thead><tbody></tbody></table>
-<h3>主机安全遥测</h3>
-<table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table>
-<h3>容器状态</h3>
-<div id='host-containers' class='host-list' aria-live='polite'></div>
+<a class='skip-link' href='#main-content'>跳到主要内容</a>
+<main id='main-content' class='app-shell'>
+<header class='app-header'><div class='brand'><span class='brand-mark' aria-hidden='true'>NW</span><div><h1>Narwhal Monitor</h1><p>容器安全与运行状态中心</p></div></div><div class='header-actions'><span id='server-version' class='pill'>Server 正在连接</span><span id='last-refresh' class='refresh-time'>尚未刷新</span><a class='nav-link' href='/stats'>数据统计</a></div></header>
+<section class='kpi-grid' aria-label='运行概览'><article class='kpi-card'><span class='kpi-label'>在线主机</span><strong id='kpi-hosts' class='kpi-value'>0</strong></article><article class='kpi-card'><span class='kpi-label'>监控容器</span><strong id='kpi-containers' class='kpi-value'>0</strong></article><article class='kpi-card'><span class='kpi-label'>活动告警</span><strong id='kpi-alerts' class='kpi-value danger'>0</strong></article><article class='kpi-card'><span class='kpi-label'>离线容器</span><strong id='kpi-offline' class='kpi-value'>0</strong></article></section>
+<section class='section-card'><header class='section-head'><div><h2>安全告警 <span class='pill pill-bad'>活动 <span id='active-alert-count'>0</span></span></h2><p>禁止操作只清理已识别的进程、服务和配置，不会停止容器。</p></div></header><div class='section-body'><table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th><th>操作</th></tr></thead><tbody></tbody></table></div></section>
+<section class='section-card'><header class='section-head'><div><h2>主机安全遥测</h2><p>低开销汇总网络、连接与访问日志状态。</p></div></header><div class='section-body'><table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table></div></section>
+<section class='section-card'><header class='section-head'><div><h2>容器状态</h2><p>按主机折叠；版本、在线状态与运行时分布集中显示。</p></div></header><div class='section-body'><div id='host-containers' class='host-list' aria-live='polite'><div class='empty-state'>正在加载节点数据…</div></div></div></section>
+</main>
 <div id='modal'><div id='card'>
   <h3 id='detail-title'></h3>
   <div class='detail-grid'>
@@ -1536,6 +1563,7 @@ async function loadAlerts(){
   const response=await fetch('/api/v1/security/alerts?active_only=true&limit=100');
   const data=await response.json();
   document.getElementById('active-alert-count').innerText=Number(data.active_count||0);
+  document.getElementById('kpi-alerts').innerText=Number(data.active_count||0);
   const body=document.querySelector('#security-alerts tbody'); body.innerHTML='';
   alertsById.clear();
   for(const alert of (data.items||[])){
@@ -1589,6 +1617,13 @@ function containerDetailUrl(host,runtime,project,container){
   return `/container-detail?${q.toString()}`;
 }
 const expandedHosts=new Set();
+function versionBadge(agentVersion,serverVersion){
+  const client=String(agentVersion||'unknown'),server=String(serverVersion||'dev');
+  if(client==='unknown'||client==='dev')return `<span class='pill pill-warn'><i class='version-dot'></i>Client 版本未知</span>`;
+  if(server==='dev')return `<span class='pill pill-warn'><i class='version-dot'></i>Client v${escapeHtml(client)} · Server dev</span>`;
+  if(client===server)return `<span class='pill pill-ok'><i class='version-dot'></i>v${escapeHtml(client)} · 最新</span>`;
+  return `<span class='pill pill-bad'><i class='version-dot'></i>Client v${escapeHtml(client)} · 应为 v${escapeHtml(server)}</span>`;
+}
 function setHostExpanded(host, group, button, panel, expanded){
   if(expanded)expandedHosts.add(host);else expandedHosts.delete(host);
   group.classList.toggle('is-open',expanded);
@@ -1599,6 +1634,13 @@ async function load(){
   const r=await fetch('/api/v1/latest'); const d=await r.json();
   const hostList=document.getElementById('host-containers'); hostList.innerHTML='';
   const groups=groupByHost(d.items||[]);
+  const offlineTotal=(d.items||[]).filter(x=>x.alerts?.stale).length;
+  document.getElementById('server-version').className=`pill ${d.server_version&&d.server_version!=='dev'?'pill-ok':'pill-warn'}`;
+  document.getElementById('server-version').innerHTML=`<i class='version-dot'></i>Server ${d.server_version&&d.server_version!=='dev'?`v${escapeHtml(d.server_version)}`:'dev'}`;
+  document.getElementById('last-refresh').innerText=`最近刷新 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
+  document.getElementById('kpi-hosts').innerText=groups.length;
+  document.getElementById('kpi-containers').innerText=(d.items||[]).length;
+  document.getElementById('kpi-offline').innerText=offlineTotal;
   if(!groups.length){
     hostList.innerHTML="<div class='empty-state'>暂未收到容器上报</div>";
     return;
@@ -1626,6 +1668,7 @@ async function load(){
     toggle.innerHTML=`<svg class='host-chevron' viewBox='0 0 24 24' aria-hidden='true'><path d='m9 5 7 7-7 7' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/></svg>`+
       `<span class='host-title'><span class='host-name'>${escapeHtml(host)}</span><span class='host-subtitle'>${rows.length} 个容器 · 主盘 ${escapeHtml(hostDiskText)} · 最近上报 ${escapeHtml(latest.timestamp_iso_utc8||'-')}</span></span>`+
       `<span class='host-summary'>${[...runtimeCounts.entries()].map(([name,count])=>`<span class='pill'>${escapeHtml(name)} ${count}</span>`).join('')}`+
+      `${versionBadge(latest.agent_version,d.server_version)}`+
       `<span class='pill ${offlineCount?'pill-bad':'pill-ok'}'>${offlineCount?`${offlineCount} 个离线`:'全部在线'}</span>`+
       `<span class='pill ${latest.container_network_ok_v4?'pill-ok':'pill-bad'}'>IPv4 ${latest.container_network_ok_v4?'正常':'异常'}</span>`+
       `<span class='pill ${latest.container_network_ok_v6?'pill-ok':'pill-warn'}'>IPv6 ${latest.container_network_ok_v6?'正常':'不可用'}</span></span>`;
@@ -1810,22 +1853,23 @@ def container_detail_page() -> str:
 <title>Container Detail</title>
 <style>
 *{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}
-body{margin:0;background:#0f1a2e;color:#dbe7ff;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}
-.page{width:min(1500px,100%);margin:auto;padding:18px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:16px}
-h1{margin:0;font-size:24px;overflow-wrap:anywhere}.subtitle{color:#9fb5d5;margin-top:4px;overflow-wrap:anywhere}.actions{display:flex;gap:8px;flex-wrap:wrap}
-.btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid #4b6fa8;border-radius:8px;background:#1a2c4e;color:#dbe7ff;text-decoration:none}
-.btn:focus-visible{outline:3px solid #8cc7ff;outline-offset:2px}.status{border:1px solid #29466f;border-radius:10px;background:#14243f;padding:10px 12px;margin-bottom:14px;color:#b8cbea}
+:root{color-scheme:dark;--bg:#020617;--surface:#0f172a;--surface-2:#172033;--surface-3:#1e293b;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--success:#22c55e;--danger:#ef4444;--focus:#7dd3fc}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}.skip-link{position:fixed;left:12px;top:-60px;z-index:10;background:var(--accent);color:#082f49;padding:10px 14px;border-radius:8px;font-weight:700}.skip-link:focus{top:12px}
+.page{width:min(1500px,100%);margin:auto;padding:20px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:16px;padding:17px 18px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(135deg,var(--surface),#111d34)}
+h1{margin:0;font-size:24px;overflow-wrap:anywhere}.subtitle{color:var(--muted);margin-top:4px;overflow-wrap:anywhere}.actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);text-decoration:none}
+.btn:hover{filter:brightness(1.12)}.btn:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.status{border:1px solid var(--border);border-radius:10px;background:var(--surface-2);padding:10px 12px;margin-bottom:14px;color:#cbd5e1}
 .status.bad{border-color:#a84655;color:#ffadb8}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
-.metric,.panel{min-width:0;border:1px solid #29466f;border-radius:12px;background:#13213b;padding:13px}.metric span{display:block;color:#91a9cb;font-size:12px}.metric strong{display:block;margin-top:4px;font-size:20px;overflow-wrap:anywhere}
+.metric,.panel{min-width:0;border:1px solid var(--border);border-radius:12px;background:var(--surface);padding:13px}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{display:block;margin-top:4px;font-size:20px;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
 .charts,.details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:14px}.panel h2{font-size:16px;margin:0 0 10px}.panel h3{font-size:14px;margin:12px 0 6px;color:#9fc8ff}
 .legend{display:flex;gap:14px;flex-wrap:wrap;color:#9fb5d5;font-size:12px;margin-bottom:7px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
 svg{width:100%;height:220px;border-top:1px solid #29466f}.kv{display:grid;grid-template-columns:minmax(115px,auto) minmax(0,1fr);gap:6px 10px;margin:0}.kv dt{color:#91a9cb}.kv dd{margin:0;text-align:right;overflow-wrap:anywhere}
 .list{margin:6px 0 0 18px;padding:0}.ok{color:#72dfa7}.bad-text{color:#ff6b78}.samples{display:grid;gap:7px}.sample{display:grid;grid-template-columns:1.4fr repeat(5,minmax(75px,1fr));gap:8px;padding:8px;border:1px solid #274365;border-radius:8px;background:#101e36;font-size:12px}.sample span{overflow-wrap:anywhere}
-.source{display:inline-flex;border:1px solid #365680;border-radius:999px;padding:3px 9px;background:#10213c;color:#c9dbf5;font-size:12px}
+.source,.version-pill{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:999px;padding:3px 9px;background:#111827;color:#cbd5e1;font-size:12px}.version-pill.ok{border-color:#166534;background:#052e16;color:#86efac}.version-pill.bad{border-color:#991b1b;background:#450a0a;color:#fca5a5}.version-pill.warn{border-color:#92400e;background:#451a03;color:#fcd34d}
 @media(max-width:900px){.top{flex-direction:column}.charts,.details{grid-template-columns:1fr}.sample{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:520px){.page{padding:10px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metric strong{font-size:17px}.kv{grid-template-columns:1fr}.kv dd{text-align:left}.actions{width:100%}.btn{flex:1}}
-</style></head><body><main class='page'>
-<header class='top'><div><h1 id='title'>容器详情</h1><div id='subtitle' class='subtitle'>正在读取容器内部指标…</div></div><nav class='actions'><a class='btn' href='/stats'>返回统计页</a><a class='btn' href='/'>返回总览</a></nav></header>
+</style></head><body><a class='skip-link' href='#detail-main'>跳到主要内容</a><main id='detail-main' class='page'>
+<header class='top'><div><h1 id='title'>容器详情</h1><div id='subtitle' class='subtitle'>正在读取容器内部指标…</div></div><nav class='actions'><span id='detail-version' class='version-pill warn'>版本检查中</span><a class='btn' href='/stats'>返回统计页</a><a class='btn' href='/'>返回总览</a></nav></header>
 <div id='status' class='status'>正在加载最新采样与历史数据…</div>
 <section id='metrics' class='metrics'></section>
 <section class='charts'><article class='panel'><h2>容器 CPU / 内存历史</h2><div class='legend'><span><i class='dot' style='background:#4a90e2'></i>CPU%</span><span><i class='dot' style='background:#16a085'></i>内存%</span></div><svg id='resource-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article><article class='panel'><h2>容器网络速率历史</h2><div class='legend'><span><i class='dot' style='background:#2ecc71'></i>RX Mbps</span><span><i class='dot' style='background:#f39c12'></i>TX Mbps</span></div><svg id='network-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article></section>
@@ -1847,7 +1891,11 @@ async function loadDetail(){
  try{
   const [latestData,historyData]=await Promise.all([fetch('/api/v1/latest?include_stale=true').then(r=>r.json()),fetch(`/api/v1/history?${params}`).then(r=>r.json())]);
   const current=(latestData.items||[]).find(x=>x.host_id===host&&x.runtime===runtime&&(x.project||'')===project&&x.container_name===container);const pts=historyData.items||[];
-  const status=document.getElementById('status');
+  const status=document.getElementById('status'),version=document.getElementById('detail-version');
+  const clientVersion=String(current?.agent_version||'unknown'),serverVersion=String(latestData.server_version||'dev');
+  if(clientVersion!=='unknown'&&clientVersion!=='dev'&&clientVersion===serverVersion){version.className='version-pill ok';version.innerText=`Client / Server v${serverVersion}`}
+  else if(clientVersion==='unknown'||clientVersion==='dev'){version.className='version-pill warn';version.innerText=`Client 版本未知 · Server ${serverVersion==='dev'?'dev':`v${serverVersion}`}`}
+  else{version.className='version-pill bad';version.innerText=`Client v${clientVersion} · Server v${serverVersion}`}
   if(current){status.innerHTML=`<span class='source'>${esc(sourceText(runtime))}</span>　最新采样 ${esc(current.timestamp_iso_utc8||'-')}${current.alerts?.stale?'　<span class="bad-text">当前离线或上报已过期</span>':''}`}
   else{status.className='status bad';status.innerText='未找到该容器的当前采样，仅显示保留的历史数据。'}
   const sec=current?.security||{},limit=Number(current?.mem_limit_bytes||0),used=Number(current?.mem_bytes||0),rootTotal=Number(current?.container_fs_root_total_bytes||0),rootAvail=Number(current?.container_fs_root_avail_bytes||0);
@@ -1873,25 +1921,27 @@ def stats_page() -> str:
 <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Container Stats</title>
 <style>
 *{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}
-body{font-family:sans-serif;margin:1rem;background:#0f1a2e;color:#dbe7ff}
-.topbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+:root{color-scheme:dark;--bg:#020617;--surface:#0f172a;--surface-2:#172033;--surface-3:#1e293b;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--focus:#7dd3fc}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.5}.page{width:min(1600px,100%);margin:auto;padding:20px}.skip-link{position:fixed;left:12px;top:-60px;z-index:10;background:var(--accent);color:#082f49;padding:10px 14px;border-radius:8px;font-weight:700}.skip-link:focus{top:12px}
+.page-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:18px 20px;margin-bottom:16px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(135deg,var(--surface),#111d34)}.page-header h1{margin:0;font-size:22px}.page-header p{margin:4px 0 0;color:var(--muted);font-size:13px}
+.topbar{display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap}.topbar label{color:var(--muted);font-size:13px}.topbar input{width:110px;min-height:44px;padding:7px 9px;border:1px solid var(--border);border-radius:8px;background:#0b1220;color:var(--text)}.btn-link,.topbar button{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);text-decoration:none;cursor:pointer}.btn-link:hover,.topbar button:hover{filter:brightness(1.12)}.btn-link:focus-visible,.topbar button:focus-visible,.topbar input:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
 .card-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-bottom:12px}
-.card{background:#13213b;border:1px solid #233b61;border-radius:10px;padding:10px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;color:var(--muted);font-size:12px}
 .value{font-size:22px;font-weight:700;margin-top:6px}
-table{border-collapse:collapse;width:100%;max-width:100%;table-layout:fixed;background:#13213b;color:#dbe7ff;margin-top:10px}
-th,td{border:1px solid #233b61;padding:8px;text-align:center;overflow-wrap:anywhere;word-break:break-word}
-th{background:#1a2c4e}
-a{color:#8cc7ff}
-.detail-link{display:inline-block;border:1px solid #4b6fa8;border-radius:6px;padding:4px 8px;text-decoration:none;background:#1a2c4e}
-@media(max-width:680px){body{margin:8px}.card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}th,td{padding:5px;font-size:11px}#all-containers th:nth-child(6),#all-containers td:nth-child(6),#all-containers th:nth-child(7),#all-containers td:nth-child(7),#all-containers th:nth-child(9),#all-containers td:nth-child(9){display:none}}
+.value{color:var(--text);font-variant-numeric:tabular-nums}.section{margin:14px 0;border:1px solid var(--border);border-radius:12px;background:var(--surface);overflow:hidden}.section h2{margin:0;padding:13px 15px;border-bottom:1px solid var(--border);background:var(--surface-2);font-size:16px}
+table{border-collapse:collapse;width:100%;max-width:100%;table-layout:fixed;background:var(--surface);color:var(--text)}
+th,td{border:1px solid var(--border);padding:8px;text-align:center;overflow-wrap:anywhere;word-break:break-word;font-size:12px}th{background:var(--surface-3);color:#cbd5e1}
+a{color:#7dd3fc}.detail-link{display:inline-flex;align-items:center;justify-content:center;min-height:40px;border:1px solid var(--border);border-radius:7px;padding:5px 9px;text-decoration:none;background:var(--surface-3);color:var(--text)}.version-pill{display:inline-flex;align-items:center;border:1px solid #166534;border-radius:999px;padding:4px 9px;background:#052e16;color:#86efac;font-size:12px}.version-pill.warn{border-color:#92400e;background:#451a03;color:#fcd34d}
+@media(max-width:800px){.page{padding:8px}.page-header{flex-direction:column;padding:14px}.topbar{justify-content:flex-start}.card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}th,td{padding:5px;font-size:11px}#all-containers th:nth-child(6),#all-containers td:nth-child(6),#all-containers th:nth-child(7),#all-containers td:nth-child(7),#all-containers th:nth-child(9),#all-containers td:nth-child(9){display:none}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}}
 </style>
-</head><body>
-<h2>数据统计页</h2>
-<div class='topbar'>
+</head><body><a class='skip-link' href='#stats-main'>跳到主要内容</a><main id='stats-main' class='page'>
+<header class='page-header'><div><h1>数据统计</h1><p>资源、连接与累计流量分析；点击排查进入独立容器详情。</p></div><div class='topbar'>
+  <span id='stats-server-version' class='version-pill warn'>Server 版本检查中</span>
   <label>统计窗口(分钟)：<input id='minutes' type='number' value='720' min='5' max='10080' /></label>
   <button onclick='loadStats()'>刷新</button>
-  <a href='/'>返回总览</a>
-</div>
+  <a class='btn-link' href='/'>返回总览</a>
+</div></header>
 <div class='card-grid'>
   <div class='card'><div>容器数</div><div class='value' id='kpi-containers'>0</div></div>
   <div class='card'><div>样本数</div><div class='value' id='kpi-samples'>0</div></div>
@@ -1899,20 +1949,25 @@ a{color:#8cc7ff}
   <div class='card'><div>窗口</div><div class='value' id='kpi-window'>--</div></div>
 </div>
 
-<h3>Top10：平均 CPU</h3>
+<section class='section'><h2>Top10：平均 CPU</h2>
   <table id='cpu-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均 CPU%</th><th>峰值 CPU%</th><th>估算间隔(秒)</th><th>排查</th></tr></thead><tbody></tbody></table>
+</section>
 
-<h3>Top10：平均连接数</h3>
+<section class='section'><h2>Top10：平均连接数</h2>
   <table id='conn-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均连接</th><th>峰值连接</th><th>样本数</th><th>排查</th></tr></thead><tbody></tbody></table>
+</section>
 
-<h3>Top10：累计流量</h3>
+<section class='section'><h2>Top10：累计流量</h2>
   <table id='traffic-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th><th>排查</th></tr></thead><tbody></tbody></table>
+</section>
 
-<h3>全部容器</h3>
+<section class='section'><h2>全部容器</h2>
 <table id='all-containers'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>当前 CPU%</th><th>当前内存%</th><th>当前 RX</th><th>当前 TX</th><th>当前连接</th><th>样本数</th><th>排查</th></tr></thead><tbody></tbody></table>
+</section>
 
-<h3>Host 汇总</h3>
+<section class='section'><h2>主机汇总</h2>
 <table id='host-summary'><thead><tr><th>主机</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th><th>样本数</th></tr></thead><tbody></tbody></table>
+</section>
 
 <script>
 function fmtBytes(n){
@@ -1944,6 +1999,9 @@ async function loadStats(){
   const minutes=Math.max(5, Math.min(10080, Number(document.getElementById('minutes').value||720)));
   const res=await fetch(`/api/v1/stats?minutes=${minutes}`);
   const data=await res.json();
+  const version=document.getElementById('stats-server-version'),serverVersion=String(data.server_version||'dev');
+  version.className=`version-pill ${serverVersion==='dev'?'warn':''}`;
+  version.innerText=serverVersion==='dev'?'Server dev':`Server v${serverVersion}`;
   document.getElementById('kpi-containers').innerText=data.container_count||0;
   document.getElementById('kpi-samples').innerText=data.samples||0;
   document.getElementById('kpi-interval').innerText=(data.recommendation?.suggested_interval_seconds||'--') + 's';
@@ -1986,5 +2044,5 @@ async function loadStats(){
 }
 loadStats();
 </script>
-</body></html>
+</main></body></html>
 """

@@ -58,7 +58,7 @@ def check_server_version(
                 "X-Narwhal-Response-Signature", ""
             )
     except urllib.error.HTTPError as exc:
-        if exc.code in (404, 409, 425, 503):
+        if exc.code in (401, 404, 409, 425, 503):
             raise UpdateDeferred(
                 f"Server version gate is not ready (HTTP {exc.code})"
             ) from exc

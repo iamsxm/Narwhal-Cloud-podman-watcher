@@ -228,8 +228,13 @@ if ! is_truthy "${NARWHAL_SKIP_SERVER_VERSION_GATE:-0}"; then
     echo "$version_gate_output"
   fi
   if [[ "$version_gate_result" -eq 10 ]]; then
-    echo "[WAIT] Client 保持当前版本；Server 升级到 v$PROJECT_VERSION 后将自动重试。"
-    exit 75
+    if [[ "$MODE" == "install" && "${NARWHAL_AUTO_UPDATE:-0}" != "1" ]]; then
+      echo "[WARN] Server 尚未运行 v$PROJECT_VERSION；继续首次人工安装。"
+      echo "[WARN] Client 可能短暂领先，Server 自动升级完成后版本会恢复一致。"
+    else
+      echo "[WAIT] Client 保持当前版本；Server 升级到 v$PROJECT_VERSION 后将自动重试。"
+      exit 75
+    fi
   elif [[ "$version_gate_result" -ne 0 ]]; then
     echo "[ERROR] Server 版本校验失败，拒绝升级 Client。"
     exit 1

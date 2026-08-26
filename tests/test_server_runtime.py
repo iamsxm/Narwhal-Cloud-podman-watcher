@@ -268,6 +268,8 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("scripts/check-server-version.py", installer)
         self.assertIn("--expected-version \"$PROJECT_VERSION\"", installer)
         self.assertIn("exit 75", installer)
+        self.assertIn('[[ "$MODE" == "install"', installer)
+        self.assertIn("继续首次人工安装", installer)
         self.assertLess(
             installer.index("scripts/check-server-version.py"),
             installer.index("NARWHAL_VERSION=$PROJECT_VERSION"),

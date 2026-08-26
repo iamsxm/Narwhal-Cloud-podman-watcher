@@ -3,6 +3,7 @@ import hmac
 import importlib.util
 import json
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -92,6 +93,22 @@ class VersionGateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "signature verification failed"):
                 gate.check_server_version(
                     "https://monitor.example.com", "shared-secret", "1.5.0"
+                )
+
+    def test_legacy_server_basic_auth_401_defers_update(self):
+        error = urllib.error.HTTPError(
+            "https://monitor.example.com/api/v1/update/version",
+            401,
+            "Unauthorized",
+            {},
+            None,
+        )
+        with mock.patch.object(
+            gate.ssl, "create_default_context", return_value=object()
+        ), mock.patch.object(gate.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(gate.UpdateDeferred, "HTTP 401"):
+                gate.check_server_version(
+                    "https://monitor.example.com", "shared-secret", "1.5.1"
                 )
 
 

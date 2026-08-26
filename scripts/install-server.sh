@@ -10,6 +10,7 @@ TLS_DIR="/opt/narwhal-monitor/caddy"
 TLS_CA_EXPORT_DIR="/opt/narwhal-monitor/tls-ca"
 CONTAINER_NAME="narwhal-monitor-server"
 TLS_CONTAINER_NAME="narwhal-monitor-caddy"
+DEPLOY_LOCK_FILE="/run/narwhal-monitor-server-deploy.lock"
 
 MODE="${1:-install}"
 RESET_DATA_ARG="${2:-}"
@@ -142,6 +143,73 @@ ensure_root_and_deps() {
     apt-get update
     apt-get install -y podman
   fi
+}
+
+acquire_deploy_lock() {
+  if [[ "${NARWHAL_SERVER_DEPLOY_LOCKED:-0}" == "1" ]]; then
+    return
+  fi
+  exec 9>"$DEPLOY_LOCK_FILE"
+  if ! flock --exclusive --wait 300 9; then
+    echo "[ERROR] 等待 Server 部署锁超过 5 分钟，可能已有安装或自动更新仍在运行。"
+    echo "[INFO] 可检查: systemctl status narwhal-monitor-server-update.service --no-pager"
+    exit 1
+  fi
+  export NARWHAL_SERVER_DEPLOY_LOCKED=1
+}
+
+replace_server_container() {
+  local image_name="$1"
+  local port_binding="$2"
+  local existing_id=""
+  existing_id="$(podman container inspect --format '{{.Id}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+  if [[ -n "$existing_id" ]]; then
+    echo "[INFO] 正在替换现有 Server 容器: ${existing_id:0:12}"
+    if ! podman rm -f --time 10 "$CONTAINER_NAME"; then
+      echo "[WARN] 首次删除旧 Server 容器失败，尝试强制停止后再次删除..."
+      podman stop --time 5 "$CONTAINER_NAME" >/dev/null 2>&1 || true
+      podman rm -f --time 0 "$CONTAINER_NAME" || true
+    fi
+  fi
+  if podman container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    echo "[ERROR] 旧 Server 容器仍占用名称 '$CONTAINER_NAME'，拒绝继续以免产生半更新状态。"
+    podman container inspect --format 'ID={{.Id}} Status={{.State.Status}} Error={{.State.Error}}' \
+      "$CONTAINER_NAME" 2>/dev/null || true
+    exit 1
+  fi
+
+  local new_id=""
+  if ! new_id="$(podman run -d --replace --name "$CONTAINER_NAME" \
+    --restart=always \
+    -p "$port_binding" \
+    --env-file "$SERVER_ENV_FILE" \
+    -v "$SERVER_DATA_DIR:/data" \
+    -v "$TLS_CA_EXPORT_DIR:/tls-ca:ro" \
+    "$image_name")"; then
+    echo "[ERROR] 新 Server 容器创建失败。"
+    exit 1
+  fi
+  echo "$new_id"
+
+  local running="false"
+  local runtime_version=""
+  local attempt=""
+  for attempt in $(seq 1 30); do
+    running="$(podman container inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+    runtime_version="$(
+      podman container inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+        "$CONTAINER_NAME" 2>/dev/null \
+        | awk -F= '$1=="NARWHAL_VERSION"{print substr($0,index($0,"=")+1);exit}'
+    )"
+    if [[ "$running" == "true" && "$runtime_version" == "$PROJECT_VERSION" ]]; then
+      echo "[OK] Server 容器已运行，版本 v$runtime_version。"
+      return
+    fi
+    sleep 1
+  done
+  echo "[ERROR] Server 容器启动或版本验证失败: running=${running:-unknown}, runtime_version=${runtime_version:-unknown}, expected=$PROJECT_VERSION"
+  podman logs --tail 120 "$CONTAINER_NAME" 2>&1 || true
+  exit 1
 }
 
 setup_tls_proxy() {
@@ -357,6 +425,7 @@ EOF_HTTPS_GUIDE
 
 main() {
   ensure_root_and_deps
+  acquire_deploy_lock
   if [[ "$MODE" == "reset-password" ]]; then
     reset_server_password
     return
@@ -543,16 +612,9 @@ ENV
     port_binding="127.0.0.1:${port}:8080"
   fi
 
-  # Keep the currently running Server available until the replacement image is ready.
-  podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-
-  podman run -d --name "$CONTAINER_NAME" \
-    --restart=always \
-    -p "$port_binding" \
-    --env-file "$SERVER_ENV_FILE" \
-    -v "$SERVER_DATA_DIR:/data" \
-    -v "$TLS_CA_EXPORT_DIR:/tls-ca:ro" \
-    "$image_name"
+  # Keep the current Server available until the replacement image is ready, then
+  # perform one serialized, verified and idempotent container replacement.
+  replace_server_container "$image_name" "$port_binding"
 
   setup_tls_proxy "$tls_host" "$port" "$tls_enable" "$tls_email" "$tls_cert_mode" "$cloudflare_api_token" "$caddy_image"
   bash "$ROOT_DIR/scripts/setup-auto-update.sh" server "$ROOT_DIR"

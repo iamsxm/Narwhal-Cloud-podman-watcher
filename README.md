@@ -164,6 +164,7 @@ Timer 每 15 分钟比较 GitHub `origin/main` 与已部署提交。自动更新
 - 仓库存在已跟踪的本地修改、分支分叉或不能 fast-forward 时拒绝更新，不会强制覆盖。
 - Server 使用 GHCR 镜像时，会核对镜像的提交 revision；新提交对应的多架构镜像未构建完成时保留现有容器，稍后重试。
 - Server 同时核对状态文件、Git 提交与容器内 `NARWHAL_VERSION`；状态文件显示最新但容器仍为旧版时，会识别为 `deployment drift` 并重新部署。
+- Server 手动安装与后台自动更新共用独占部署锁，防止两个流程同时替换容器。镜像准备完成后，会复检并删除旧的同名容器，使用 Podman `--replace` 幂等创建新容器，再确认容器运行状态及 `NARWHAL_VERSION`；删除、启动或版本校验失败都会明确停止并输出诊断，不再吞掉错误后继续执行。
 - Client 更新前通过 HMAC 签名接口 `/api/v1/update/version` 核对 Server 的实际运行版本。Server 未升级、接口尚不可用或暂时无法连接时，Client 保持原版本并在下个 timer 周期自动重试。
 - 首次人工安装 Client 时，若目标是尚无版本接口的旧 Server（旧版会返回 HTTP 401），安装器会明确警告并继续安装；这是为了避免新节点无法部署。后续自动更新仍执行严格的 Server-first 门禁。
 - 更新成功才写入部署版本；失败会保留当前服务，并在下一周期重试。

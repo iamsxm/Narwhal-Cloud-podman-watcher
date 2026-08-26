@@ -291,9 +291,18 @@ class ServerRuntimeTests(unittest.TestCase):
             encoding="utf-8"
         )
         updater = (ROOT / "scripts" / "auto-update.sh").read_text(encoding="utf-8")
+        server_installer = (ROOT / "scripts" / "install-server.sh").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("TimeoutStartSec=30min", setup)
         self.assertIn("for _ in $(seq 1 30)", updater)
         self.assertIn("sleep 30", updater)
+        self.assertIn("deployment drift detected", updater)
+        self.assertIn("org.opencontainers.image.revision", updater)
+        self.assertIn("flock --exclusive --wait 300", server_installer)
+        self.assertIn("podman run -d --replace", server_installer)
+        self.assertIn("旧 Server 容器仍占用名称", server_installer)
+        self.assertIn("Server 容器启动或版本验证失败", server_installer)
 
     def test_signed_agent_version_endpoint_reports_runtime_server_version(self):
         original_version = server.APP_VERSION

@@ -230,6 +230,13 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("入站去重 IP", html)
         self.assertNotIn("<table id='t'", html)
 
+    def test_active_socks_enforcement_actions_explain_policy_effects(self):
+        html = server.dashboard()
+        self.assertIn("解除拦截并允许（不再提醒）", html)
+        self.assertIn("仅隐藏本次告警（保留拦截）", html)
+        self.assertIn("即使服务仍然无认证并对公网/NAT 暴露", html)
+        self.assertIn("节点侧拦截策略不会解除", html)
+
     def test_container_detail_is_a_dedicated_internal_metrics_page(self):
         html = server.container_detail_page()
         self.assertIn("容器内部进程", html)
@@ -678,6 +685,45 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertEqual(body["action"]["action_type"], "enforce_socks_auth")
         self.assertEqual(body["action"]["params"]["auth_mode"], "no_auth")
         self.assertEqual(body["action"]["params"]["process_names"], ["microsocks"])
+
+    def test_legacy_config_confirmed_sockd_alert_keeps_safe_stop_action(self):
+        alert = {
+            "type": "socks_weak_auth",
+            "severity": "critical",
+            "title": "SOCKS risk",
+            "message": (
+                "检测到 SOCKS 服务允许无认证访问；公网/NAT 暴露 是；"
+                "进程 sockd；不会上报用户名或密码内容"
+            ),
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "proxy",
+            "socks_auth_mode": "no_auth",
+            "socks_processes": [],
+            "socks_process_pids": [],
+            "socks_config_files": ["/etc/sockd.conf"],
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        item = json.loads(server.security_alerts().body)["items"][0]
+        self.assertEqual(item["details"]["socks_processes"], ["sockd"])
+
+        class State:
+            dashboard_user = "operator"
+
+        class Request:
+            state = State()
+
+            async def json(self):
+                return {"decision": "deny"}
+
+        response = asyncio.run(server.set_security_alert_disposition(alert_id, Request()))
+        body = json.loads(response.body)
+        self.assertEqual(body["action"]["params"]["process_names"], ["sockd"])
 
     def test_deny_rejects_nonempty_weak_socks_password(self):
         alert = {

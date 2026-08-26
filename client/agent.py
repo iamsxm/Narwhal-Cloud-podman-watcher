@@ -3143,17 +3143,21 @@ def collect_panel_pairing_indicators(
             for item in socks_process.get("process_matches", [])
             if isinstance(item, dict)
         }
-        socks_process_matches = [
-            {
-                **item,
-                "auth_state": detected_auth_states.get(
-                    (int(item.get("pid") or 0), str(item.get("process") or "")),
-                    config_auth_mode,
-                ),
-            }
-            for item in socks_process.get("candidate_matches", [])
-            if isinstance(item, dict)
-        ]
+        config_confirmed_matches = []
+        for item in socks_process.get("candidate_matches", []):
+            if not isinstance(item, dict):
+                continue
+            identity = (int(item.get("pid") or 0), str(item.get("process") or ""))
+            auth_state = detected_auth_states.get(identity, "unknown")
+            config_confirmed_matches.append(
+                {
+                    **item,
+                    "auth_state": config_auth_mode
+                    if auth_state in ("", "unknown")
+                    else auth_state,
+                }
+            )
+        socks_process_matches = config_confirmed_matches
     result["socks_proxy"] = {
         "detected": bool(socks_process.get("detected") or socks_config.get("detected")),
         "process_matches": socks_process_matches,

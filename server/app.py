@@ -1122,12 +1122,35 @@ def _alert_action_evidence(alert: sqlite3.Row) -> Dict[str, Any]:
         in ("no_auth", "weak_password", "configured", "unknown")
         else "unknown"
     )
-    details["socks_processes"] = [
-        item for item in clean(details.get("socks_processes")) if item.lower() in {
-            "microsocks", "sockd", "danted", "srelay", "hev-socks5-server",
-            "3proxy", "gost", "xray", "v2ray", "sing-box",
-        }
+    allowed_socks_processes = {
+        "microsocks", "sockd", "danted", "srelay", "hev-socks5-server",
+        "3proxy", "gost", "xray", "v2ray", "sing-box",
+    }
+    socks_config_files = clean(details.get("socks_config_files"))
+    socks_processes = [
+        item
+        for item in clean(details.get("socks_processes"))
+        if item.lower() in allowed_socks_processes
     ]
+    if (
+        not socks_processes
+        and details["socks_auth_mode"] == "no_auth"
+        and socks_config_files
+    ):
+        process_match = re.search(r"(?:^|[；;])\s*进程\s*([^；;]+)", message)
+        message_processes = (
+            re.split(r"[,，\s]+", process_match.group(1).strip())
+            if process_match
+            else []
+        )
+        socks_processes = sorted(
+            {
+                item.lower()
+                for item in message_processes
+                if item.lower() in allowed_socks_processes
+            }
+        )
+    details["socks_processes"] = socks_processes
     details["socks_process_pids"] = sorted(
         {
             int(item)
@@ -1135,7 +1158,7 @@ def _alert_action_evidence(alert: sqlite3.Row) -> Dict[str, Any]:
             if isinstance(item, int) and 1 < item <= 4194304
         }
     ) if isinstance(details.get("socks_process_pids"), list) else []
-    details["socks_config_files"] = clean(details.get("socks_config_files"))
+    details["socks_config_files"] = socks_config_files
     return details
 
 
@@ -1815,7 +1838,10 @@ th{background:#1a2c4e}
 .btn-allow{background:#185d4a;border-color:#36a77f;margin-right:6px}
 .btn-dismiss{background:#34445e;border-color:#6e85a8}
 .btn:disabled{opacity:.55;cursor:not-allowed}
-.action-status{font-size:12px;margin-top:5px;color:#a9bddc;max-width:260px}
+.security-action-state{display:flex;align-items:center;justify-content:center;min-height:28px;margin-bottom:7px;font-weight:650}
+.security-action-buttons{display:flex;align-items:center;justify-content:center;gap:6px;flex-wrap:wrap}
+.security-action-buttons .btn{margin-right:0}
+.action-status{font-size:12px;margin-top:7px;color:#a9bddc}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center}
 #card{background:#0d1730;border-radius:12px;padding:16px;width:min(1380px,96vw);max-height:94vh;overflow-y:auto}
 .legend{display:flex;gap:14px;align-items:center;margin:8px 0 4px 0;font-size:14px}
@@ -1995,6 +2021,8 @@ async function setAlertDisposition(alertId, decision){
   const alert=alertsById.get(Number(alertId)); if(!alert)return;
   if(submittingAlertActions.has(Number(alertId)))return;
   const details=alert.details||{};
+  const latestAction=alert.latest_action||null;
+  const socksPolicyActive=alert.type==='socks_weak_auth'&&latestAction?.action_type==='enforce_socks_auth'&&latestAction?.status==='succeeded'&&details.socks_auth_mode==='no_auth';
   let promptText='';
   if(decision==='deny'){
     if(alert.type==='socks_weak_auth'){
@@ -2006,11 +2034,17 @@ async function setAlertDisposition(alertId, decision){
       promptText=`确认禁止并清理 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的机场对接组件？\n\n将终止进程特征：${processes}\n停用并删除对应服务，删除配置：${files}\n容器本身不会停止。成功后同一面板域名再次出现会自动清理且不再提醒。`;
     }
   }else if(decision==='allow_silent'){
-    promptText=alert.type==='socks_weak_auth'
-      ?`确认允许此 SOCKS 告警且以后不再提醒？\n\n该告警指纹会被永久抑制；如果此前启用了持续拦截，节点会同时解除策略，之后可以正常启动服务。`
-      :`确认允许此告警且以后不再提醒？\n\n该告警指纹会被永久抑制；机场面板域名还会同步加入节点放行名单。`;
+    if(socksPolicyActive){
+      promptText=`确认解除持续拦截并永久允许此 SOCKS 服务？\n\n节点会删除持续拦截策略，此告警以后不再提醒。即使服务仍然无认证并对公网/NAT 暴露，也不会再次自动停止。`;
+    }else if(alert.type==='socks_weak_auth'){
+      promptText=`确认允许此 SOCKS 告警且以后不再提醒？\n\n该告警指纹会被永久抑制，节点不会为这条告警启用持续拦截。`;
+    }else{
+      promptText=`确认允许此告警且以后不再提醒？\n\n该告警指纹会被永久抑制；机场面板域名还会同步加入节点放行名单。`;
+    }
   }else{
-    promptText=`确认仅取消本次提醒？\n\n当前连续出现期间不再显示；事件消失后如果再次出现，仍会重新告警。`;
+    promptText=socksPolicyActive
+      ?`确认仅隐藏本次告警并保留持续拦截？\n\n节点侧拦截策略不会解除；无认证 SOCKS 再次启动时仍会被自动停止。事件消失后如果再次出现，仍会重新告警。`
+      :`确认仅取消本次提醒？\n\n当前连续出现期间不再显示；事件消失后如果再次出现，仍会重新告警。`;
   }
   if(!confirm(promptText))return;
   submittingAlertActions.add(Number(alertId));
@@ -2056,9 +2090,11 @@ async function loadAlerts(){
     }else if(canPanelRemediate){
       denyControl=changed&&!recurred?`<span class='ok'>已禁止，等待复检</span>`:`<button class='btn btn-danger' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'deny')">${denyLabel}</button>`;
     }else if(socksReleased){denyControl=`<span class='ok'>已检测到非空认证，持续拦截已解除</span>`;}
-    const actions=denyControl+
-      `<button class='btn btn-allow' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'allow_silent')">允许且不再提醒</button>`+
-      `<button class='btn btn-dismiss' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'dismiss_once')">本次取消提醒</button>`;
+    const allowLabel=socksPolicyActive?'解除拦截并允许（不再提醒）':'允许且不再提醒';
+    const dismissLabel=socksPolicyActive?'仅隐藏本次告警（保留拦截）':'本次取消提醒';
+    const actions=`<div class='security-action-state'>${denyControl}</div><div class='security-action-buttons'>`+
+      `<button class='btn btn-allow' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'allow_silent')">${allowLabel}</button>`+
+      `<button class='btn btn-dismiss' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'dismiss_once')">${dismissLabel}</button></div>`;
     tr.innerHTML=`<td class='severity-${escapeHtml(alert.severity)}'>${escapeHtml(alert.severity)}</td>`+
       `<td>${escapeHtml(alert.host_id)}</td><td>${escapeHtml(runtime)}</td>`+
       `<td>${escapeHtml(alert.container_name||'-')}</td><td>${escapeHtml(alert.type)}</td>`+

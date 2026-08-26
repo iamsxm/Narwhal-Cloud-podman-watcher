@@ -789,6 +789,20 @@ class SecurityTelemetryTests(unittest.TestCase):
             [{"pid": 12, "process": "xray", "auth_state": "no_auth"}],
         )
 
+    def test_config_confirmed_sockd_uses_config_auth_for_safe_process_target(self):
+        process_output = "14 S sockd /usr/sbin/sockd -f /etc/sockd.conf\n"
+        markers = "@@SOCKS:/etc/sockd.conf\n@@NOAUTH:/etc/sockd.conf\n"
+        with mock.patch.object(agent, "run", side_effect=[process_output, markers, ""]):
+            result = agent.collect_panel_pairing_indicators(
+                "proxy", "incus", "default", "debian:latest"
+            )
+        socks = result["socks_proxy"]
+        self.assertEqual(socks["auth_mode"], "no_auth")
+        self.assertEqual(
+            socks["process_matches"],
+            [{"pid": 14, "process": "sockd", "auth_state": "no_auth"}],
+        )
+
     def test_socks_inbound_fanout_replaces_generic_alert(self):
         container = {
             "name": "proxy",

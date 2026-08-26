@@ -20,7 +20,7 @@
 - **告警快速处理**：活动告警可选择“禁止/持续拦截”“允许且不再提醒”或“本次取消提醒”；Podman/Incus 的机场面板对接告警支持定向清理，无认证 SOCKS 告警支持停止服务并持续拦截，Docker 不执行处理。
 - **无认证 SOCKS 持续拦截**：Incus/Podman 的无认证或空密码 SOCKS 告警可一键停止对应进程/服务并保存节点侧策略；以后再次无认证启动会自动停止，检测到非空认证后自动解除策略。不会停止容器，也不会删除 SOCKS 配置或服务文件。
 - **按需深度上报**：可在容器详情页对可疑的 Podman/Incus 容器发起一次性深度采样，在下一 Client 周期查看瞬时流量、详细进程、连接 IP 及进程归属；Docker 默认仅提醒，不执行该任务。
-- **自动更新**：Server 与 Client 默认每 15 分钟检查 GitHub `main`，只进行安全的 fast-forward 更新并记录日志。
+- **Server-first 自动更新**：Server 与 Client 默认每 15 分钟检查 GitHub `main`；Client 必须通过共享密钥签名确认 Server 已运行目标版本才会升级，避免 Client 版本提前。更新只进行安全的 fast-forward 并记录日志。
 - **统一版本状态**：仓库根目录 `VERSION` 是 Server 与 Client 的唯一版本源；每台主机显示“最新、版本不一致或版本未知”，安装摘要也会显示当前版本。
 - **Server HTTPS 自动化**：支持自动拉起 Caddy 反向代理：
   - 域名场景：自动申请公网证书（ACME HTTP-01）。
@@ -161,6 +161,8 @@ Timer 每 15 分钟比较 GitHub `origin/main` 与已部署提交。自动更新
 
 - 仓库存在已跟踪的本地修改、分支分叉或不能 fast-forward 时拒绝更新，不会强制覆盖。
 - Server 使用 GHCR 镜像时，会核对镜像的提交 revision；新提交对应的多架构镜像未构建完成时保留现有容器，稍后重试。
+- Server 同时核对状态文件、Git 提交与容器内 `NARWHAL_VERSION`；状态文件显示最新但容器仍为旧版时，会识别为 `deployment drift` 并重新部署。
+- Client 更新前通过 HMAC 签名接口 `/api/v1/update/version` 核对 Server 的实际运行版本。Server 未升级、接口尚不可用或暂时无法连接时，Client 保持原版本并在下个 timer 周期自动重试。
 - 更新成功才写入部署版本；失败会保留当前服务，并在下一周期重试。
 - 原有共享密钥、Dashboard 登录凭据、TLS 配置、数据库、Client CA 和节点域名白名单均保留。
 
@@ -173,6 +175,8 @@ sudo journalctl -u narwhal-monitor-client-update.service -n 100 --no-pager
 sudo tail -n 100 /opt/narwhal-monitor/server-auto-update.log
 sudo tail -n 100 /opt/narwhal-monitor/client-auto-update.log
 ```
+
+日志出现 `update deferred: waiting for Server to run the target version` 表示 Server-first 版本门禁正常生效，不是 Client 故障。若 Server 长时间没有升级，重点检查 `server-auto-update.log` 中的 `tracked local changes`、`GHCR image ... was not ready`、`deployment drift` 或 `deployment verification failed`。仅在灾难恢复且明确接受版本不一致时，才可人工设置 `NARWHAL_SKIP_SERVER_VERSION_GATE=1` 跳过 Client 门禁；不建议用于日常更新。
 
 如需暂停某一端自动更新，将对应配置中的 `AUTO_UPDATE_ENABLED=true` 改为 `false`：
 

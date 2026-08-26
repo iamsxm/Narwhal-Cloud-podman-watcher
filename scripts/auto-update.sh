@@ -8,6 +8,17 @@ STATE_FILE="$BASE_DIR/${SIDE}-auto-update.version"
 LOG_FILE="$BASE_DIR/${SIDE}-auto-update.log"
 LOCK_FILE="/run/narwhal-monitor-${SIDE}-auto-update.lock"
 
+installed_version() {
+  if [[ "$SIDE" == "server" ]]; then
+    podman inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      narwhal-monitor-server 2>/dev/null \
+      | awk -F= '$1=="NARWHAL_VERSION"{print substr($0,index($0,"=")+1);exit}'
+  else
+    awk -F= '$1=="NARWHAL_VERSION"{print substr($0,index($0,"=")+1);exit}' \
+      "$BASE_DIR/client.env" 2>/dev/null || true
+  fi
+}
+
 log() {
   local line
   line="$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$SIDE] $*"
@@ -59,8 +70,20 @@ if [[ ! "$remote_commit" =~ ^[0-9a-f]{40}$ ]]; then
   exit 1
 fi
 deployed_commit="$(tr -d '[:space:]' <"$STATE_FILE" 2>/dev/null || true)"
-if [[ "$remote_commit" == "$deployed_commit" ]]; then
+local_commit="$(git -C "$REPO_DIR" rev-parse HEAD)"
+local_version=""
+if [[ "$local_commit" == "$remote_commit" && -f "$REPO_DIR/VERSION" ]]; then
+  local_version="$(tr -d '[:space:]' <"$REPO_DIR/VERSION")"
+fi
+runtime_version="$(installed_version || true)"
+if [[ "$remote_commit" == "$deployed_commit" \
+  && "$local_commit" == "$remote_commit" \
+  && -n "$local_version" \
+  && "$runtime_version" == "$local_version" ]]; then
   exit 0
+fi
+if [[ "$remote_commit" == "$deployed_commit" ]]; then
+  log "deployment drift detected: state=$deployed_commit repository=$local_commit runtime_version=${runtime_version:-unknown} expected_version=${local_version:-unknown}"
 fi
 
 if [[ -n "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no)" ]]; then
@@ -100,7 +123,24 @@ if [[ "$SIDE" == "server" ]]; then
   fi
   NARWHAL_AUTO_UPDATE=1 bash "$REPO_DIR/scripts/install-server.sh" update
 else
-  bash "$REPO_DIR/scripts/install-client.sh" update
+  set +e
+  NARWHAL_AUTO_UPDATE=1 bash "$REPO_DIR/scripts/install-client.sh" update
+  client_update_result=$?
+  set -e
+  if [[ "$client_update_result" -eq 75 ]]; then
+    log "update deferred: waiting for Server to run the target version"
+    exit 0
+  elif [[ "$client_update_result" -ne 0 ]]; then
+    log "ERROR Client installer failed with exit code $client_update_result"
+    exit "$client_update_result"
+  fi
+fi
+
+expected_version="$(tr -d '[:space:]' <"$REPO_DIR/VERSION")"
+runtime_version="$(installed_version || true)"
+if [[ "$runtime_version" != "$expected_version" ]]; then
+  log "ERROR deployment verification failed: runtime_version=${runtime_version:-unknown} expected_version=$expected_version"
+  exit 1
 fi
 
 printf '%s\n' "$remote_commit" >"$STATE_FILE.tmp"

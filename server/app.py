@@ -57,6 +57,7 @@ _AGENT_ONLY_PATHS = {
     "/api/v1/tls/ca",
     "/api/v1/actions/poll",
     "/api/v1/actions/result",
+    "/api/v1/update/version",
 }
 
 
@@ -1136,6 +1137,35 @@ def _alert_action_evidence(alert: sqlite3.Row) -> Dict[str, Any]:
     ) if isinstance(details.get("socks_process_pids"), list) else []
     details["socks_config_files"] = clean(details.get("socks_config_files"))
     return details
+
+
+@app.post("/api/v1/update/version")
+async def agent_update_version(
+    request: Request,
+    x_timestamp: str = Header(default=""),
+    x_signature: str = Header(default=""),
+) -> Response:
+    """Return the running Server version to an authenticated Client updater."""
+    body = await request.body()
+    verify_signature(body, x_timestamp, x_signature)
+    try:
+        payload = json.loads(body or b"{}")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    expected_version = str(payload.get("expected_version") or "")[:80]
+    if expected_version and not re.fullmatch(
+        r"\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?", expected_version
+    ):
+        raise HTTPException(status_code=400, detail="invalid expected version")
+    return signed_json_response(
+        {
+            "ok": True,
+            "server_version": APP_VERSION,
+            "expected_version": expected_version,
+            "ready": not expected_version or APP_VERSION == expected_version,
+        },
+        x_timestamp,
+    )
 
 
 def _queue_security_action_row(

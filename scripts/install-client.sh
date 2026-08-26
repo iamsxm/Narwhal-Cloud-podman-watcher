@@ -66,6 +66,12 @@ load_non_empty_or_default() {
   fi
 }
 
+is_truthy() {
+  local value="${1:-}"
+  value="$(echo "$value" | tr '[:upper:]' '[:lower:]')"
+  [[ "$value" == "1" || "$value" == "true" || "$value" == "yes" || "$value" == "y" ]]
+}
+
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "Please run as root: sudo bash scripts/install-client.sh ${MODE}"
   exit 1
@@ -206,6 +212,28 @@ if [[ "$server_url" == https://* || "$server_url" != *://* ]]; then
     --server-url "$server_url" \
     --secret-stdin \
     --output "$tls_ca_output")"
+fi
+
+if ! is_truthy "${NARWHAL_SKIP_SERVER_VERSION_GATE:-0}"; then
+  echo "[INFO] Checking that Server v$PROJECT_VERSION is running before Client update..."
+  set +e
+  version_gate_output="$(printf '%s' "$secret" | python3 "$ROOT_DIR/scripts/check-server-version.py" \
+    --server-url "$server_url" \
+    --expected-version "$PROJECT_VERSION" \
+    --ca-file "$tls_ca_file" \
+    --secret-stdin 2>&1)"
+  version_gate_result=$?
+  set -e
+  if [[ -n "$version_gate_output" ]]; then
+    echo "$version_gate_output"
+  fi
+  if [[ "$version_gate_result" -eq 10 ]]; then
+    echo "[WAIT] Client 保持当前版本；Server 升级到 v$PROJECT_VERSION 后将自动重试。"
+    exit 75
+  elif [[ "$version_gate_result" -ne 0 ]]; then
+    echo "[ERROR] Server 版本校验失败，拒绝升级 Client。"
+    exit 1
+  fi
 fi
 
 if [[ ! -r /proc/net/nf_conntrack && ! -r /proc/net/ip_conntrack ]] \

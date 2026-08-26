@@ -260,6 +260,55 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("SECURITY_HOST_PROXY_SOCKET_MAX=$host_proxy_socket_max", client_installer)
         self.assertIn("NARWHAL_VERSION=$PROJECT_VERSION", server_installer)
 
+    def test_client_installer_waits_for_signed_server_version(self):
+        installer = (ROOT / "scripts" / "install-client.sh").read_text(
+            encoding="utf-8"
+        )
+        updater = (ROOT / "scripts" / "auto-update.sh").read_text(encoding="utf-8")
+        self.assertIn("scripts/check-server-version.py", installer)
+        self.assertIn("--expected-version \"$PROJECT_VERSION\"", installer)
+        self.assertIn("exit 75", installer)
+        self.assertLess(
+            installer.index("scripts/check-server-version.py"),
+            installer.index("NARWHAL_VERSION=$PROJECT_VERSION"),
+        )
+        self.assertIn("waiting for Server to run the target version", updater)
+        self.assertIn("deployment drift detected", updater)
+
+    def test_signed_agent_version_endpoint_reports_runtime_server_version(self):
+        original_version = server.APP_VERSION
+        server.APP_VERSION = "1.5.0"
+        body = json.dumps(
+            {"expected_version": server.APP_VERSION}, separators=(",", ":")
+        ).encode()
+        timestamp = str(int(time.time()))
+        signature = hmac.new(
+            server.SHARED_SECRET.encode(), body + timestamp.encode(), hashlib.sha256
+        ).hexdigest()
+
+        class Request:
+            async def body(self):
+                return body
+
+        try:
+            response = asyncio.run(
+                server.agent_update_version(Request(), timestamp, signature)
+            )
+        finally:
+            server.APP_VERSION = original_version
+        payload = json.loads(response.body)
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["server_version"], "1.5.0")
+        expected_response_signature = hmac.new(
+            server.SHARED_SECRET.encode(),
+            response.body + timestamp.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertEqual(
+            response.headers["x-narwhal-response-signature"],
+            expected_response_signature,
+        )
+
     def test_panel_action_queue_and_agent_poll_are_signed(self):
         now = int(time.time())
         alert = {

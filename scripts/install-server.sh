@@ -163,12 +163,33 @@ acquire_deploy_lock() {
     return
   fi
   exec 9>"$DEPLOY_LOCK_FILE"
-  if ! flock --exclusive --wait 300 9; then
-    echo "[ERROR] 等待 Server 部署锁超过 5 分钟，可能已有安装或自动更新仍在运行。"
-    echo "[INFO] 可检查: systemctl status narwhal-monitor-server-update.service --no-pager"
-    exit 1
+  if flock --exclusive --nonblock 9; then
+    export NARWHAL_SERVER_DEPLOY_LOCKED=1
+    return
   fi
-  export NARWHAL_SERVER_DEPLOY_LOCKED=1
+
+  echo "[INFO] 检测到另一个 Server 安装或自动更新正在执行，等待其释放部署锁（最长 5 分钟）..."
+  if command -v systemctl >/dev/null 2>&1 \
+    && systemctl is-active --quiet narwhal-monitor-server-update.service; then
+    echo "[INFO] 后台自动更新服务当前为 active；可在另一终端查看："
+    echo "       journalctl -fu narwhal-monitor-server-update.service"
+  fi
+  local waited_seconds=0
+  while (( waited_seconds < 300 )); do
+    sleep 5
+    waited_seconds=$((waited_seconds + 5))
+    if flock --exclusive --nonblock 9; then
+      echo "[OK] 已等待 ${waited_seconds} 秒，部署锁现已释放，继续当前流程。"
+      export NARWHAL_SERVER_DEPLOY_LOCKED=1
+      return
+    fi
+    if (( waited_seconds % 30 == 0 )); then
+      echo "[INFO] 仍在等待其他部署完成：${waited_seconds}/300 秒..."
+    fi
+  done
+  echo "[ERROR] 等待 Server 部署锁超过 5 分钟，可能已有安装或自动更新仍在运行。"
+  echo "[INFO] 可检查: systemctl status narwhal-monitor-server-update.service --no-pager"
+  exit 1
 }
 
 remove_container_for_replace() {

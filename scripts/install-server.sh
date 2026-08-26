@@ -10,7 +10,7 @@ TLS_DIR="/opt/narwhal-monitor/caddy"
 TLS_CA_EXPORT_DIR="/opt/narwhal-monitor/tls-ca"
 CONTAINER_NAME="narwhal-monitor-server"
 TLS_CONTAINER_NAME="narwhal-monitor-caddy"
-DEPLOY_LOCK_FILE="/run/narwhal-monitor-server-deploy.lock"
+DEPLOY_LOCK_FILE="/run/narwhal-monitor-server-deploy-v2.lock"
 # shellcheck source=scripts/lib/interactive.sh
 source "$ROOT_DIR/scripts/lib/interactive.sh"
 
@@ -160,29 +160,45 @@ ask_choice_with_default() {
 
 acquire_deploy_lock() {
   if [[ "${NARWHAL_SERVER_DEPLOY_LOCKED:-0}" == "1" ]]; then
+    if (( ${NARWHAL_SERVER_DEPLOY_WAITED:-0} > 0 )); then
+      echo "[OK] 已等待 ${NARWHAL_SERVER_DEPLOY_WAITED} 秒，部署锁现已释放，继续当前流程。"
+    fi
     return
   fi
-  exec 9>"$DEPLOY_LOCK_FILE"
-  if flock --exclusive --nonblock 9; then
-    export NARWHAL_SERVER_DEPLOY_LOCKED=1
-    return
+  local -a locked_command=(
+    env NARWHAL_SERVER_DEPLOY_LOCKED=1
+    NARWHAL_SERVER_DEPLOY_WAITED=0
+    bash "$ROOT_DIR/scripts/install-server.sh" "$MODE"
+  )
+  if [[ -n "$RESET_DATA_ARG" ]]; then
+    locked_command+=( "$RESET_DATA_ARG" )
   fi
 
-  echo "[INFO] 检测到另一个 Server 安装或自动更新正在执行，等待其释放部署锁（最长 5 分钟）..."
-  if command -v systemctl >/dev/null 2>&1 \
-    && systemctl is-active --quiet narwhal-monitor-server-update.service; then
-    echo "[INFO] 后台自动更新服务当前为 active；可在另一终端查看："
-    echo "       journalctl -fu narwhal-monitor-server-update.service"
-  fi
   local waited_seconds=0
-  while (( waited_seconds < 300 )); do
+  local lock_result=0
+  while true; do
+    locked_command[2]="NARWHAL_SERVER_DEPLOY_WAITED=$waited_seconds"
+    set +e
+    flock --exclusive --nonblock --close --conflict-exit-code 75 \
+      "$DEPLOY_LOCK_FILE" "${locked_command[@]}"
+    lock_result=$?
+    set -e
+    if [[ "$lock_result" -ne 75 ]]; then
+      exit "$lock_result"
+    fi
+    if (( waited_seconds == 0 )); then
+      echo "[INFO] 检测到另一个 Server 安装或自动更新正在执行，等待其释放部署锁（最长 5 分钟）..."
+      if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet narwhal-monitor-server-update.service; then
+        echo "[INFO] 后台自动更新服务当前为 active；可在另一终端查看："
+        echo "       journalctl -fu narwhal-monitor-server-update.service"
+      fi
+    fi
+    if (( waited_seconds >= 300 )); then
+      break
+    fi
     sleep 5
     waited_seconds=$((waited_seconds + 5))
-    if flock --exclusive --nonblock 9; then
-      echo "[OK] 已等待 ${waited_seconds} 秒，部署锁现已释放，继续当前流程。"
-      export NARWHAL_SERVER_DEPLOY_LOCKED=1
-      return
-    fi
     if (( waited_seconds % 30 == 0 )); then
       echo "[INFO] 仍在等待其他部署完成：${waited_seconds}/300 秒..."
     fi

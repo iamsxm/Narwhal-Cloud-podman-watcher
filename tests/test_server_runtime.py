@@ -265,6 +265,8 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("ALERT_INBOUND_UNIQUE_IPS=$inbound_unique_ips", client_installer)
         self.assertIn("SECURITY_CONNTRACK_SNAPSHOT_MAX=$conntrack_snapshot_max", client_installer)
         self.assertIn("SECURITY_HOST_PROXY_SOCKET_MAX=$host_proxy_socket_max", client_installer)
+        self.assertIn("SECURITY_AUTO_REMEDIATE_XMRIG=$auto_remediate_xmrig", client_installer)
+        self.assertIn("SECURITY_AUTO_REMEDIATE_XRAYR=$auto_remediate_xrayr", client_installer)
         self.assertIn("NARWHAL_VERSION=$PROJECT_VERSION", server_installer)
 
     def test_client_installer_waits_for_signed_server_version(self):
@@ -283,6 +285,15 @@ class ServerRuntimeTests(unittest.TestCase):
         )
         self.assertIn("waiting for Server to run the target version", updater)
         self.assertIn("deployment drift detected", updater)
+
+    def test_automatic_update_unit_allows_image_build_wait(self):
+        setup = (ROOT / "scripts" / "setup-auto-update.sh").read_text(
+            encoding="utf-8"
+        )
+        updater = (ROOT / "scripts" / "auto-update.sh").read_text(encoding="utf-8")
+        self.assertIn("TimeoutStartSec=30min", setup)
+        self.assertIn("for _ in $(seq 1 30)", updater)
+        self.assertIn("sleep 30", updater)
 
     def test_signed_agent_version_endpoint_reports_runtime_server_version(self):
         original_version = server.APP_VERSION
@@ -1006,6 +1017,137 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("请求深度上报", html)
         self.assertIn("/api/v1/containers/diagnostics", html)
         self.assertIn("不抓包、不扫描文件", html)
+
+    def test_successful_automatic_xmrig_remediation_is_saved_in_history(self):
+        alert = {
+            "type": "malicious_process",
+            "severity": "critical",
+            "title": "确认挖矿程序",
+            "message": "命中 1 个可疑进程特征；首个特征 xmrig，PID 9157",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "miner",
+            "malicious_processes": [{"process": "xmrig", "pid": 9157}],
+            "automatic_remediation": {
+                "attempted": True,
+                "succeeded": True,
+                "message": "killed_processes=1 removed_binaries=1 cleanup_errors=0",
+            },
+        }
+        conn = server.db()
+        notifications = server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        conn.close()
+        self.assertEqual(notifications, [])
+        history = json.loads(server.security_alert_history().body)
+        self.assertEqual(history["total"], 1)
+        self.assertEqual(history["items"][0]["status"], "remediated")
+        self.assertTrue(
+            history["items"][0]["details"]["automatic_remediation"]["succeeded"]
+        )
+
+    def test_ignored_legacy_xmrig_alert_can_be_reprocessed_from_history(self):
+        alert = {
+            "type": "malicious_process",
+            "severity": "critical",
+            "title": "疑似恶意程序",
+            "message": "命中 1 个可疑进程特征；首个特征 xmrig，PID 9157",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "miner",
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class Request:
+            state = State()
+
+            def __init__(self, decision):
+                self.decision = decision
+
+            async def json(self):
+                return {"decision": self.decision}
+
+        asyncio.run(
+            server.set_security_alert_disposition(alert_id, Request("allow_silent"))
+        )
+        history = json.loads(
+            server.security_alert_history(status="suppressed").body
+        )
+        self.assertEqual(history["items"][0]["latest_decision"]["decision"], "allow_silent")
+        response = asyncio.run(
+            server.set_security_alert_disposition(alert_id, Request("deny"))
+        )
+        body = json.loads(response.body)
+        self.assertTrue(body["queued"])
+        self.assertEqual(body["action"]["action_type"], "remediate_malicious_process")
+        self.assertEqual(body["action"]["params"]["process_names"], ["xmrig"])
+        conn = server.db()
+        status = conn.execute(
+            "SELECT status FROM security_alerts WHERE id=?", (alert_id,)
+        ).fetchone()["status"]
+        policies = conn.execute("SELECT COUNT(*) FROM security_alert_policies").fetchone()[0]
+        conn.close()
+        self.assertEqual(status, "active")
+        self.assertEqual(policies, 0)
+
+    def test_reopen_ignored_panel_alert_removes_node_allowlist_entry(self):
+        alert = {
+            "type": "unauthorized_panel_pairing",
+            "severity": "critical",
+            "title": "panel",
+            "message": "panel",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "node",
+            "unapproved_domains": ["panel.example.net"],
+            "process_patterns": ["xrayr"],
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class Request:
+            state = State()
+
+            def __init__(self, decision):
+                self.decision = decision
+
+            async def json(self):
+                return {"decision": self.decision}
+
+        asyncio.run(
+            server.set_security_alert_disposition(alert_id, Request("allow_silent"))
+        )
+        response = asyncio.run(
+            server.set_security_alert_disposition(alert_id, Request("reopen"))
+        )
+        body = json.loads(response.body)
+        self.assertTrue(body["queued"])
+        self.assertEqual(body["action"]["action_type"], "disallow_panel_domains")
+        self.assertEqual(body["action"]["params"]["domains"], ["panel.example.net"])
+
+    def test_alert_history_page_is_responsive_and_linked_from_dashboard(self):
+        history_html = server.security_alert_history_page()
+        self.assertIn("安全告警历史", history_html)
+        self.assertIn("重新禁止/处理", history_html)
+        self.assertIn("恢复提醒", history_html)
+        self.assertIn("overflow-x:hidden", history_html)
+        self.assertIn("@media(max-width:640px)", history_html)
+        self.assertIn("prefers-reduced-motion", history_html)
+        self.assertIn("/api/v1/security/history", history_html)
+        self.assertIn("href='/alerts/history'", server.dashboard())
 
 
 if __name__ == "__main__":

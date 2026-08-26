@@ -42,6 +42,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=$UPDATER $SIDE
+TimeoutStartSec=30min
+TimeoutStopSec=2min
 EOF_SERVICE
 
 cat >"/etc/systemd/system/$TIMER_NAME" <<EOF_TIMER

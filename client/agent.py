@@ -38,6 +38,7 @@ _pending_deep_samples: Dict[int, Dict[str, object]] = {}
 _SOCKS_DIRECT_NAMES = {"microsocks", "sockd", "danted", "srelay", "hev-socks5-server"}
 _SOCKS_CONFIGURABLE_NAMES = {"3proxy", "gost", "xray", "v2ray", "sing-box"}
 _SOCKS_PROCESS_NAMES = _SOCKS_DIRECT_NAMES | _SOCKS_CONFIGURABLE_NAMES
+_AUTO_REMEDIATE_MALWARE_NAMES = {"xmrig"}
 
 
 def _is_containerized_runtime() -> bool:
@@ -2081,6 +2082,12 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
         "no",
         "off",
     )
+    auto_remediate_xmrig = os.getenv(
+        "SECURITY_AUTO_REMEDIATE_XMRIG", "true"
+    ).strip().lower() not in ("0", "false", "no", "off")
+    auto_remediate_xrayr = os.getenv(
+        "SECURITY_AUTO_REMEDIATE_XRAYR", "true"
+    ).strip().lower() not in ("0", "false", "no", "off")
     alerts: List[Dict[str, object]] = []
     container_access_readable_files = 0
     socks_enforcement_entries = _socks_auth_enforcement_entries()
@@ -2382,17 +2389,66 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
         suspicious_processes = security.get("suspicious_processes")
         if isinstance(suspicious_processes, list) and suspicious_processes:
             first_process = suspicious_processes[0] if isinstance(suspicious_processes[0], dict) else {}
-            alerts.append(
-                _security_alert(
-                    "malicious_process",
-                    "critical",
-                    "疑似恶意程序",
-                    f"命中 {len(suspicious_processes)} 个可疑进程特征；首个特征 {first_process.get('pattern') or 'unknown'}，PID {first_process.get('pid') or 0}",
-                    len(suspicious_processes),
-                    1,
-                    container,
+            confirmed_xmrig = [
+                item
+                for item in suspicious_processes
+                if isinstance(item, dict)
+                and str(item.get("process") or "").strip().lower() == "xmrig"
+            ]
+            automatic_result: Dict[str, object] = {}
+            if (
+                auto_remediate_xmrig
+                and confirmed_xmrig
+                and str(container.get("runtime") or "").lower() in ("podman", "incus")
+            ):
+                auto_ok, auto_message = remediate_malicious_process(
+                    {
+                        "runtime": container.get("runtime"),
+                        "project": container.get("project"),
+                        "container_name": container.get("name"),
+                        "params": {
+                            "process_names": ["xmrig"],
+                            "process_pids": [
+                                int(item.get("pid") or 0)
+                                for item in confirmed_xmrig
+                                if int(item.get("pid") or 0) > 1
+                            ],
+                        },
+                    }
                 )
+                automatic_result = {
+                    "attempted": True,
+                    "succeeded": auto_ok,
+                    "message": auto_message[:500],
+                }
+                print(
+                    f"automatic XMRig remediation {'succeeded' if auto_ok else 'failed'} for "
+                    f"{container.get('runtime')}/{container.get('name')}: {auto_message}"
+                )
+            malicious_alert = _security_alert(
+                "malicious_process",
+                "critical",
+                "确认挖矿程序" if confirmed_xmrig else "疑似恶意程序",
+                f"命中 {len(suspicious_processes)} 个可疑进程特征；首个特征 {first_process.get('pattern') or 'unknown'}，PID {first_process.get('pid') or 0}",
+                len(suspicious_processes),
+                1,
+                container,
             )
+            malicious_alert.update(
+                {
+                    "malicious_processes": [
+                        {
+                            "pid": int(item.get("pid") or 0),
+                            "process": str(item.get("process") or "")[:80],
+                            "pattern": str(item.get("pattern") or "")[:120],
+                        }
+                        for item in suspicious_processes[:20]
+                        if isinstance(item, dict)
+                    ],
+                    "automatic_remediation": automatic_result,
+                }
+            )
+            alerts.append(malicious_alert)
         configuration_risks = security.get("configuration_risks")
         if config_audit_enabled and isinstance(configuration_risks, list) and configuration_risks:
             risk_items = [item for item in configuration_risks if isinstance(item, dict)]
@@ -2429,10 +2485,51 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
         remaining_unapproved_domains = [
             item for item in normalized_unapproved if item not in auto_domains
         ]
+        xrayr_auto_result: Dict[str, object] = {}
+        xrayr_confirmed = "xrayr" in {
+            str(item).strip().lower() for item in process_patterns
+        }
+        if (
+            panel_detection_enabled
+            and auto_remediate_xrayr
+            and xrayr_confirmed
+            and not bool(panel_pairing.get("approved"))
+            and str(container.get("runtime") or "").lower() in ("podman", "incus")
+        ):
+            xrayr_ok, xrayr_message = remediate_panel_pairing(
+                {
+                    "runtime": container.get("runtime"),
+                    "project": container.get("project"),
+                    "container_name": container.get("name"),
+                    "params": {
+                        "process_patterns": ["xrayr"],
+                        "process_pids": [
+                            int(item.get("pid") or 0)
+                            for item in process_matches[:20]
+                            if isinstance(item, dict)
+                            and str(item.get("pattern") or "").lower() == "xrayr"
+                            and int(item.get("pid") or 0) > 1
+                        ],
+                        "config_files": config_files,
+                    },
+                }
+            )
+            xrayr_auto_result = {
+                "attempted": True,
+                "succeeded": xrayr_ok,
+                "message": xrayr_message[:500],
+            }
+            print(
+                f"automatic XrayR remediation {'succeeded' if xrayr_ok else 'failed'} for "
+                f"{container.get('runtime')}/{container.get('name')}: {xrayr_message}"
+            )
         suppress_panel_alert = bool(
-            panel_detection_enabled and auto_matched_domains and not remaining_unapproved_domains
+            panel_detection_enabled
+            and auto_matched_domains
+            and not remaining_unapproved_domains
+            and not xrayr_auto_result
         )
-        if panel_detection_enabled and auto_matched_domains:
+        if panel_detection_enabled and auto_matched_domains and not xrayr_auto_result:
             auto_ok, auto_message = remediate_panel_pairing(
                 {
                     "runtime": container.get("runtime"),
@@ -2496,6 +2593,7 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
                     ],
                     "identity_patterns": [str(item) for item in identity_patterns[:20]],
                     "config_files": [str(item) for item in config_files[:20]],
+                    "automatic_remediation": xrayr_auto_result,
                 }
             )
             alerts.append(panel_alert)
@@ -2625,6 +2723,7 @@ def collect_suspicious_processes(name: str, runtime: str = "", project: str = ""
             {
                 "pid": pid,
                 "cpu_percent": cpu_percent,
+                "process": posixpath.basename(parts[2]).lower() if len(parts) > 2 else "",
                 "pattern": matched_pattern,
                 "command": (parts[3] if len(parts) > 3 else text)[:500],
             }
@@ -2680,7 +2779,10 @@ def _configured_allowed_panel_domains() -> List[str]:
                 )
         except (OSError, TypeError, ValueError):
             pass
-    return sorted(item for item in values if _valid_panel_domain(item))
+    denied_domains = set(_configured_auto_remediate_panel_domains())
+    return sorted(
+        item for item in values if _valid_panel_domain(item) and item not in denied_domains
+    )
 
 
 def add_allowed_panel_domains(domains: List[str]) -> List[str]:
@@ -2764,6 +2866,82 @@ def add_auto_remediate_panel_domains(domains: List[str]) -> List[str]:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
     return merged
+
+
+def remove_auto_remediate_panel_domains(domains: List[str]) -> List[str]:
+    normalized = {
+        str(item).strip().lower().rstrip(".")
+        for item in domains
+        if isinstance(item, str) and _valid_panel_domain(item)
+    }
+    remaining = sorted(set(_configured_auto_remediate_panel_domains()) - normalized)
+    policy_path = os.getenv(
+        "SECURITY_PANEL_AUTO_REMEDIATE_FILE",
+        "/opt/narwhal-monitor/panel-auto-remediate.json",
+    ).strip()
+    if not policy_path or not (posixpath.isabs(policy_path) or os.path.isabs(policy_path)):
+        raise ValueError("SECURITY_PANEL_AUTO_REMEDIATE_FILE must be an absolute path")
+    parent = os.path.dirname(policy_path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".panel-auto-remediate-", dir=parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as policy_file:
+            json.dump(
+                {"domains": remaining, "updated_at": int(time.time())},
+                policy_file,
+                ensure_ascii=False,
+            )
+            policy_file.write("\n")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, policy_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return remaining
+
+
+def remove_allowed_panel_domains(domains: List[str]) -> List[str]:
+    normalized = {
+        str(item).strip().lower().rstrip(".")
+        for item in domains
+        if isinstance(item, str) and _valid_panel_domain(item)
+    }
+    policy_path = os.getenv(
+        "SECURITY_PANEL_ALLOWLIST_FILE", "/opt/narwhal-monitor/panel-allowlist.json"
+    ).strip()
+    if not policy_path or not (posixpath.isabs(policy_path) or os.path.isabs(policy_path)):
+        raise ValueError("SECURITY_PANEL_ALLOWLIST_FILE must be an absolute path")
+    stored_domains: List[str] = []
+    try:
+        with open(policy_path, "r", encoding="utf-8") as policy_file:
+            stored = json.load(policy_file)
+        values = stored.get("domains", []) if isinstance(stored, dict) else stored
+        if isinstance(values, list):
+            stored_domains = [
+                str(item).strip().lower().rstrip(".")
+                for item in values
+                if isinstance(item, str) and _valid_panel_domain(item)
+            ]
+    except (OSError, TypeError, ValueError):
+        pass
+    remaining = sorted(set(stored_domains) - normalized)
+    parent = os.path.dirname(policy_path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".panel-allowlist-", dir=parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as policy_file:
+            json.dump(
+                {"domains": remaining, "updated_at": int(time.time())},
+                policy_file,
+                ensure_ascii=False,
+            )
+            policy_file.write("\n")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, policy_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return remaining
 
 
 def _socks_auth_enforcement_path() -> str:
@@ -4851,6 +5029,118 @@ def enforce_socks_auth_policy(
     return result
 
 
+def remediate_malicious_process(action: Dict) -> Tuple[bool, str]:
+    """Remove an exact allowlisted malware process without stopping its container."""
+    runtime_kind = str(action.get("runtime") or "").strip().lower()
+    container_name = str(action.get("container_name") or "").strip()
+    project = str(action.get("project") or "").strip()
+    if runtime_kind not in ("podman", "incus"):
+        return False, "Docker and unknown runtimes are notice-only"
+    if not re.fullmatch(r"[A-Za-z0-9_.:@+-]{1,200}", container_name):
+        return False, "invalid container target"
+    if project and not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", project):
+        return False, "invalid Incus project"
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    requested_names = params.get("process_names") if isinstance(params.get("process_names"), list) else []
+    process_names = sorted(
+        {
+            str(item).strip().lower()
+            for item in requested_names
+            if isinstance(item, str)
+            and str(item).strip().lower() in _AUTO_REMEDIATE_MALWARE_NAMES
+        }
+    )
+    if not process_names:
+        return False, "no exact allowlisted malware target"
+    runtime_bin = get_runtime_bins().get(runtime_kind, "")
+    if not runtime_bin:
+        return False, f"runtime {runtime_kind} is unavailable"
+
+    names = " ".join(shlex.quote(item) for item in process_names)
+    config_paths = " ".join(
+        shlex.quote(path)
+        for path in (
+            "/etc/xmrig.json",
+            "/etc/xmrig/config.json",
+            "/usr/local/etc/xmrig.json",
+            "/opt/xmrig/config.json",
+            "/root/.xmrig.json",
+        )
+    )
+    binary_paths = " ".join(
+        shlex.quote(path)
+        for path in (
+            "/usr/bin/xmrig",
+            "/usr/local/bin/xmrig",
+            "/opt/xmrig/xmrig",
+            "/tmp/xmrig",
+            "/var/tmp/xmrig",
+        )
+    )
+    script = (
+        "set -u; killed_processes=0; removed_services=0; removed_configs=0; "
+        "removed_binaries=0; cleanup_errors=0; "
+        f"for pattern in {names}; do "
+        "command -v systemctl >/dev/null 2>&1 && systemctl disable --now \"${pattern}.service\" >/dev/null 2>&1 || true; "
+        "for unit_dir in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do "
+        "unit=\"$unit_dir/${pattern}.service\"; [ -e \"$unit\" ] || [ -L \"$unit\" ] || continue; "
+        "if rm -f -- \"$unit\"; then removed_services=$((removed_services+1)); else cleanup_errors=$((cleanup_errors+1)); fi; done; "
+        "if [ -e \"/etc/init.d/$pattern\" ]; then \"/etc/init.d/$pattern\" stop >/dev/null 2>&1 || true; "
+        "if rm -f -- \"/etc/init.d/$pattern\"; then removed_services=$((removed_services+1)); else cleanup_errors=$((cleanup_errors+1)); fi; fi; "
+        "for proc in /proc/[0-9]*; do pid=${proc##*/}; [ \"$pid\" = \"$$\" ] && continue; "
+        "state=$(awk '{print $3}' \"$proc/stat\" 2>/dev/null || true); [ \"$state\" = Z ] && continue; "
+        "comm=$(cat \"$proc/comm\" 2>/dev/null || true); argv0=$(tr '\\000' '\\n' < \"$proc/cmdline\" 2>/dev/null | head -n 1); "
+        "exe=$(readlink \"$proc/exe\" 2>/dev/null || true); matched=0; "
+        "for candidate in \"$comm\" \"${argv0##*/}\" \"${exe##*/}\"; do "
+        "candidate=$(printf '%s' \"$candidate\" | tr '[:upper:]' '[:lower:]'); [ \"$candidate\" = \"$pattern\" ] && matched=1; done; "
+        "if [ \"$matched\" -eq 1 ]; then if kill -TERM \"$pid\" 2>/dev/null; then killed_processes=$((killed_processes+1)); "
+        "sleep 1; [ -d \"$proc\" ] && kill -KILL \"$pid\" 2>/dev/null || true; fi; fi; done; done; "
+        f"for path in {config_paths}; do [ -e \"$path\" ] || [ -L \"$path\" ] || continue; "
+        "if rm -f -- \"$path\"; then removed_configs=$((removed_configs+1)); else cleanup_errors=$((cleanup_errors+1)); fi; done; "
+        f"for path in {binary_paths}; do [ -e \"$path\" ] || [ -L \"$path\" ] || continue; "
+        "if rm -f -- \"$path\"; then removed_binaries=$((removed_binaries+1)); else cleanup_errors=$((cleanup_errors+1)); fi; done; "
+        "command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true; "
+        "printf 'killed_processes=%s removed_services=%s removed_configs=%s removed_binaries=%s cleanup_errors=%s\\n' "
+        "\"$killed_processes\" \"$removed_services\" \"$removed_configs\" \"$removed_binaries\" \"$cleanup_errors\"; "
+        "changes=$((killed_processes+removed_services+removed_configs+removed_binaries)); "
+        "[ \"$cleanup_errors\" -eq 0 ] && [ \"$changes\" -gt 0 ]"
+    )
+    ok, output = _run_action_command(
+        _runtime_exec_cmd(runtime_bin, container_name, script, project)
+    )
+    counts = {
+        key: int(value)
+        for key, value in re.findall(
+            r"\b(killed_processes|removed_services|removed_configs|removed_binaries|cleanup_errors)=(\d+)\b",
+            output or "",
+        )
+    }
+    if runtime_kind == "incus":
+        _, host_killed, host_errors, host_output = _incus_host_namespace_kill(
+            runtime_bin, container_name, project, process_names
+        )
+        counts["killed_processes"] = counts.get("killed_processes", 0) + host_killed
+        counts["cleanup_errors"] = counts.get("cleanup_errors", 0) + host_errors
+        changes = sum(
+            counts.get(key, 0)
+            for key in (
+                "killed_processes",
+                "removed_services",
+                "removed_configs",
+                "removed_binaries",
+            )
+        )
+        output = (
+            f"killed_processes={counts.get('killed_processes', 0)} "
+            f"removed_services={counts.get('removed_services', 0)} "
+            f"removed_configs={counts.get('removed_configs', 0)} "
+            f"removed_binaries={counts.get('removed_binaries', 0)} "
+            f"cleanup_errors={counts.get('cleanup_errors', 0)}; {host_output}"
+        )
+        ok = counts.get("cleanup_errors", 0) == 0 and changes > 0
+    return ok, output or ("malware remediation completed" if ok else "malware remediation failed")
+
+
 def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
     runtime_kind = str(action.get("runtime") or "").lower()
     if runtime_kind not in ("podman", "incus"):
@@ -5018,6 +5308,8 @@ def execute_security_action(action: Dict) -> Tuple[bool, str]:
         ok, message = stop_unauthenticated_socks(action)
         prefix = "policy_installed=1; "
         return ok, prefix + message
+    if action_type == "remediate_malicious_process":
+        return remediate_malicious_process(action)
     if action_type == "stop_container":
         runtime_kind = str(action.get("runtime") or "").strip().lower()
         container_name = str(action.get("container_name") or "").strip()
@@ -5048,10 +5340,22 @@ def execute_security_action(action: Dict) -> Tuple[bool, str]:
         params = action.get("params") if isinstance(action.get("params"), dict) else {}
         domains = params.get("domains") if isinstance(params.get("domains"), list) else []
         try:
+            remove_auto_remediate_panel_domains(domains)
             merged = add_allowed_panel_domains(domains)
         except (OSError, ValueError) as exc:
             return False, f"allowlist update failed: {exc}"
         return True, f"allowed {len(domains)} exact domain(s); allowlist now contains {len(merged)}"
+    if action_type == "disallow_panel_domains":
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        domains = params.get("domains") if isinstance(params.get("domains"), list) else []
+        try:
+            remaining = remove_allowed_panel_domains(domains)
+        except (OSError, ValueError) as exc:
+            return False, f"allowlist removal failed: {exc}"
+        return True, (
+            f"removed {len(domains)} exact domain(s) from the node allowlist; "
+            f"allowlist now contains {len(remaining)}"
+        )
     if action_type == "remediate_panel_pairing":
         ok, message = remediate_panel_pairing(action)
         if not ok:
@@ -5059,6 +5363,7 @@ def execute_security_action(action: Dict) -> Tuple[bool, str]:
         params = action.get("params") if isinstance(action.get("params"), dict) else {}
         domains = params.get("domains") if isinstance(params.get("domains"), list) else []
         try:
+            remove_allowed_panel_domains(domains)
             add_auto_remediate_panel_domains(domains)
         except (OSError, ValueError) as exc:
             return False, f"remediation completed but automatic policy update failed: {exc}"

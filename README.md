@@ -18,6 +18,8 @@
 - **OpenRC/Incus 清理兼容**：若非特权 Incus 容器内 UID 映射导致 `kill` 返回 `EPERM`，Agent 会从宿主机进入目标容器的 PID/挂载命名空间，重新核验精确进程名后终止进程；仍不会停止容器。
 - **一键安装与更新**：`install.sh` 支持安装、更新和卸载；更新会复用 `/opt/narwhal-monitor/*.env` 配置并重建或重启服务。
 - **告警快速处理**：活动告警可选择“禁止/持续拦截”“允许且不再提醒”或“本次取消提醒”；Podman/Incus 的机场面板对接告警支持定向清理，无认证 SOCKS 告警支持停止服务并持续拦截，Docker 不执行处理。
+- **XMRig / XrayR 自动处置**：Podman/Incus 中精确命中的 XMRig 挖矿进程默认自动终止并清理明确的服务、配置和二进制；未获允许的 XrayR 节点后端默认自动定向清理。已加入域名白名单的合法 XrayR 不处理，Docker 仍只提醒。
+- **告警历史与重新处置**：总览页可进入“告警历史”，按状态、级别、类型、主机和关键词筛选活动、已忽略、已处理及已恢复记录；可以对忽略记录重新禁止，也可以撤销“不再提醒”策略。
 - **无认证 SOCKS 持续拦截**：Incus/Podman 的无认证或空密码 SOCKS 告警可一键停止对应进程/服务并保存节点侧策略；以后再次无认证启动会自动停止，检测到非空认证后自动解除策略。不会停止容器，也不会删除 SOCKS 配置或服务文件。
 - **按需深度上报**：可在容器详情页对可疑的 Podman/Incus 容器发起一次性深度采样，在下一 Client 周期查看瞬时流量、详细进程、连接 IP 及进程归属；Docker 默认仅提醒，不执行该任务。
 - **Server-first 自动更新**：Server 与 Client 默认每 15 分钟检查 GitHub `main`；Client 必须通过共享密钥签名确认 Server 已运行目标版本才会升级，避免 Client 版本提前。更新只进行安全的 fast-forward 并记录日志。
@@ -165,6 +167,7 @@ Timer 每 15 分钟比较 GitHub `origin/main` 与已部署提交。自动更新
 - Client 更新前通过 HMAC 签名接口 `/api/v1/update/version` 核对 Server 的实际运行版本。Server 未升级、接口尚不可用或暂时无法连接时，Client 保持原版本并在下个 timer 周期自动重试。
 - 首次人工安装 Client 时，若目标是尚无版本接口的旧 Server（旧版会返回 HTTP 401），安装器会明确警告并继续安装；这是为了避免新节点无法部署。后续自动更新仍执行严格的 Server-first 门禁。
 - 更新成功才写入部署版本；失败会保留当前服务，并在下一周期重试。
+- 自动更新 systemd oneshot 的启动超时为 30 分钟，覆盖 GHCR 多架构镜像最长约 15 分钟的等待窗口，避免 systemd 默认短超时提前终止正常更新。
 - 原有共享密钥、Dashboard 登录凭据、TLS 配置、数据库、Client CA 和节点域名白名单均保留。
 
 查看自动更新状态和审计日志：
@@ -178,6 +181,19 @@ sudo tail -n 100 /opt/narwhal-monitor/client-auto-update.log
 ```
 
 日志出现 `update deferred: waiting for Server to run the target version` 表示 Server-first 版本门禁正常生效，不是 Client 故障。若 Server 长时间没有升级，重点检查 `server-auto-update.log` 中的 `tracked local changes`、`GHCR image ... was not ready`、`deployment drift` 或 `deployment verification failed`。仅在灾难恢复且明确接受版本不一致时，才可人工设置 `NARWHAL_SKIP_SERVER_VERSION_GATE=1` 跳过 Client 门禁；不建议用于日常更新。
+
+旧版本生成的更新单元如果执行 `systemctl start narwhal-monitor-server-update.service` 后显示 `timeout was exceeded`，可在 Server 主机一次性增加超时覆盖并重新启动：
+
+```bash
+sudo mkdir -p /etc/systemd/system/narwhal-monitor-server-update.service.d
+printf '[Service]\nTimeoutStartSec=30min\nTimeoutStopSec=2min\n' | \
+  sudo tee /etc/systemd/system/narwhal-monitor-server-update.service.d/timeout.conf >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl reset-failed narwhal-monitor-server-update.service
+sudo systemctl start narwhal-monitor-server-update.service
+```
+
+新版本安装/更新后会把相同配置直接写入主单元。若仍失败，执行 `sudo journalctl -u narwhal-monitor-server-update.service -n 150 --no-pager` 查看真正的后续错误。
 
 如需暂停某一端自动更新，将对应配置中的 `AUTO_UPDATE_ENABLED=true` 改为 `false`：
 
@@ -339,6 +355,8 @@ SECURITY_CONFIG_AUDIT_ENABLED=true
 SECURITY_SUSPICIOUS_OUTBOUND_PORTS=25,465,587,23,445,6667
 SECURITY_WEB_SCAN_PATTERNS=.env,.git,wp-login,wp-admin,phpmyadmin,actuator,server-status,cgi-bin,vendor/phpunit,etc/passwd,boaform,hnap1
 SECURITY_SUSPICIOUS_PROCESS_PATTERNS=xmrig,kinsing,kdevtmpfsi,watchbog,cryptonight,minerd,pwnrig,teamtnt,stratum+tcp,stratum+ssl,/dev/tcp/,nc -e,ncat -e,socat exec:,mkfifo /tmp
+SECURITY_AUTO_REMEDIATE_XMRIG=true
+SECURITY_AUTO_REMEDIATE_XRAYR=true
 SECURITY_PANEL_PAIRING_DETECTION_ENABLED=true
 SECURITY_ALLOWED_PANEL_DOMAINS=
 SECURITY_PANEL_ALLOWLIST_FILE=/opt/narwhal-monitor/panel-allowlist.json
@@ -362,19 +380,23 @@ SOCKS 检测复用本轮已经读取的容器进程列表；只有发现 SOCKS �
 
 对于已确认 `no_auth` 的 Incus/Podman SOCKS 告警，面板会显示“停止并持续拦截”。确认后，Client 只停止本次检测命中的 SOCKS 进程及其精确 systemd/OpenRC 服务，不禁用或删除服务，不删除配置，也不停止容器。策略按运行时、Incus 项目和容器名称写入 `SECURITY_SOCKS_AUTH_ENFORCEMENT_FILE`；以后正常采集周期复用既有 SOCKS 认证检测结果，如果该容器再次以无认证或空密码方式运行就再次停止。检测到 `configured` 或非空的 `weak_password` 认证后，Client 会自动删除该容器的持续拦截策略，允许服务恢复运行；弱密码本身仍会继续告警，供管理员决定是否放行。Docker 始终仅提醒，不显示此按钮。
 
-### Critical 机场对接告警的处理
+### Critical 机场对接、挖矿与 SOCKS 告警的处理
 
 活动告警在总览页提供三个处置入口：
 
 - **禁止**：只出现在证据完整的 Podman/Incus `unauthorized_panel_pairing` 告警上。Server 把经过 HMAC 签名的定向动作发送给对应节点。Agent 不停止或删除容器，只在目标容器内部终止本次检测命中的机场节点进程，停用并删除同名 systemd/OpenRC 服务定义，并删除本次检测到且同时属于 `SECURITY_PANEL_CONFIG_PATHS` 的配置文件。Agent 会再次校验容器、运行时、进程特征和配置路径，不接受任意 Shell 或任意文件路径。首次人工清理成功后，本次命中的具体面板域名会写入节点侧 `SECURITY_PANEL_AUTO_REMEDIATE_FILE`；同一域名以后再次出现时会自动执行清理且不再向 Server 提醒，新域名仍正常告警。
+- **XMRig 自动清理**：XMRig 是加密货币挖矿程序。Podman/Incus 中只有进程名、`argv[0]` 或可执行文件 basename 精确等于 `xmrig` 时才自动处理；处理范围限于 XMRig 进程、同名 systemd/OpenRC 服务以及内置的精确配置/二进制路径，不做模糊文件搜索，不停止容器。其他可疑进程特征只告警，不自动删除。
+- **XrayR 自动清理**：XrayR 是支持多种机场面板的代理节点后端，本身不等同于恶意软件。只有节点侧检测到 XrayR 且面板未被域名白名单明确允许时才自动定向清理；在“允许且不再提醒”中放行对应域名后不会处理。撤销忽略时，Server 会同步从节点动态白名单删除该精确域名。
 - **允许且不再提醒**：永久抑制该告警指纹。机场面板告警按具体域名形成指纹，并把域名写入节点的 `SECURITY_PANEL_ALLOWLIST_FILE`；其他告警按主机、运行时、项目、容器和类型抑制。更新 Client/Server 后策略保留。
 - **本次取消提醒**：只隐藏当前连续出现的这一次事件。只要节点后续一次上报不再包含它，事件即恢复；以后再次出现会重新展示并通知。
 
 按钮决策记录在 `security_alert_decisions`，永久抑制策略记录在 `security_alert_policies`，节点动作记录在 `security_actions`。页面会显示“等待节点 / 节点处理中 / 已完成 / 失败”及结果。动作响应由共享密钥签名校验，即使使用 internal CA，也不会接受被篡改的动作。Docker 仍没有“禁止”，但可以选择永久不再提醒或取消本次提醒。
 
+总览右上角“告警历史”进入 `/alerts/history`。历史页保留 `active`（活动）、`suppressed`（允许且不再提醒）、`dismissed`（本次取消提醒）、`remediated`（已处理）和 `resolved`（已恢复）记录，并展示最近人工决定、节点动作结果及自动处置结果。对已忽略记录点击“重新禁止/处理”会先撤销 Server 抑制策略，再下发新的定向动作；点击“恢复提醒”只撤销忽略策略，机场面板告警还会同步撤销节点域名白名单。
+
 进程告警会上报命中的 PID；Agent 清理前会再次校验 PID、进程状态和允许的程序特征，并忽略僵尸进程。只有实际终止进程或删除服务/配置后才算“禁止成功”，随后活动告警立即转为已处理；如果清理数全部为 0，动作显示失败并提供“重试禁止”，不会再把零清理误报为完成。若后续采样再次发现同一特征，按钮会明确显示“再次禁止”。
 
-> “禁止”会删除容器内对应配置与服务定义，属于不可逆操作，页面提交前会列出目标及后续自动清理规则并要求二次确认。它不会删除程序二进制，也不会停止 Incus/Podman 容器。需要取消某个域名的自动清理时，请从节点的 `/opt/narwhal-monitor/panel-auto-remediate.json` 中删除该域名并保持 JSON 格式有效。
+> 机场组件“禁止”会删除容器内对应配置与服务定义，属于不可逆操作，页面提交前会列出目标及后续自动清理规则并要求二次确认；它不删除机场程序二进制。XMRig 精确处置会额外删除内置白名单中的 XMRig 二进制路径。两类处置都不会停止 Incus/Podman 容器。需要取消某个域名的自动清理时，可在历史页选择放行，或从节点的 `/opt/narwhal-monitor/panel-auto-remediate.json` 中删除该域名并保持 JSON 格式有效。
 
 ### 容量采集与容器详情
 

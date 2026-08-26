@@ -401,11 +401,23 @@ def process_security_alerts(
             "SELECT 1 FROM security_alert_policies WHERE fingerprint=? AND mode='allow_silent'",
             (fingerprint,),
         ).fetchone() is not None
-        next_status = "suppressed" if allow_policy else "active"
-        should_notify = existing is None and not allow_policy
+        automatic_remediation = raw_alert.get("automatic_remediation")
+        automatically_remediated = (
+            isinstance(automatic_remediation, dict)
+            and automatic_remediation.get("attempted") is True
+            and automatic_remediation.get("succeeded") is True
+        )
+        next_status = (
+            "suppressed" if allow_policy
+            else "remediated" if automatically_remediated
+            else "active"
+        )
+        should_notify = existing is None and not allow_policy and not automatically_remediated
         if existing is not None:
             previous_status = str(existing["status"])
             if allow_policy:
+                should_notify = False
+            elif automatically_remediated:
                 should_notify = False
             elif previous_status == "dismissed":
                 next_status = "dismissed"
@@ -1053,17 +1065,62 @@ def _action_item(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
+def _decision_item(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "alert_id": int(row["alert_id"]),
+        "decision": row["decision"],
+        "requested_by": row["requested_by"],
+        "created_at": int(row["created_at"]),
+        "created_at_utc8": format_utc8(int(row["created_at"])),
+    }
+
+
+def _security_alert_item(conn: sqlite3.Connection, row: sqlite3.Row) -> Dict[str, Any]:
+    latest_action = _latest_action_for_alert(conn, row)
+    latest_decision = conn.execute(
+        "SELECT * FROM security_alert_decisions WHERE alert_id=? ORDER BY id DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    return {
+        "id": int(row["id"]),
+        "host_id": row["host_id"],
+        "runtime": row["runtime"],
+        "project": row["project"],
+        "container_name": row["container_name"],
+        "type": row["alert_type"],
+        "severity": row["severity"],
+        "title": row["title"],
+        "message": row["message"],
+        "value": float(row["value"] or 0),
+        "threshold": float(row["threshold"] or 0),
+        "first_seen": int(row["first_seen"]),
+        "first_seen_utc8": format_utc8(int(row["first_seen"])),
+        "last_seen": int(row["last_seen"]),
+        "last_seen_utc8": format_utc8(int(row["last_seen"])),
+        "occurrence_count": int(row["occurrence_count"]),
+        "status": row["status"],
+        "details": _alert_action_evidence(row),
+        "latest_action": _action_item(latest_action) if latest_action is not None else None,
+        "latest_decision": (
+            _decision_item(latest_decision) if latest_decision is not None else None
+        ),
+    }
+
+
 def _remediation_changed(message: str) -> bool:
     counts = {
         key: int(value)
         for key, value in re.findall(
-            r"\b(killed_processes|removed_services|removed_configs|cleanup_errors)=(\d+)\b",
+            r"\b(killed_processes|removed_services|removed_configs|removed_binaries|cleanup_errors)=(\d+)\b",
             message,
         )
     }
     return counts.get("cleanup_errors", 0) == 0 and sum(
         counts.get(key, 0)
-        for key in ("killed_processes", "removed_services", "removed_configs")
+        for key in (
+            "killed_processes", "removed_services", "removed_configs", "removed_binaries"
+        )
     ) > 0
 
 
@@ -1159,6 +1216,36 @@ def _alert_action_evidence(alert: sqlite3.Row) -> Dict[str, Any]:
         }
     ) if isinstance(details.get("socks_process_pids"), list) else []
     details["socks_config_files"] = socks_config_files
+    malicious_processes = []
+    raw_malicious_processes = details.get("malicious_processes")
+    if isinstance(raw_malicious_processes, list):
+        for item in raw_malicious_processes:
+            if not isinstance(item, dict):
+                continue
+            process = str(item.get("process") or "").strip().lower()
+            try:
+                pid = int(item.get("pid") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if process == "xmrig":
+                malicious_processes.append(
+                    {"process": process, "pid": pid if 1 < pid <= 4194304 else 0}
+                )
+    if not malicious_processes and alert["alert_type"] == "malicious_process":
+        legacy_match = re.search(
+            r"首个特征\s*(xmrig)\s*[，,]\s*PID\s*(\d+)",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if legacy_match:
+            legacy_pid = int(legacy_match.group(2))
+            malicious_processes.append(
+                {
+                    "process": legacy_match.group(1).lower(),
+                    "pid": legacy_pid if 1 < legacy_pid <= 4194304 else 0,
+                }
+            )
+    details["malicious_processes"] = malicious_processes[:20]
     return details
 
 
@@ -1363,10 +1450,10 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
     except Exception:
         raise HTTPException(status_code=400, detail="invalid JSON body")
     decision = str(payload.get("decision") or "").strip().lower()
-    if decision not in ("deny", "allow_silent", "dismiss_once"):
+    if decision not in ("deny", "allow_silent", "dismiss_once", "reopen"):
         raise HTTPException(
             status_code=400,
-            detail="decision must be deny, allow_silent or dismiss_once",
+            detail="decision must be deny, allow_silent, dismiss_once or reopen",
         )
 
     conn = db()
@@ -1375,7 +1462,7 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
     if alert is None:
         conn.close()
         raise HTTPException(status_code=404, detail="alert not found")
-    if alert["status"] != "active":
+    if alert["status"] != "active" and decision not in ("deny", "reopen"):
         conn.close()
         raise HTTPException(status_code=409, detail="alert is no longer active")
 
@@ -1386,11 +1473,16 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
     action = None
     queued = False
     if decision == "deny":
-        if alert["alert_type"] not in ("unauthorized_panel_pairing", "socks_weak_auth"):
+        if alert["alert_type"] not in (
+            "unauthorized_panel_pairing", "socks_weak_auth", "malicious_process"
+        ):
             conn.close()
             raise HTTPException(
                 status_code=400,
-                detail="deny supports panel-pairing and confirmed no-auth SOCKS alerts",
+                detail=(
+                    "deny supports panel-pairing, confirmed no-auth SOCKS, "
+                    "and exact XMRig alerts"
+                ),
             )
         if alert["runtime"] not in ("podman", "incus"):
             conn.close()
@@ -1398,6 +1490,11 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
         if not alert["container_name"]:
             conn.close()
             raise HTTPException(status_code=400, detail="alert has no container target")
+        conn.execute(
+            "DELETE FROM security_alert_policies WHERE fingerprint=?",
+            (alert["fingerprint"],),
+        )
+        conn.execute("UPDATE security_alerts SET status='active' WHERE id=?", (alert_id,))
         details = _alert_action_evidence(alert)
         if alert["alert_type"] == "socks_weak_auth":
             if details.get("socks_auth_mode") != "no_auth":
@@ -1419,7 +1516,7 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
             action, queued = _queue_security_action_row(
                 conn, alert, "enforce_socks_auth", params, requested_by
             )
-        else:
+        elif alert["alert_type"] == "unauthorized_panel_pairing":
             process_patterns = details.get("process_patterns") or []
             process_pids = details.get("process_pids") or []
             config_files = details.get("config_files") or []
@@ -1434,6 +1531,33 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
             }
             action, queued = _queue_security_action_row(
                 conn, alert, "remediate_panel_pairing", params, requested_by
+            )
+        else:
+            malicious_processes = details.get("malicious_processes") or []
+            exact_xmrig = [
+                item for item in malicious_processes
+                if isinstance(item, dict) and item.get("process") == "xmrig"
+            ]
+            if not exact_xmrig:
+                conn.close()
+                raise HTTPException(
+                    status_code=400,
+                    detail="alert has no exact XMRig process evidence",
+                )
+            process_pids = []
+            for item in exact_xmrig:
+                try:
+                    process_pid = int(item.get("pid") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if 1 < process_pid <= 4194304:
+                    process_pids.append(process_pid)
+            params = {
+                "process_names": ["xmrig"],
+                "process_pids": sorted(set(process_pids)),
+            }
+            action, queued = _queue_security_action_row(
+                conn, alert, "remediate_malicious_process", params, requested_by
             )
     elif decision == "allow_silent":
         conn.execute(
@@ -1459,8 +1583,27 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
             action, queued = _queue_security_action_row(
                 conn, alert, "release_socks_auth", {}, requested_by
             )
-    else:
+    elif decision == "dismiss_once":
         conn.execute("UPDATE security_alerts SET status='dismissed' WHERE id=?", (alert_id,))
+    else:
+        conn.execute(
+            "DELETE FROM security_alert_policies WHERE fingerprint=?",
+            (alert["fingerprint"],),
+        )
+        conn.execute("UPDATE security_alerts SET status='active' WHERE id=?", (alert_id,))
+        if (
+            alert["alert_type"] == "unauthorized_panel_pairing"
+            and alert["runtime"] in ("podman", "incus")
+        ):
+            domains = _alert_action_evidence(alert).get("unapproved_domains") or []
+            if domains:
+                action, queued = _queue_security_action_row(
+                    conn,
+                    alert,
+                    "disallow_panel_domains",
+                    {"domains": domains},
+                    requested_by,
+                )
 
     conn.execute(
         """
@@ -1562,7 +1705,11 @@ async def security_action_result(
     if row is None or row["host_id"] != host_id:
         conn.close()
         raise HTTPException(status_code=404, detail="action not found for host")
-    if status == "succeeded" and row["action_type"] == "remediate_panel_pairing" and not _remediation_changed(message):
+    if (
+        status == "succeeded"
+        and row["action_type"] in ("remediate_panel_pairing", "remediate_malicious_process")
+        and not _remediation_changed(message)
+    ):
         status = "failed"
         message = f"no matching process, service or config was removed; {message}"[:2000]
     if row["status"] not in ("succeeded", "failed"):
@@ -1571,7 +1718,7 @@ async def security_action_result(
             (status, message, now, action_id),
         )
         if status == "succeeded" and row["action_type"] in (
-            "remediate_panel_pairing", "enforce_socks_auth"
+            "remediate_panel_pairing", "remediate_malicious_process", "enforce_socks_auth"
         ):
             conn.execute(
                 "UPDATE security_alerts SET status='remediated' WHERE id=? AND status='active'",
@@ -1605,35 +1752,99 @@ def security_alerts(active_only: bool = True, limit: int = 200) -> JSONResponse:
             "SELECT * FROM security_alerts ORDER BY last_seen DESC LIMIT ?",
             (limit,),
         ).fetchall()
-    items = []
-    for row in rows:
-        latest_action = _latest_action_for_alert(conn, row)
-        items.append(
-            {
-                "id": int(row["id"]),
-                "host_id": row["host_id"],
-                "runtime": row["runtime"],
-                "project": row["project"],
-                "container_name": row["container_name"],
-                "type": row["alert_type"],
-                "severity": row["severity"],
-                "title": row["title"],
-                "message": row["message"],
-                "value": float(row["value"] or 0),
-                "threshold": float(row["threshold"] or 0),
-                "first_seen": int(row["first_seen"]),
-                "first_seen_utc8": format_utc8(int(row["first_seen"])),
-                "last_seen": int(row["last_seen"]),
-                "last_seen_utc8": format_utc8(int(row["last_seen"])),
-                "occurrence_count": int(row["occurrence_count"]),
-                "status": row["status"],
-                "details": _alert_action_evidence(row),
-                "latest_action": _action_item(latest_action) if latest_action is not None else None,
-            }
-        )
+    items = [_security_alert_item(conn, row) for row in rows]
     conn.close()
     active_count = sum(1 for item in items if item["status"] == "active") if not active_only else len(items)
     return JSONResponse(content={"items": items, "active_count": active_count})
+
+
+@app.get("/api/v1/security/history")
+def security_alert_history(
+    status: str = "all",
+    severity: str = "all",
+    alert_type: str = "all",
+    host_id: str = "",
+    query: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> JSONResponse:
+    valid_statuses = {"active", "suppressed", "dismissed", "resolved", "remediated"}
+    valid_severities = {"info", "warning", "critical"}
+    status = status.strip().lower()
+    severity = severity.strip().lower()
+    alert_type = alert_type.strip()[:80]
+    host_id = host_id.strip()[:200]
+    query = query.strip()[:200]
+    if status != "all" and status not in valid_statuses:
+        raise HTTPException(status_code=400, detail="invalid alert status")
+    if severity != "all" and severity not in valid_severities:
+        raise HTTPException(status_code=400, detail="invalid alert severity")
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    clauses: List[str] = []
+    params: List[Any] = []
+    if status != "all":
+        clauses.append("status=?")
+        params.append(status)
+    if severity != "all":
+        clauses.append("severity=?")
+        params.append(severity)
+    if alert_type and alert_type != "all":
+        clauses.append("alert_type=?")
+        params.append(alert_type)
+    if host_id:
+        clauses.append("host_id=?")
+        params.append(host_id)
+    if query:
+        like_query = f"%{query}%"
+        clauses.append(
+            "(host_id LIKE ? OR container_name LIKE ? OR title LIKE ? OR message LIKE ?)"
+        )
+        params.extend([like_query, like_query, like_query, like_query])
+    where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = db()
+    total = int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM security_alerts{where_sql}", params
+        ).fetchone()[0]
+    )
+    rows = conn.execute(
+        f"SELECT * FROM security_alerts{where_sql} "
+        "ORDER BY last_seen DESC, id DESC LIMIT ? OFFSET ?",
+        (*params, limit, offset),
+    ).fetchall()
+    counts = {item: 0 for item in ("all", *sorted(valid_statuses))}
+    for count_row in conn.execute(
+        "SELECT status, COUNT(*) AS count FROM security_alerts GROUP BY status"
+    ).fetchall():
+        current_status = str(count_row["status"])
+        counts[current_status] = int(count_row["count"])
+        counts["all"] += int(count_row["count"])
+    alert_types = [
+        str(item["alert_type"])
+        for item in conn.execute(
+            "SELECT DISTINCT alert_type FROM security_alerts ORDER BY alert_type"
+        ).fetchall()
+    ]
+    hosts = [
+        str(item["host_id"])
+        for item in conn.execute(
+            "SELECT DISTINCT host_id FROM security_alerts ORDER BY host_id"
+        ).fetchall()
+    ]
+    items = [_security_alert_item(conn, row) for row in rows]
+    conn.close()
+    return JSONResponse(
+        content={
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "counts": counts,
+            "alert_types": alert_types,
+            "hosts": hosts,
+        }
+    )
 
 
 @app.get("/api/v1/security/status")
@@ -1817,6 +2028,49 @@ def stats(minutes: int = 720) -> JSONResponse:
     )
 
 
+@app.get("/alerts/history", response_class=HTMLResponse)
+def security_alert_history_page() -> str:
+    return """
+<!doctype html>
+<html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>告警历史 · Narwhal Monitor</title>
+<style>
+*{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}:root{color-scheme:dark;--bg:#020617;--surface:#0f172a;--surface2:#172033;--surface3:#1e293b;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--success:#22c55e;--warning:#f59e0b;--danger:#ef4444;--focus:#7dd3fc}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}.skip-link{position:fixed;top:-70px;left:12px;z-index:1000;padding:10px 14px;border-radius:8px;background:var(--accent);color:#082f49;font-weight:750}.skip-link:focus{top:12px}.shell{width:min(1500px,100%);margin:auto;padding:20px}.header{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding:18px 20px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(135deg,#0f172a,#111d34)}h1{margin:0;font-size:22px}.subtitle{margin:5px 0 0;color:var(--muted);font-size:13px}.header-actions,.actions,.status-tabs{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.btn,.nav-link{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;background:var(--surface3);color:var(--text);font:inherit;text-decoration:none;cursor:pointer;touch-action:manipulation;transition:filter 180ms ease,opacity 180ms ease}.btn:hover,.nav-link:hover{filter:brightness(1.13)}.btn:focus-visible,.nav-link:focus-visible,input:focus-visible,select:focus-visible,.status-chip:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.btn:disabled{opacity:.55;cursor:wait}.btn-danger{border-color:#b91c1c;background:#7f1d1d}.btn-secondary{background:#334155}.panel{margin-top:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface);overflow:hidden}.panel-head{padding:14px 16px;border-bottom:1px solid var(--border);background:var(--surface2)}.panel-head h2{margin:0;font-size:17px}.filters{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;padding:16px}.field{min-width:0}.field label{display:block;margin-bottom:5px;color:#cbd5e1;font-size:12px;font-weight:650}.field input,.field select{width:100%;min-height:44px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:#0b1220;color:var(--text);font:inherit}.filter-actions{display:flex;align-items:end;gap:8px}.status-tabs{padding:12px 16px;border-top:1px solid var(--border)}.status-chip{min-height:44px;padding:6px 10px;border:1px solid var(--border);border-radius:999px;background:#111827;color:#cbd5e1;cursor:pointer;touch-action:manipulation}.status-chip.active{border-color:#0ea5e9;background:#082f49;color:#bae6fd}.alert-list{display:grid;gap:12px;padding:16px}.alert-card{min-width:0;border:1px solid var(--border);border-left:4px solid var(--warning);border-radius:12px;background:#0b1220;padding:15px}.alert-card.critical{border-left-color:var(--danger)}.alert-card.info{border-left-color:var(--accent)}.alert-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.alert-title{min-width:0}.alert-title h3{margin:0;font-size:16px;overflow-wrap:anywhere}.meta{display:flex;gap:7px;flex-wrap:wrap;margin-top:7px}.pill{display:inline-flex;align-items:center;min-height:28px;padding:3px 9px;border:1px solid var(--border);border-radius:999px;background:#111827;color:#cbd5e1;font-size:12px;overflow-wrap:anywhere}.pill.active{border-color:#b91c1c;background:#450a0a;color:#fca5a5}.pill.suppressed{border-color:#166534;background:#052e16;color:#86efac}.pill.dismissed{border-color:#92400e;background:#451a03;color:#fcd34d}.pill.remediated{border-color:#0369a1;background:#082f49;color:#7dd3fc}.pill.resolved{color:#cbd5e1}.message{margin:13px 0;color:#e2e8f0;overflow-wrap:anywhere}.evidence{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.evidence-block{min-width:0;padding:10px;border:1px solid #26364e;border-radius:9px;background:#0f172a}.evidence-block span{display:block;color:var(--muted);font-size:11px}.evidence-block strong{display:block;margin-top:4px;font-size:13px;font-weight:600;overflow-wrap:anywhere}.result{margin-top:10px;padding:10px;border-radius:8px;background:#111827;color:#cbd5e1;font-size:12px;overflow-wrap:anywhere}.card-footer{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;margin-top:12px}.timestamps{color:var(--muted);font-size:12px}.empty{padding:36px;text-align:center;color:var(--muted)}.load-more{display:flex;justify-content:center;padding:0 16px 18px}.toast{position:fixed;right:18px;bottom:18px;z-index:10;max-width:min(440px,calc(100% - 36px));padding:12px 14px;border:1px solid #166534;border-radius:10px;background:#052e16;color:#bbf7d0;box-shadow:0 12px 35px #0008}.toast.error{border-color:#991b1b;background:#450a0a;color:#fecaca}[hidden]{display:none!important}
+@media(max-width:1000px){.filters{grid-template-columns:repeat(2,minmax(0,1fr))}.evidence{grid-template-columns:1fr}.filter-actions{align-items:center}.card-footer{align-items:flex-start;flex-direction:column}}
+@media(max-width:640px){.shell{padding:8px}.header{padding:14px;flex-direction:column}.filters{grid-template-columns:1fr;padding:10px}.alert-list{padding:10px}.alert-top{flex-direction:column}.actions{width:100%}.actions .btn{flex:1 1 100%}.status-tabs{padding:10px}.status-chip{flex:1 1 calc(50% - 8px)}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
+</style></head><body><a class='skip-link' href='#history-main'>跳到主要内容</a><main id='history-main' class='shell'>
+<header class='header'><div><h1>安全告警历史</h1><p class='subtitle'>保留活动、已忽略、已处理和已恢复事件；可重新禁止或恢复提醒。</p></div><div class='header-actions'><span id='server-version' class='pill'>Server</span><a class='nav-link' href='/'>返回总览</a><button class='btn' type='button' onclick='loadHistory(true)'>刷新</button></div></header>
+<section class='panel' aria-labelledby='filter-title'><header class='panel-head'><h2 id='filter-title'>检索与筛选</h2></header><div class='filters'>
+<div class='field'><label for='severity'>级别</label><select id='severity'><option value='all'>全部级别</option><option value='critical'>Critical</option><option value='warning'>Warning</option><option value='info'>Info</option></select></div>
+<div class='field'><label for='alert-type'>告警类型</label><select id='alert-type'><option value='all'>全部类型</option></select></div>
+<div class='field'><label for='host-id'>主机</label><select id='host-id'><option value=''>全部主机</option></select></div>
+<div class='field'><label for='query'>关键词</label><input id='query' type='search' placeholder='容器、主机、说明'></div>
+<div class='filter-actions'><button class='btn' type='button' onclick='applyFilters()'>应用筛选</button><button class='btn btn-secondary' type='button' onclick='resetFilters()'>重置</button></div>
+</div><div id='status-tabs' class='status-tabs' aria-label='处理状态'></div></section>
+<section class='panel' aria-labelledby='history-title'><header class='panel-head'><h2 id='history-title'>告警记录 <span id='result-count' class='pill'>0</span></h2></header><div id='alert-list' class='alert-list' aria-live='polite'><div class='empty'>正在加载告警历史…</div></div><div class='load-more'><button id='load-more' class='btn' type='button' hidden onclick='loadMore()'>加载更多</button></div></section>
+</main><div id='toast' class='toast' role='status' aria-live='polite' hidden></div>
+<script>
+const state={status:'all',offset:0,limit:50,total:0,loading:false};
+const labels={active:'活动',suppressed:'允许且不再提醒',dismissed:'本次取消提醒',resolved:'已恢复',remediated:'已处理'};
+const decisions={deny:'禁止/处理',allow_silent:'允许且不再提醒',dismiss_once:'本次取消提醒',reopen:'恢复提醒'};
+function esc(value){return String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));}
+function showToast(message,error=false){const toast=document.getElementById('toast');toast.textContent=message;toast.className=`toast${error?' error':''}`;toast.hidden=false;setTimeout(()=>{toast.hidden=true},4500)}
+function actionable(alert){const details=alert.details||{};const supported=alert.runtime==='incus'||alert.runtime==='podman';if(!supported)return false;if(alert.type==='unauthorized_panel_pairing')return (details.process_patterns||[]).length>0||(details.config_files||[]).length>0;if(alert.type==='socks_weak_auth')return details.socks_auth_mode==='no_auth'&&(details.socks_processes||[]).length>0;if(alert.type==='malicious_process')return (details.malicious_processes||[]).some(x=>x.process==='xmrig');return false;}
+function evidenceText(alert){const d=alert.details||{};if(alert.type==='unauthorized_panel_pairing')return [`域名：${(d.unapproved_domains||[]).join(', ')||'-'}`,`进程：${(d.process_patterns||[]).join(', ')||'-'}`,`配置：${(d.config_files||[]).join(', ')||'-'}`];if(alert.type==='socks_weak_auth')return [`认证：${d.socks_auth_mode||'unknown'}`,`进程：${(d.socks_processes||[]).join(', ')||'-'}`,`配置：${(d.socks_config_files||[]).join(', ')||'-'}`];if(alert.type==='malicious_process')return [`进程：${(d.malicious_processes||[]).map(x=>x.process).join(', ')||'-'}`,`PID：${(d.malicious_processes||[]).map(x=>x.pid||'-').join(', ')||'-'}`,'策略：仅精确匹配 XMRig'];return [`指标：${alert.value||0}`,`阈值：${alert.threshold||0}`,`类型：${alert.type}`];}
+function resultText(alert){const automatic=alert.details?.automatic_remediation;const action=alert.latest_action;const decision=alert.latest_decision;const parts=[];if(automatic?.attempted)parts.push(`自动处置：${automatic.succeeded?'成功':'失败'} · ${automatic.message||'-'}`);if(action)parts.push(`节点操作：${action.status} · ${action.result_message||action.action_type}`);if(decision)parts.push(`人工决定：${decisions[decision.decision]||decision.decision} · ${decision.requested_by} · ${decision.created_at_utc8}`);return parts.join('<br>');}
+function card(alert){const runtime=alert.project?`${alert.runtime}/${alert.project}`:(alert.runtime||'-');const evidence=evidenceText(alert);const canAct=actionable(alert);const historical=alert.status!=='active';const controls=[];if(canAct)controls.push(`<button class='btn btn-danger' type='button' data-action-id='${alert.id}' onclick="decide(${alert.id},'deny')">${historical?'重新禁止/处理':'禁止/处理'}</button>`);if(alert.status==='suppressed'||alert.status==='dismissed')controls.push(`<button class='btn btn-secondary' type='button' data-action-id='${alert.id}' onclick="decide(${alert.id},'reopen')">恢复提醒</button>`);const result=resultText(alert);return `<article class='alert-card ${esc(alert.severity)}'><div class='alert-top'><div class='alert-title'><h3>${esc(alert.title||alert.type)}</h3><div class='meta'><span class='pill ${esc(alert.status)}'>${esc(labels[alert.status]||alert.status)}</span><span class='pill'>${esc(alert.severity)}</span><span class='pill'>${esc(alert.host_id)}</span><span class='pill'>${esc(runtime)}</span><span class='pill'>${esc(alert.container_name||'-')}</span></div></div><span class='pill'>出现 ${Number(alert.occurrence_count||0)} 次</span></div><p class='message'>${esc(alert.message)}</p><div class='evidence'>${evidence.map((x,i)=>`<div class='evidence-block'><span>${['关键证据','关联对象','处置范围'][i]||'证据'}</span><strong>${esc(x)}</strong></div>`).join('')}</div>${result?`<div class='result'>${result}</div>`:''}<footer class='card-footer'><div class='timestamps'>首次 ${esc(alert.first_seen_utc8)} · 最近 ${esc(alert.last_seen_utc8)}</div><div class='actions'>${controls.join('')}</div></footer></article>`;}
+function fillOptions(id,values,current,allLabel){const select=document.getElementById(id);select.innerHTML=`<option value='${id==='host-id'?'':'all'}'>${allLabel}</option>`+values.map(v=>`<option value='${esc(v)}'>${esc(v)}</option>`).join('');select.value=current||'';}
+function renderTabs(counts){const tabs=document.getElementById('status-tabs');tabs.innerHTML=['all','active','suppressed','dismissed','remediated','resolved'].map(status=>`<button type='button' class='status-chip ${state.status===status?'active':''}' onclick="selectStatus('${status}')">${status==='all'?'全部':labels[status]} ${Number(counts?.[status]||0)}</button>`).join('');}
+async function loadHistory(reset=false){if(state.loading)return;if(reset)state.offset=0;state.loading=true;const params=new URLSearchParams({status:state.status,severity:document.getElementById('severity').value,alert_type:document.getElementById('alert-type').value,host_id:document.getElementById('host-id').value,query:document.getElementById('query').value,limit:String(state.limit),offset:String(state.offset)});try{const response=await fetch(`/api/v1/security/history?${params}`);const data=await response.json();if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);state.total=Number(data.total||0);document.getElementById('server-version').textContent='Server 已连接';document.getElementById('result-count').textContent=`${state.total} 条`;renderTabs(data.counts);if(reset){fillOptions('alert-type',data.alert_types||[],document.getElementById('alert-type').value,'全部类型');fillOptions('host-id',data.hosts||[],document.getElementById('host-id').value,'全部主机');document.getElementById('alert-list').innerHTML='';}const list=document.getElementById('alert-list');if(reset)list.innerHTML='';list.insertAdjacentHTML('beforeend',(data.items||[]).map(card).join(''));state.offset+=(data.items||[]).length;if(state.total===0)list.innerHTML='<div class="empty">没有符合条件的告警记录</div>';document.getElementById('load-more').hidden=state.offset>=state.total;}catch(error){showToast(`加载失败：${error.message||error}`,true)}finally{state.loading=false}}
+function selectStatus(status){state.status=status;loadHistory(true)}function applyFilters(){loadHistory(true)}function resetFilters(){state.status='all';document.getElementById('severity').value='all';document.getElementById('alert-type').value='all';document.getElementById('host-id').value='';document.getElementById('query').value='';loadHistory(true)}function loadMore(){loadHistory(false)}
+async function decide(id,decision){const warning=decision==='deny'?'确认重新执行定向处置？只会处理已识别的进程、服务和配置，不会停止容器。':'确认撤销忽略策略并恢复提醒？';if(!confirm(warning))return;document.querySelectorAll(`[data-action-id="${id}"]`).forEach(x=>x.disabled=true);try{const response=await fetch(`/api/v1/security/alerts/${id}/disposition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision})});const data=await response.json();if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);showToast(data.queued?'操作已排队，等待节点执行':'状态已更新');await loadHistory(true)}catch(error){showToast(`操作失败：${error.message||error}`,true);document.querySelectorAll(`[data-action-id="${id}"]`).forEach(x=>x.disabled=false)}}
+document.getElementById('query').addEventListener('keydown',event=>{if(event.key==='Enter')loadHistory(true)});loadHistory(true);setInterval(()=>loadHistory(true),30000);
+</script></body></html>
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     return """
@@ -1927,7 +2181,7 @@ table{background:var(--surface);color:var(--text)}th,td{border-color:var(--borde
 </head><body>
 <a class='skip-link' href='#main-content'>跳到主要内容</a>
 <main id='main-content' class='app-shell'>
-<header class='app-header'><div class='brand'><span class='brand-mark' aria-hidden='true'>NW</span><div><h1>Narwhal Monitor</h1><p>容器安全与运行状态中心</p></div></div><div class='header-actions'><span id='server-version' class='pill'>Server 正在连接</span><span id='last-refresh' class='refresh-time'>尚未刷新</span><a class='nav-link' href='/stats'>数据统计</a></div></header>
+<header class='app-header'><div class='brand'><span class='brand-mark' aria-hidden='true'>NW</span><div><h1>Narwhal Monitor</h1><p>容器安全与运行状态中心</p></div></div><div class='header-actions'><span id='server-version' class='pill'>Server 正在连接</span><span id='last-refresh' class='refresh-time'>尚未刷新</span><a class='nav-link' href='/alerts/history'>告警历史</a><a class='nav-link' href='/stats'>数据统计</a></div></header>
 <section class='kpi-grid' aria-label='运行概览'><article class='kpi-card'><span class='kpi-label'>在线主机</span><strong id='kpi-hosts' class='kpi-value'>0</strong></article><article class='kpi-card'><span class='kpi-label'>监控容器</span><strong id='kpi-containers' class='kpi-value'>0</strong></article><article class='kpi-card'><span class='kpi-label'>活动告警</span><strong id='kpi-alerts' class='kpi-value danger'>0</strong></article><article class='kpi-card'><span class='kpi-label'>离线容器</span><strong id='kpi-offline' class='kpi-value'>0</strong></article></section>
 <section class='section-card'><header class='section-head'><div><h2>安全告警 <span class='pill pill-bad'>活动 <span id='active-alert-count'>0</span></span></h2><p>机场组件禁止操作执行定向清理；无认证 SOCKS 操作只停止对应服务并持续拦截，均不会停止容器。</p></div></header><div class='section-body'><table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th><th>操作</th></tr></thead><tbody></tbody></table></div></section>
 <section class='section-card'><header class='section-head'><div><h2>主机安全遥测</h2><p>低开销汇总网络、连接与访问日志状态。</p></div></header><div class='section-body'><table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table></div></section>
@@ -2001,7 +2255,7 @@ function escapeHtml(value){
 const alertsById=new Map();
 const submittingAlertActions=new Set();
 function remediationChanged(action){
-  if(!action||action.action_type!=='remediate_panel_pairing'||action.status!=='succeeded')return false;
+  if(!action||!['remediate_panel_pairing','remediate_malicious_process'].includes(action.action_type)||action.status!=='succeeded')return false;
   const text=String(action.result_message||'');
   const values=[...text.matchAll(/\\b(?:killed_processes|removed_services|removed_configs)=(\\d+)\\b/g)].map(x=>Number(x[1]||0));
   return values.some(x=>x>0)&&!/\\bcleanup_errors=[1-9]\\d*\\b/.test(text);
@@ -2028,6 +2282,9 @@ async function setAlertDisposition(alertId, decision){
     if(alert.type==='socks_weak_auth'){
       const processes=(details.socks_processes||[]).join(', ')||'无';
       promptText=`确认停止 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的无认证 SOCKS 服务并启用持续拦截？\n\n目标进程：${processes}\n不会停止容器，不会删除配置或服务文件。以后检测到该容器再次以无认证/空密码方式运行时会自动停止；检测到非空认证后会自动解除拦截，允许服务恢复。`;
+    }else if(alert.type==='malicious_process'){
+      const processes=(details.malicious_processes||[]).map(item=>`${item.process}${item.pid?` (PID ${item.pid})`:''}`).join(', ')||'无';
+      promptText=`确认清理 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内精确识别的 XMRig 挖矿程序？\n\n目标：${processes}\n将终止进程、停用对应服务并删除明确的 XMRig 配置和二进制文件；不会停止容器。`;
     }else{
       const processes=(details.process_patterns||[]).join(', ')||'无';
       const files=(details.config_files||[]).join(', ')||'无';
@@ -2075,8 +2332,9 @@ async function loadAlerts(){
     const supportedRuntime=alert.runtime==='podman'||alert.runtime==='incus';
     const canPanelRemediate=supportedRuntime&&alert.type==='unauthorized_panel_pairing'&&((alert.details?.process_patterns||[]).length>0||(alert.details?.config_files||[]).length>0);
     const canSocksRemediate=supportedRuntime&&alert.type==='socks_weak_auth'&&alert.details?.socks_auth_mode==='no_auth'&&(alert.details?.socks_processes||[]).length>0;
+    const canMaliciousRemediate=supportedRuntime&&alert.type==='malicious_process'&&(alert.details?.malicious_processes||[]).some(item=>item.process==='xmrig');
     const pending=alert.latest_action&&(alert.latest_action.status==='queued'||alert.latest_action.status==='dispatched');
-    const lastRemediation=alert.latest_action?.action_type==='remediate_panel_pairing'?alert.latest_action:null;
+    const lastRemediation=['remediate_panel_pairing','remediate_malicious_process'].includes(alert.latest_action?.action_type)?alert.latest_action:null;
     const lastSocksEnforcement=alert.latest_action?.action_type==='enforce_socks_auth'?alert.latest_action:null;
     const changed=remediationChanged(lastRemediation);
     const recurred=changed&&Number(alert.last_seen||0)>Number(lastRemediation?.updated_at||0);
@@ -2087,7 +2345,7 @@ async function loadAlerts(){
     if(canSocksRemediate){
       const socksLabel=pending?'正在启用持续拦截':(lastSocksEnforcement?.status==='failed'?'重试停止并持续拦截':'停止并持续拦截');
       denyControl=socksPolicyActive?`<span class='ok'>持续拦截已启用</span>`:`<button class='btn btn-danger' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'deny')">${socksLabel}</button>`;
-    }else if(canPanelRemediate){
+    }else if(canPanelRemediate||canMaliciousRemediate){
       denyControl=changed&&!recurred?`<span class='ok'>已禁止，等待复检</span>`:`<button class='btn btn-danger' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'deny')">${denyLabel}</button>`;
     }else if(socksReleased){denyControl=`<span class='ok'>已检测到非空认证，持续拦截已解除</span>`;}
     const allowLabel=socksPolicyActive?'解除拦截并允许（不再提醒）':'允许且不再提醒';

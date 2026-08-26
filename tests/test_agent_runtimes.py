@@ -1258,10 +1258,81 @@ class SecurityTelemetryTests(unittest.TestCase):
             "project": "",
             "security": {"suspicious_processes": processes},
         }
-        with mock.patch.dict(os.environ, {"SECURITY_ACCESS_LOG_PATHS": ""}, clear=False):
+        with mock.patch.dict(
+            os.environ,
+            {"SECURITY_ACCESS_LOG_PATHS": "", "SECURITY_AUTO_REMEDIATE_XMRIG": "true"},
+            clear=False,
+        ), mock.patch.object(
+            agent,
+            "remediate_malicious_process",
+            return_value=(True, "killed_processes=1 removed_services=0 removed_configs=0"),
+        ) as remediate:
             result = agent.collect_security_summary([container], 60)
         alert = next(item for item in result["alerts"] if item["type"] == "malicious_process")
         self.assertEqual(alert["severity"], "critical")
         self.assertEqual(alert["container_name"], "panel")
+        self.assertEqual(alert["malicious_processes"][0]["process"], "xmrig")
+        self.assertTrue(alert["automatic_remediation"]["succeeded"])
+        remediate.assert_called_once()
+
+    def test_docker_xmrig_is_notice_only_and_never_auto_remediated(self):
+        container = {
+            "name": "customer-helper",
+            "runtime": "docker",
+            "project": "",
+            "security": {
+                "suspicious_processes": [
+                    {"pid": 42, "process": "xmrig", "pattern": "xmrig"}
+                ]
+            },
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"SECURITY_ACCESS_LOG_PATHS": "", "SECURITY_AUTO_REMEDIATE_XMRIG": "true"},
+            clear=False,
+        ), mock.patch.object(agent, "remediate_malicious_process") as remediate:
+            result = agent.collect_security_summary([container], 60)
+        alert = next(item for item in result["alerts"] if item["type"] == "malicious_process")
+        self.assertEqual(alert["runtime"], "docker")
+        self.assertEqual(alert["automatic_remediation"], {})
+        remediate.assert_not_called()
+
+    def test_unapproved_xrayr_is_auto_remediated_but_approved_xrayr_is_not(self):
+        base = {
+            "name": "node",
+            "runtime": "incus",
+            "project": "default",
+            "security": {
+                "panel_pairing": {
+                    "detected": True,
+                    "approved": False,
+                    "panel_domains": ["panel.example.net"],
+                    "unapproved_domains": ["panel.example.net"],
+                    "process_patterns": ["xrayr"],
+                    "process_matches": [{"pid": 77, "pattern": "xrayr"}],
+                    "config_files": ["/etc/XrayR/config.yml"],
+                }
+            },
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"SECURITY_ACCESS_LOG_PATHS": "", "SECURITY_AUTO_REMEDIATE_XRAYR": "true"},
+            clear=False,
+        ), mock.patch.object(
+            agent,
+            "remediate_panel_pairing",
+            return_value=(True, "killed_processes=1 removed_services=1 removed_configs=1"),
+        ) as remediate:
+            result = agent.collect_security_summary([base], 60)
+            approved = json.loads(json.dumps(base))
+            approved["security"]["panel_pairing"]["approved"] = True
+            approved["security"]["panel_pairing"]["unapproved_domains"] = []
+            agent.collect_security_summary([approved], 60)
+        alert = next(
+            item for item in result["alerts"]
+            if item["type"] == "unauthorized_panel_pairing"
+        )
+        self.assertTrue(alert["automatic_remediation"]["succeeded"])
+        self.assertEqual(remediate.call_count, 1)
 if __name__ == "__main__":
     unittest.main()

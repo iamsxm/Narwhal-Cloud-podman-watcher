@@ -10,6 +10,8 @@ CLIENT_VENV_DIR="$CLIENT_APP_DIR/.venv"
 CLIENT_CA_FILE="/opt/narwhal-monitor/server-ca.crt"
 SYSTEMD_SERVICE_FILE="/etc/systemd/system/narwhal-monitor-client.service"
 MODE="${1:-install}"
+# shellcheck source=scripts/lib/interactive.sh
+source "$ROOT_DIR/scripts/lib/interactive.sh"
 
 if [[ "$MODE" != "install" && "$MODE" != "update" ]]; then
   echo "[ERROR] 用法: bash scripts/install-client.sh [install|update]"
@@ -64,6 +66,17 @@ load_non_empty_or_default() {
   else
     echo "$fallback"
   fi
+}
+
+ask_choice_with_default() {
+  local prompt="$1"
+  local current="$2"
+  shift 2
+  if [[ "$MODE" == "update" ]]; then
+    echo "$current"
+    return
+  fi
+  narwhal_choose "$prompt" "$current" "$@"
 }
 
 is_truthy() {
@@ -196,11 +209,16 @@ secret="$(ask_with_default "Shared secret" "$default_secret")"
 host_id="$(ask_with_default "Host ID" "$default_host_id")"
 interval="$(ask_with_default "Collect interval seconds" "$default_interval")"
 runtimes="$(ask_with_default "Container runtimes (auto or comma-separated podman,docker,incus)" "$default_runtimes")"
-docker_monitor_mode="$(ask_with_default "Docker handling (notice/full/off)" "$default_docker_monitor_mode")"
+docker_monitor_mode="$(ask_choice_with_default "请选择 Docker 处理方式" "$default_docker_monitor_mode" \
+  "notice|仅发现并提醒（推荐）" \
+  "full|完整监测" \
+  "off|关闭 Docker 发现")"
 monitored_patterns="$(ask_with_default "Podman/Docker image patterns (comma-separated substring match)" "$default_monitored_patterns")"
 monitored_incus_patterns="$(ask_with_default "Incus name/image patterns (* for all)" "$default_monitored_incus_patterns")"
 incus_project="$(ask_with_default "Incus project" "$default_incus_project")"
-security_enabled="$(ask_with_default "Enable DDoS/CC/abuse/scan monitoring [true/false]" "$default_security_enabled")"
+security_enabled="$(ask_choice_with_default "是否启用 DDoS/CC/滥用/扫描监测" "$default_security_enabled" \
+  "true|启用（推荐）" \
+  "false|禁用")"
 access_log_paths="$(ask_with_default "Nginx/Caddy access log paths (comma-separated)" "$default_access_log_paths")"
 container_access_log_paths="$(ask_with_default "Access log paths inside every container (comma-separated)" "$default_container_access_log_paths")"
 allowed_panel_domains="$(ask_with_default "Allowed airport panel domains (comma-separated; empty means none)" "$default_allowed_panel_domains")"

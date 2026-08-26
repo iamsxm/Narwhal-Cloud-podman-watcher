@@ -301,8 +301,24 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("org.opencontainers.image.revision", updater)
         self.assertIn("flock --exclusive --wait 300", server_installer)
         self.assertIn("podman run -d --replace", server_installer)
-        self.assertIn("旧 Server 容器仍占用名称", server_installer)
+        self.assertIn("容器仍占用名称", server_installer)
         self.assertIn("Server 容器启动或版本验证失败", server_installer)
+        self.assertIn('remove_container_for_replace "$TLS_CONTAINER_NAME" "TLS Proxy"', server_installer)
+        self.assertIn('run -d --replace --name "$TLS_CONTAINER_NAME"', server_installer)
+        self.assertIn("TLS Proxy 容器未能进入运行状态", server_installer)
+        self.assertIn('caddy validate --config /etc/caddy/Caddyfile', server_installer)
+
+    def test_install_menus_support_arrows_and_numeric_choices(self):
+        interactive = (ROOT / "scripts" / "lib" / "interactive.sh").read_text(
+            encoding="utf-8"
+        )
+        installer = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("使用 ↑/↓ 移动", interactive)
+        self.assertIn("请输入数字或名称", interactive)
+        self.assertIn("'[A'", interactive)
+        self.assertIn("'[B'", interactive)
+        self.assertIn('action="$(narwhal_choose', installer)
+        self.assertIn('mode="$(narwhal_choose', installer)
 
     def test_signed_agent_version_endpoint_reports_runtime_server_version(self):
         original_version = server.APP_VERSION

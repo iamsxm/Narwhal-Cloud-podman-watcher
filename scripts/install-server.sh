@@ -11,6 +11,8 @@ TLS_CA_EXPORT_DIR="/opt/narwhal-monitor/tls-ca"
 CONTAINER_NAME="narwhal-monitor-server"
 TLS_CONTAINER_NAME="narwhal-monitor-caddy"
 DEPLOY_LOCK_FILE="/run/narwhal-monitor-server-deploy.lock"
+# shellcheck source=scripts/lib/interactive.sh
+source "$ROOT_DIR/scripts/lib/interactive.sh"
 
 MODE="${1:-install}"
 RESET_DATA_ARG="${2:-}"
@@ -145,6 +147,17 @@ ensure_root_and_deps() {
   fi
 }
 
+ask_choice_with_default() {
+  local prompt="$1"
+  local current="$2"
+  shift 2
+  if [[ "$MODE" == "update" ]]; then
+    echo "$current"
+    return
+  fi
+  narwhal_choose "$prompt" "$current" "$@"
+}
+
 acquire_deploy_lock() {
   if [[ "${NARWHAL_SERVER_DEPLOY_LOCKED:-0}" == "1" ]]; then
     return
@@ -158,25 +171,31 @@ acquire_deploy_lock() {
   export NARWHAL_SERVER_DEPLOY_LOCKED=1
 }
 
+remove_container_for_replace() {
+  local container_name="$1"
+  local display_name="$2"
+  local existing_id=""
+  existing_id="$(podman container inspect --format '{{.Id}}' "$container_name" 2>/dev/null || true)"
+  if [[ -n "$existing_id" ]]; then
+    echo "[INFO] 正在替换现有 $display_name 容器: ${existing_id:0:12}"
+    if ! podman rm -f --time 10 "$container_name"; then
+      echo "[WARN] 首次删除旧 $display_name 容器失败，尝试强制停止后再次删除..."
+      podman stop --time 5 "$container_name" >/dev/null 2>&1 || true
+      podman rm -f --time 0 "$container_name" || true
+    fi
+  fi
+  if podman container inspect "$container_name" >/dev/null 2>&1; then
+    echo "[ERROR] 旧 $display_name 容器仍占用名称 '$container_name'，拒绝继续以免产生半更新状态。"
+    podman container inspect --format 'ID={{.Id}} Status={{.State.Status}} Error={{.State.Error}}' \
+      "$container_name" 2>/dev/null || true
+    exit 1
+  fi
+}
+
 replace_server_container() {
   local image_name="$1"
   local port_binding="$2"
-  local existing_id=""
-  existing_id="$(podman container inspect --format '{{.Id}}' "$CONTAINER_NAME" 2>/dev/null || true)"
-  if [[ -n "$existing_id" ]]; then
-    echo "[INFO] 正在替换现有 Server 容器: ${existing_id:0:12}"
-    if ! podman rm -f --time 10 "$CONTAINER_NAME"; then
-      echo "[WARN] 首次删除旧 Server 容器失败，尝试强制停止后再次删除..."
-      podman stop --time 5 "$CONTAINER_NAME" >/dev/null 2>&1 || true
-      podman rm -f --time 0 "$CONTAINER_NAME" || true
-    fi
-  fi
-  if podman container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
-    echo "[ERROR] 旧 Server 容器仍占用名称 '$CONTAINER_NAME'，拒绝继续以免产生半更新状态。"
-    podman container inspect --format 'ID={{.Id}} Status={{.State.Status}} Error={{.State.Error}}' \
-      "$CONTAINER_NAME" 2>/dev/null || true
-    exit 1
-  fi
+  remove_container_for_replace "$CONTAINER_NAME" "Server"
 
   local new_id=""
   if ! new_id="$(podman run -d --replace --name "$CONTAINER_NAME" \
@@ -221,11 +240,11 @@ setup_tls_proxy() {
   local cloudflare_api_token="$6"
   local caddy_image="$7"
 
-  podman rm -f "$TLS_CONTAINER_NAME" >/dev/null 2>&1 || true
+  remove_container_for_replace "$TLS_CONTAINER_NAME" "TLS Proxy"
   mkdir -p "$TLS_CA_EXPORT_DIR"
-  rm -f "$TLS_CA_EXPORT_DIR/root.crt"
 
   if [[ "$enable_tls" != "yes" ]]; then
+    rm -f "$TLS_CA_EXPORT_DIR/root.crt"
     return
   fi
 
@@ -312,7 +331,7 @@ CADDY
   fi
 
   local -a podman_args=(
-    run -d --name "$TLS_CONTAINER_NAME"
+    run -d --replace --name "$TLS_CONTAINER_NAME"
     --restart=always
     --network host
     -v "$TLS_DIR/Caddyfile:/etc/caddy/Caddyfile:ro"
@@ -324,14 +343,41 @@ CADDY
   fi
   podman_args+=( "$caddy_image" )
 
-  podman "${podman_args[@]}"
+  local tls_container_id=""
+  if ! tls_container_id="$(podman "${podman_args[@]}")"; then
+    echo "[ERROR] TLS Proxy 容器创建失败。"
+    exit 1
+  fi
+  echo "$tls_container_id"
+
+  local tls_running="false"
+  local tls_attempt=""
+  for tls_attempt in $(seq 1 30); do
+    tls_running="$(podman container inspect --format '{{.State.Running}}' "$TLS_CONTAINER_NAME" 2>/dev/null || true)"
+    if [[ "$tls_running" == "true" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$tls_running" != "true" ]]; then
+    echo "[ERROR] TLS Proxy 容器未能进入运行状态。"
+    podman logs --tail 100 "$TLS_CONTAINER_NAME" 2>&1 || true
+    exit 1
+  fi
+  if ! podman exec "$TLS_CONTAINER_NAME" caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+    echo "[ERROR] TLS Proxy 配置验证失败。"
+    podman logs --tail 100 "$TLS_CONTAINER_NAME" 2>&1 || true
+    exit 1
+  fi
+  echo "[OK] TLS Proxy 容器已运行。"
 
   if [[ "$tls_cert_mode" == "internal" || "$host_is_ip" == "yes" ]]; then
     local generated_root="$TLS_DIR/data/caddy/pki/authorities/local/root.crt"
     local attempt=""
     for attempt in $(seq 1 30); do
       if [[ -s "$generated_root" ]]; then
-        install -m 0644 "$generated_root" "$TLS_CA_EXPORT_DIR/root.crt"
+        install -m 0644 "$generated_root" "$TLS_CA_EXPORT_DIR/root.crt.tmp"
+        mv -f "$TLS_CA_EXPORT_DIR/root.crt.tmp" "$TLS_CA_EXPORT_DIR/root.crt"
         echo "[OK] Internal TLS CA exported for authenticated Client bootstrap."
         return
       fi
@@ -341,6 +387,7 @@ CADDY
     podman logs --tail 100 "$TLS_CONTAINER_NAME" 2>&1 || true
     return 1
   fi
+  rm -f "$TLS_CA_EXPORT_DIR/root.crt"
 }
 
 replace_kv_in_file() {
@@ -496,7 +543,9 @@ main() {
 
   local image_source github_image port secret th tls_enable tls_host tls_email tls_cert_mode cloudflare_api_token caddy_image alert_webhook_url alert_webhook_min_severity
 
-  image_source="$(ask_with_default "Image source [local/github]" "$default_image_source")"
+  image_source="$(ask_choice_with_default "请选择 Server 镜像来源" "$default_image_source" \
+    "github|GitHub Container Registry（推荐）" \
+    "local|本机源码构建")"
   image_source=$(echo "$image_source" | tr '[:upper:]' '[:lower:]')
   github_image="$(ask_with_default "GitHub image (for github source)" "$default_github_image")"
   port="$(ask_with_default "Server listen port" "$default_port")"
@@ -507,16 +556,23 @@ main() {
     alert_webhook_min_severity="$default_alert_webhook_min_severity"
   else
     alert_webhook_url="$(ask_with_default "Security alert webhook URL (empty to disable)" "$default_alert_webhook_url")"
-    alert_webhook_min_severity="$(ask_with_default "Webhook minimum severity [warning/critical]" "$default_alert_webhook_min_severity")"
+    alert_webhook_min_severity="$(ask_choice_with_default "请选择 Webhook 最低告警级别" "$default_alert_webhook_min_severity" \
+      "warning|warning 及以上" \
+      "critical|仅 critical")"
   fi
-  tls_enable="$(ask_with_default "Enable HTTPS reverse proxy [yes/no]" "$default_tls_enable")"
+  tls_enable="$(ask_choice_with_default "是否启用 HTTPS 反向代理" "$default_tls_enable" \
+    "yes|启用（推荐）" \
+    "no|不启用")"
   tls_enable=$(echo "$tls_enable" | tr '[:upper:]' '[:lower:]')
 
   if [[ "$tls_enable" == "yes" ]]; then
     print_https_guide
     tls_host="$(ask_with_default "TLS host (domain or IP)" "$default_tls_host")"
     tls_email="$(ask_with_default "TLS email (domain cert optional)" "$default_tls_email")"
-    tls_cert_mode="$(ask_with_default "TLS cert mode [auto/internal/cloudflare_dns]" "$default_tls_cert_mode")"
+    tls_cert_mode="$(ask_choice_with_default "请选择 TLS 证书模式" "$default_tls_cert_mode" \
+      "auto|自动：域名使用公网 CA，IP 自动切换内部 CA" \
+      "internal|内部 CA：适合直接使用 IP" \
+      "cloudflare_dns|Cloudflare DNS Challenge")"
     tls_cert_mode=$(echo "$tls_cert_mode" | tr '[:upper:]' '[:lower:]')
     case "$tls_cert_mode" in
       auto|internal|cloudflare_dns) ;;

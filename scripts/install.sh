@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_BASE_DIR="/opt/narwhal-monitor"
 UNINSTALL_IMAGES_TO_REMOVE=()
+# shellcheck source=scripts/lib/interactive.sh
+source "$ROOT_DIR/scripts/lib/interactive.sh"
 
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -246,21 +248,26 @@ main() {
 
   local action
   local reset_server_data="no"
-  read -rp "请选择操作 [install/update/reset-server-password/uninstall] (默认 install): " action
-  action=${action:-install}
+  action="$(narwhal_choose "请选择操作" "install" \
+    "install|安装" \
+    "update|更新" \
+    "reset-server-password|重置 Server 登录密码" \
+    "uninstall|卸载")"
 
   case "$action" in
     install)
       install_deps
       local mode
-      read -rp "请选择目标 [server/client/both] (默认 client): " mode
-      mode=${mode:-client}
+      mode="$(narwhal_choose "请选择安装目标" "client" \
+        "client|Client" \
+        "server|Server" \
+        "both|Server 和 Client")"
       if [[ "$mode" == "server" || "$mode" == "both" ]]; then
         local reset_confirm=""
-        read -rp "是否删除 Server 已有全部采集数据（初始化数据库）[yes/no] (默认 no): " reset_confirm
-        reset_confirm="${reset_confirm:-no}"
-        reset_confirm="$(echo "$reset_confirm" | tr '[:upper:]' '[:lower:]')"
-        if [[ "$reset_confirm" == "yes" || "$reset_confirm" == "y" ]]; then
+        reset_confirm="$(narwhal_choose "是否删除 Server 已有全部采集数据（初始化数据库）" "no" \
+          "no|否，保留现有数据库（推荐）" \
+          "yes|是，永久清空全部采集数据")"
+        if [[ "$reset_confirm" == "yes" ]]; then
           reset_server_data="yes"
         fi
       fi
@@ -269,14 +276,16 @@ main() {
     update)
       install_deps
       local mode
-      read -rp "请选择目标 [server/client/both] (默认 client): " mode
-      mode=${mode:-client}
+      mode="$(narwhal_choose "请选择更新目标" "client" \
+        "client|Client" \
+        "server|Server" \
+        "both|Server 和 Client")"
       if [[ "$mode" == "server" || "$mode" == "both" ]]; then
         local reset_confirm=""
-        read -rp "是否删除 Server 已有全部采集数据（初始化数据库）[yes/no] (默认 no): " reset_confirm
-        reset_confirm="${reset_confirm:-no}"
-        reset_confirm="$(echo "$reset_confirm" | tr '[:upper:]' '[:lower:]')"
-        if [[ "$reset_confirm" == "yes" || "$reset_confirm" == "y" ]]; then
+        reset_confirm="$(narwhal_choose "是否删除 Server 已有全部采集数据（初始化数据库）" "no" \
+          "no|否，保留现有数据库（推荐）" \
+          "yes|是，永久清空全部采集数据")"
+        if [[ "$reset_confirm" == "yes" ]]; then
           reset_server_data="yes"
         fi
       fi

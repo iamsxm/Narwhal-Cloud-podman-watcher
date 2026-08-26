@@ -35,6 +35,10 @@ _access_log_states: Dict[str, Dict[str, object]] = {}
 _security_last_sample_ts = 0.0
 _pending_deep_samples: Dict[int, Dict[str, object]] = {}
 
+_SOCKS_DIRECT_NAMES = {"microsocks", "sockd", "danted", "srelay", "hev-socks5-server"}
+_SOCKS_CONFIGURABLE_NAMES = {"3proxy", "gost", "xray", "v2ray", "sing-box"}
+_SOCKS_PROCESS_NAMES = _SOCKS_DIRECT_NAMES | _SOCKS_CONFIGURABLE_NAMES
+
 
 def _is_containerized_runtime() -> bool:
     return os.path.exists("/run/.containerenv") or os.path.exists("/.dockerenv")
@@ -2079,6 +2083,7 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
     )
     alerts: List[Dict[str, object]] = []
     container_access_readable_files = 0
+    socks_enforcement_entries = _socks_auth_enforcement_entries()
 
     for container in containers:
         if container.get("runtime") == "docker" and container.get("monitor_mode") == "notice":
@@ -2095,6 +2100,7 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
             )
             continue
         security = container.get("security") if isinstance(container.get("security"), dict) else {}
+        enforce_socks_auth_policy(container, socks_enforcement_entries)
         rx_bps = float(container.get("net_rx_bps") or 0)
         tx_bps = float(container.get("net_tx_bps") or 0)
         rx_pps = float(security.get("net_rx_pps") or 0)
@@ -2165,27 +2171,62 @@ def collect_security_summary(containers: List[Dict[str, object]], interval_secon
         if socks_detected and socks_auth_mode in ("no_auth", "weak_password"):
             public_exposure = bool(socks_proxy.get("public_exposure"))
             reason = "允许无认证访问" if socks_auth_mode == "no_auth" else "命中短密码或常见弱密码"
+            process_matches = [
+                item
+                for item in socks_proxy.get("process_matches", [])
+                if isinstance(item, dict)
+            ]
             process_names = sorted(
                 {
                     str(item.get("process") or "")
-                    for item in socks_proxy.get("process_matches", [])
-                    if isinstance(item, dict) and item.get("process")
+                    for item in process_matches
+                    if item.get("process")
                 }
             )
-            alerts.append(
-                _security_alert(
-                    "socks_weak_auth",
-                    "critical" if public_exposure else "warning",
-                    "SOCKS 代理认证风险",
-                    f"检测到 SOCKS 服务{reason}；"
-                    f"公网/NAT 暴露 {'是' if public_exposure else '未确认'}；"
-                    f"进程 {','.join(process_names) if process_names else 'unknown'}；"
-                    "不会上报用户名或密码内容",
-                    1,
-                    0,
-                    container,
-                )
+            action_process_matches = [
+                item
+                for item in process_matches
+                if socks_auth_mode == "no_auth"
+                and str(item.get("auth_state") or "no_auth") == "no_auth"
+            ]
+            socks_alert = _security_alert(
+                "socks_weak_auth",
+                "critical" if public_exposure else "warning",
+                "SOCKS 代理认证风险",
+                f"检测到 SOCKS 服务{reason}；"
+                f"公网/NAT 暴露 {'是' if public_exposure else '未确认'}；"
+                f"进程 {','.join(process_names) if process_names else 'unknown'}；"
+                "不会上报用户名或密码内容",
+                1,
+                0,
+                container,
             )
+            socks_alert.update(
+                {
+                    "socks_auth_mode": socks_auth_mode,
+                    "socks_processes": sorted(
+                        {
+                            str(item.get("process") or "")
+                            for item in action_process_matches
+                            if item.get("process")
+                        }
+                    )[:20],
+                    "socks_process_pids": [
+                        int(item.get("pid") or 0)
+                        for item in action_process_matches[:20]
+                        if int(item.get("pid") or 0) > 1
+                    ],
+                    "socks_config_files": [
+                        str(item)
+                        for item in socks_proxy.get("config_files", [])[:20]
+                        if isinstance(item, str)
+                    ],
+                    "socks_auth_enforcement": socks_proxy.get("auth_enforcement")
+                    if isinstance(socks_proxy.get("auth_enforcement"), dict)
+                    else {},
+                }
+            )
+            alerts.append(socks_alert)
         inbound_unique_ips = int(security.get("inbound_unique_ips") or 0)
         if inbound_unique_ips > inbound_unique_ip_threshold:
             communication_processes = (
@@ -2725,6 +2766,164 @@ def add_auto_remediate_panel_domains(domains: List[str]) -> List[str]:
     return merged
 
 
+def _socks_auth_enforcement_path() -> str:
+    return os.getenv(
+        "SECURITY_SOCKS_AUTH_ENFORCEMENT_FILE",
+        "/opt/narwhal-monitor/socks-auth-enforcement.json",
+    ).strip()
+
+
+def _socks_auth_enforcement_entries() -> List[Dict[str, object]]:
+    policy_path = _socks_auth_enforcement_path()
+    if not policy_path:
+        return []
+    try:
+        with open(policy_path, "r", encoding="utf-8") as policy_file:
+            stored = json.load(policy_file)
+    except (OSError, TypeError, ValueError):
+        return []
+    entries = stored.get("entries", []) if isinstance(stored, dict) else []
+    if not isinstance(entries, list):
+        return []
+    normalized: List[Dict[str, object]] = []
+    for item in entries[:1000]:
+        if not isinstance(item, dict):
+            continue
+        runtime = str(item.get("runtime") or "").strip().lower()
+        project = str(item.get("project") or "").strip()
+        container_name = str(item.get("container_name") or "").strip()
+        process_names = sorted(
+            {
+                str(name).strip().lower()
+                for name in item.get("process_names", [])
+                if isinstance(name, str) and str(name).strip().lower() in _SOCKS_PROCESS_NAMES
+            }
+        ) if isinstance(item.get("process_names"), list) else []
+        if runtime not in ("incus", "podman") or not container_name or not process_names:
+            continue
+        try:
+            created_at = int(item.get("created_at") or 0)
+            updated_at = int(item.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0
+            updated_at = 0
+        normalized.append(
+            {
+                "runtime": runtime,
+                "project": project,
+                "container_name": container_name,
+                "process_names": process_names,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }
+        )
+    return normalized
+
+
+def _write_socks_auth_enforcement_entries(entries: List[Dict[str, object]]) -> None:
+    policy_path = _socks_auth_enforcement_path()
+    if not policy_path or not (posixpath.isabs(policy_path) or os.path.isabs(policy_path)):
+        raise ValueError("SECURITY_SOCKS_AUTH_ENFORCEMENT_FILE must be an absolute path")
+    parent = os.path.dirname(policy_path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".socks-auth-enforcement-", dir=parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as policy_file:
+            json.dump(
+                {"entries": entries[:1000], "updated_at": int(time.time())},
+                policy_file,
+                ensure_ascii=False,
+            )
+            policy_file.write("\n")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, policy_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def set_socks_auth_enforcement(
+    runtime: str, project: str, container_name: str, process_names: List[str]
+) -> Dict[str, object]:
+    runtime = runtime.strip().lower()
+    project = project.strip()
+    container_name = container_name.strip()
+    approved_names = sorted(
+        {
+            str(name).strip().lower()
+            for name in process_names
+            if isinstance(name, str) and str(name).strip().lower() in _SOCKS_PROCESS_NAMES
+        }
+    )
+    if (
+        runtime not in ("incus", "podman")
+        or not re.fullmatch(r"[A-Za-z0-9_.:@+-]{1,200}", container_name)
+        or (project and not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", project))
+        or not approved_names
+    ):
+        raise ValueError("invalid SOCKS enforcement target")
+    now = int(time.time())
+    entries = _socks_auth_enforcement_entries()
+    existing = next(
+        (
+            item
+            for item in entries
+            if item["runtime"] == runtime
+            and item["project"] == project
+            and item["container_name"] == container_name
+        ),
+        None,
+    )
+    if existing is None:
+        existing = {
+            "runtime": runtime,
+            "project": project,
+            "container_name": container_name,
+            "created_at": now,
+        }
+        entries.append(existing)
+    existing["process_names"] = approved_names
+    existing["updated_at"] = now
+    _write_socks_auth_enforcement_entries(entries)
+    return dict(existing)
+
+
+def remove_socks_auth_enforcement(runtime: str, project: str, container_name: str) -> bool:
+    entries = _socks_auth_enforcement_entries()
+    remaining = [
+        item
+        for item in entries
+        if not (
+            item["runtime"] == runtime.strip().lower()
+            and item["project"] == project.strip()
+            and item["container_name"] == container_name.strip()
+        )
+    ]
+    if len(remaining) == len(entries):
+        return False
+    _write_socks_auth_enforcement_entries(remaining)
+    return True
+
+
+def _socks_auth_enforcement_for_container(
+    container: Dict[str, object], entries: List[Dict[str, object]] | None = None
+) -> Dict[str, object] | None:
+    runtime = str(container.get("runtime") or "").strip().lower()
+    project = str(container.get("project") or "").strip()
+    container_name = str(container.get("name") or "").strip()
+    source_entries = entries if entries is not None else _socks_auth_enforcement_entries()
+    return next(
+        (
+            item
+            for item in source_entries
+            if item["runtime"] == runtime
+            and item["project"] == project
+            and item["container_name"] == container_name
+        ),
+        None,
+    )
+
+
 _SOCKS_WEAK_PASSWORDS = {
     "123456", "12345678", "123123", "admin", "admin123", "changeme", "default",
     "guest", "letmein", "pass", "password", "qwerty", "root", "socks", "socks5", "test", "toor",
@@ -2732,11 +2931,10 @@ _SOCKS_WEAK_PASSWORDS = {
 
 
 def _socks_process_evidence(process_output: str, combined_identity: str) -> Dict[str, object]:
-    direct_names = {"microsocks", "sockd", "danted", "srelay", "hev-socks5-server"}
-    configurable_names = {"3proxy", "gost", "xray", "v2ray", "sing-box"}
     matches: List[Dict[str, object]] = []
-    candidate_found = any(name in combined_identity for name in direct_names | configurable_names)
-    detected = any(name in combined_identity for name in direct_names)
+    candidate_matches: List[Dict[str, object]] = []
+    candidate_found = any(name in combined_identity for name in _SOCKS_PROCESS_NAMES)
+    detected = any(name in combined_identity for name in _SOCKS_DIRECT_NAMES)
     auth_modes = set()
     reasons = set()
     for line in process_output.splitlines():
@@ -2752,31 +2950,38 @@ def _socks_process_evidence(process_output: str, combined_identity: str) -> Dict
         executable_names.update(
             posixpath.basename(token).lower() for token in tokens if token and not token.startswith("-")
         )
-        matched = next((name for name in direct_names | configurable_names if name in executable_names), "")
+        matched = next((name for name in _SOCKS_PROCESS_NAMES if name in executable_names), "")
         if not matched:
             continue
         candidate_found = True
+        candidate_matches.append({"pid": int(parts[0]), "process": matched})
         lowered_args = args.lower()
-        process_detected = matched in direct_names or "socks" in lowered_args
-        if not process_detected and matched in configurable_names:
+        process_detected = matched in _SOCKS_DIRECT_NAMES or "socks" in lowered_args
+        if not process_detected and matched in _SOCKS_CONFIGURABLE_NAMES:
             continue
         detected = True
         matches.append({"pid": int(parts[0]), "process": matched})
+        process_auth_state = "unknown"
         if matched == "microsocks":
             username_present = "-u" in tokens
             password = tokens[tokens.index("-P") + 1] if "-P" in tokens and tokens.index("-P") + 1 < len(tokens) else ""
             if not username_present or not password:
                 auth_modes.add("no_auth")
+                process_auth_state = "no_auth"
                 reasons.add("microsocks 未同时配置用户名和密码")
             elif password.lower() in _SOCKS_WEAK_PASSWORDS or len(password) < 8:
                 auth_modes.add("weak_password")
+                process_auth_state = "weak"
                 reasons.add("microsocks 使用短密码或常见弱密码")
             else:
                 auth_modes.add("configured")
+                process_auth_state = "configured"
         elif matched == "gost":
             urls = re.findall(r"socks(?:4|5|5h)?://[^\s]+", args, flags=re.IGNORECASE)
+            gost_modes = set()
             if any("@" not in url.split("/", 3)[2] for url in urls):
                 auth_modes.add("no_auth")
+                gost_modes.add("no_auth")
                 reasons.add("gost SOCKS 监听地址未见认证信息")
             for url in urls:
                 try:
@@ -2785,13 +2990,21 @@ def _socks_process_evidence(process_output: str, combined_identity: str) -> Dict
                     password = ""
                 if password and (password.lower() in _SOCKS_WEAK_PASSWORDS or len(password) < 8):
                     auth_modes.add("weak_password")
+                    gost_modes.add("weak_password")
                     reasons.add("gost 使用短密码或常见弱密码")
                 elif password:
                     auth_modes.add("configured")
-    if "weak_password" in auth_modes:
-        auth_mode = "weak_password"
-    elif "no_auth" in auth_modes:
+                    gost_modes.add("configured")
+            process_auth_state = (
+                "no_auth" if "no_auth" in gost_modes else
+                "weak" if "weak_password" in gost_modes else
+                "configured" if "configured" in gost_modes else "unknown"
+            )
+        matches[-1]["auth_state"] = process_auth_state
+    if "no_auth" in auth_modes:
         auth_mode = "no_auth"
+    elif "weak_password" in auth_modes:
+        auth_mode = "weak_password"
     elif "configured" in auth_modes:
         auth_mode = "configured"
     else:
@@ -2800,6 +3013,7 @@ def _socks_process_evidence(process_output: str, combined_identity: str) -> Dict
         "candidate_found": candidate_found,
         "detected": detected,
         "process_matches": matches[:20],
+        "candidate_matches": candidate_matches[:20],
         "auth_mode": auth_mode,
         "risk_reasons": sorted(reasons),
     }
@@ -2866,10 +3080,10 @@ def _collect_socks_config_evidence(
         {
             "detected": bool(files),
             "config_files": sorted(files),
-            "auth_mode": "weak_password"
-            if "weak_password" in modes
-            else "no_auth"
+            "auth_mode": "no_auth"
             if "no_auth" in modes
+            else "weak_password"
+            if "weak_password" in modes
             else "configured"
             if "configured" in modes
             else "unknown",
@@ -2915,13 +3129,34 @@ def collect_panel_pairing_indicators(
     )
     socks_auth_modes = {str(socks_process.get("auth_mode") or "unknown"), str(socks_config.get("auth_mode") or "unknown")}
     socks_auth_mode = (
-        "weak_password" if "weak_password" in socks_auth_modes else
         "no_auth" if "no_auth" in socks_auth_modes else
+        "weak_password" if "weak_password" in socks_auth_modes else
         "configured" if "configured" in socks_auth_modes else "unknown"
     )
+    socks_process_matches = socks_process.get("process_matches", [])
+    if socks_config.get("detected"):
+        config_auth_mode = str(socks_config.get("auth_mode") or "unknown")
+        detected_auth_states = {
+            (int(item.get("pid") or 0), str(item.get("process") or "")): str(
+                item.get("auth_state") or "unknown"
+            )
+            for item in socks_process.get("process_matches", [])
+            if isinstance(item, dict)
+        }
+        socks_process_matches = [
+            {
+                **item,
+                "auth_state": detected_auth_states.get(
+                    (int(item.get("pid") or 0), str(item.get("process") or "")),
+                    config_auth_mode,
+                ),
+            }
+            for item in socks_process.get("candidate_matches", [])
+            if isinstance(item, dict)
+        ]
     result["socks_proxy"] = {
         "detected": bool(socks_process.get("detected") or socks_config.get("detected")),
-        "process_matches": socks_process.get("process_matches", []),
+        "process_matches": socks_process_matches,
         "config_files": socks_config.get("config_files", []),
         "auth_mode": socks_auth_mode,
         "risk_reasons": sorted(
@@ -4385,7 +4620,11 @@ def _configured_panel_config_paths() -> List[str]:
 
 
 def _incus_host_namespace_kill(
-    runtime_bin: str, container_name: str, project: str, patterns: List[str]
+    runtime_bin: str,
+    container_name: str,
+    project: str,
+    patterns: List[str],
+    process_pids: List[int] | None = None,
 ) -> Tuple[int, int, int, str]:
     """Kill exact allowlisted process identities with host user-namespace privileges.
 
@@ -4398,8 +4637,14 @@ def _incus_host_namespace_kill(
     if init_pid <= 1 or not shutil.which("nsenter") or not patterns:
         return 0, 0, 0, "host namespace fallback unavailable"
     safe_patterns = " ".join(shlex.quote(item) for item in patterns)
+    safe_pids = " ".join(
+        str(item)
+        for item in (process_pids or [])
+        if isinstance(item, int) and 1 < item <= 4194304
+    )
     script = (
         "matched=0; killed=0; errors=0; "
+        f"requested_pids={shlex.quote((' ' + safe_pids + ' ') if safe_pids else '')}; "
         f"for pattern in {safe_patterns}; do "
         "for proc in /proc/[0-9]*; do pid=${proc##*/}; "
         "[ \"$pid\" = 1 ] && continue; [ \"$pid\" = \"$$\" ] && continue; "
@@ -4410,7 +4655,9 @@ def _incus_host_namespace_kill(
         "for candidate in \"$comm\" \"${argv0##*/}\" \"${exe##*/}\"; do "
         "candidate=$(printf '%s' \"$candidate\" | tr '[:upper:]' '[:lower:]'); "
         "[ \"$candidate\" = \"$pattern\" ] && found=1; done; "
-        "[ \"$found\" -eq 1 ] || continue; matched=$((matched+1)); "
+        "[ \"$found\" -eq 1 ] || continue; "
+        "if [ -n \"$requested_pids\" ]; then case \"$requested_pids\" in "
+        "*\" $pid \"*) ;; *) continue;; esac; fi; matched=$((matched+1)); "
         "if kill -TERM \"$pid\" 2>/dev/null; then killed=$((killed+1)); "
         "sleep 1; [ -d \"$proc\" ] && kill -KILL \"$pid\" 2>/dev/null || true; "
         "else errors=$((errors+1)); fi; done; done; "
@@ -4436,6 +4683,170 @@ def _incus_host_namespace_kill(
         errors,
         output,
     )
+
+
+def stop_unauthenticated_socks(action: Dict) -> Tuple[bool, str]:
+    """Stop only the allowlisted SOCKS process/service inside one container."""
+    runtime_kind = str(action.get("runtime") or "").strip().lower()
+    container_name = str(action.get("container_name") or "").strip()
+    project = str(action.get("project") or "").strip()
+    if runtime_kind not in ("podman", "incus"):
+        return False, "Docker and unknown runtimes are notice-only"
+    if not re.fullmatch(r"[A-Za-z0-9_.:@+-]{1,200}", container_name):
+        return False, "invalid container target"
+    if project and not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", project):
+        return False, "invalid Incus project"
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    if str(params.get("auth_mode") or "") != "no_auth":
+        return False, "SOCKS stop requires confirmed no-auth evidence"
+    requested_names = params.get("process_names") if isinstance(params.get("process_names"), list) else []
+    process_names = sorted(
+        {
+            str(item).strip().lower()
+            for item in requested_names
+            if isinstance(item, str) and str(item).strip().lower() in _SOCKS_PROCESS_NAMES
+        }
+    )
+    requested_pids = params.get("process_pids") if isinstance(params.get("process_pids"), list) else []
+    process_pids = sorted(
+        {
+            int(item)
+            for item in requested_pids
+            if isinstance(item, int) and 1 < item <= 4194304
+        }
+    )
+    if not process_names:
+        return False, "no locally approved SOCKS process target"
+    runtime_bin = get_runtime_bins().get(runtime_kind, "")
+    if not runtime_bin:
+        return False, f"runtime {runtime_kind} is unavailable"
+
+    names = " ".join(shlex.quote(item) for item in process_names)
+    pids = " ".join(str(item) for item in process_pids)
+    script = (
+        "set -u; stopped_services=0; killed_processes=0; stop_errors=0; targets=''; "
+        f"requested_pids={shlex.quote((' ' + pids + ' ') if pids else '')}; "
+        f"for pattern in {names}; do "
+        "for proc in /proc/[0-9]*; do pid=${proc##*/}; [ \"$pid\" = \"$$\" ] && continue; "
+        "state=$(awk '{print $3}' \"$proc/stat\" 2>/dev/null || true); [ \"$state\" = Z ] && continue; "
+        "comm=$(cat \"$proc/comm\" 2>/dev/null || true); "
+        "argv0=$(tr '\\000' '\\n' < \"$proc/cmdline\" 2>/dev/null | head -n 1); "
+        "exe=$(readlink \"$proc/exe\" 2>/dev/null || true); matched=0; "
+        "for candidate in \"$comm\" \"${argv0##*/}\" \"${exe##*/}\"; do "
+        "candidate=$(printf '%s' \"$candidate\" | tr '[:upper:]' '[:lower:]'); "
+        "[ \"$candidate\" = \"$pattern\" ] && matched=1; done; "
+        "if [ \"$matched\" -eq 1 ]; then if [ -n \"$requested_pids\" ]; then "
+        "case \"$requested_pids\" in *\" $pid \"*) targets=\"$targets $pid\";; esac; "
+        "else targets=\"$targets $pid\"; fi; fi; done; "
+        "if [ -z \"$requested_pids\" ]; then command -v systemctl >/dev/null 2>&1 && "
+        "systemctl stop \"${pattern}.service\" >/dev/null 2>&1 && stopped_services=$((stopped_services+1)) || true; "
+        "if [ -x \"/etc/init.d/$pattern\" ]; then \"/etc/init.d/$pattern\" stop >/dev/null 2>&1 && "
+        "stopped_services=$((stopped_services+1)) || true; fi; fi; done; "
+        "for pid in $targets; do [ -r \"/proc/$pid/stat\" ] || continue; "
+        "unit=$(sed -n 's#.*[/]\\([^/]*\\.service\\)$#\\1#p' \"/proc/$pid/cgroup\" 2>/dev/null | head -n 1); "
+        "case \"$unit\" in *.service) case \"$unit\" in *[!A-Za-z0-9_.@:-]*) ;; *) "
+        "command -v systemctl >/dev/null 2>&1 && systemctl stop \"$unit\" >/dev/null 2>&1 && "
+        "stopped_services=$((stopped_services+1)) || true;; esac;; esac; "
+        "if kill -TERM \"$pid\" 2>/dev/null; then killed_processes=$((killed_processes+1)); "
+        "sleep 1; [ -d \"/proc/$pid\" ] && kill -KILL \"$pid\" 2>/dev/null || true; fi; done; "
+        "printf 'stopped_services=%s killed_processes=%s stop_errors=%s\\n' "
+        "\"$stopped_services\" \"$killed_processes\" \"$stop_errors\"; [ \"$stop_errors\" -eq 0 ]"
+    )
+    ok, output = _run_action_command(
+        _runtime_exec_cmd(runtime_bin, container_name, script, project)
+    )
+    counts = {
+        key: int(value)
+        for key, value in re.findall(
+            r"\b(stopped_services|killed_processes|stop_errors)=(\d+)\b", output or ""
+        )
+    }
+    if runtime_kind == "incus":
+        container_stop_ok = ok
+        _, host_killed, host_errors, host_output = _incus_host_namespace_kill(
+            runtime_bin, container_name, project, process_names, process_pids
+        )
+        counts["killed_processes"] = counts.get("killed_processes", 0) + host_killed
+        counts["stop_errors"] = counts.get("stop_errors", 0) + host_errors
+        output = (
+            f"stopped_services={counts.get('stopped_services', 0)} "
+            f"killed_processes={counts.get('killed_processes', 0)} "
+            f"stop_errors={counts.get('stop_errors', 0)}; {host_output}"
+        )
+        ok = counts.get("stop_errors", 0) == 0 and (
+            container_stop_ok or host_killed > 0
+        )
+    return ok, output or ("SOCKS service stopped" if ok else "SOCKS stop command failed")
+
+
+def enforce_socks_auth_policy(
+    container: Dict[str, object], entries: List[Dict[str, object]] | None = None
+) -> Dict[str, object] | None:
+    """Apply an operator-approved no-auth policy using this cycle's existing evidence."""
+    policy = _socks_auth_enforcement_for_container(container, entries)
+    if policy is None:
+        return None
+    security = container.get("security") if isinstance(container.get("security"), dict) else {}
+    socks_proxy = security.get("socks_proxy") if isinstance(security.get("socks_proxy"), dict) else {}
+    auth_mode = str(socks_proxy.get("auth_mode") or "unknown")
+    if auth_mode in ("configured", "weak_password"):
+        released = remove_socks_auth_enforcement(
+            str(container.get("runtime") or ""),
+            str(container.get("project") or ""),
+            str(container.get("name") or ""),
+        )
+        result = {
+            "active": False,
+            "released": released,
+            "reason": "non_empty_auth_detected",
+        }
+        socks_proxy["auth_enforcement"] = result
+        return result
+    if not socks_proxy.get("detected") or auth_mode != "no_auth":
+        result = {"active": True, "attempted": False, "reason": "awaiting_auth_evidence"}
+        socks_proxy["auth_enforcement"] = result
+        return result
+    current_names = {
+        str(item.get("process") or "").strip().lower()
+        for item in socks_proxy.get("process_matches", [])
+        if isinstance(item, dict)
+        and str(item.get("process") or "").strip().lower() in _SOCKS_PROCESS_NAMES
+        and str(item.get("auth_state") or "no_auth") == "no_auth"
+    }
+    approved_names = sorted(set(policy.get("process_names", [])) & current_names)
+    if not approved_names:
+        result = {"active": True, "attempted": False, "reason": "process_identity_changed"}
+        socks_proxy["auth_enforcement"] = result
+        return result
+    process_pids = [
+        int(item.get("pid") or 0)
+        for item in socks_proxy.get("process_matches", [])
+        if isinstance(item, dict)
+        and str(item.get("process") or "").strip().lower() in approved_names
+        and str(item.get("auth_state") or "no_auth") == "no_auth"
+        and int(item.get("pid") or 0) > 1
+    ]
+    ok, message = stop_unauthenticated_socks(
+        {
+            "runtime": container.get("runtime"),
+            "project": container.get("project"),
+            "container_name": container.get("name"),
+            "params": {
+                "auth_mode": "no_auth",
+                "process_names": approved_names,
+                "process_pids": process_pids,
+            },
+        }
+    )
+    result = {"active": True, "attempted": True, "succeeded": ok, "message": message[:500]}
+    socks_proxy["auth_enforcement"] = result
+    print(
+        f"automatic no-auth SOCKS stop {'succeeded' if ok else 'failed'} for "
+        f"{container.get('runtime')}/{container.get('name')}: {message}"
+    )
+    return result
+
+
 def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
     runtime_kind = str(action.get("runtime") or "").lower()
     if runtime_kind not in ("podman", "incus"):
@@ -4571,6 +4982,38 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
 
 def execute_security_action(action: Dict) -> Tuple[bool, str]:
     action_type = str(action.get("action_type") or "")
+    if action_type == "release_socks_auth":
+        runtime_kind = str(action.get("runtime") or "").strip().lower()
+        project = str(action.get("project") or "").strip()
+        container_name = str(action.get("container_name") or "").strip()
+        if runtime_kind not in ("incus", "podman"):
+            return False, "Docker and unknown runtimes are notice-only"
+        if not re.fullmatch(r"[A-Za-z0-9_.:@+-]{1,200}", container_name):
+            return False, "invalid container target"
+        if project and not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", project):
+            return False, "invalid Incus project"
+        try:
+            removed = remove_socks_auth_enforcement(
+                runtime_kind, project, container_name
+            )
+        except (OSError, ValueError) as exc:
+            return False, f"SOCKS enforcement policy removal failed: {exc}"
+        return True, f"policy_removed={1 if removed else 0}; SOCKS service is allowed to recover"
+    if action_type == "enforce_socks_auth":
+        runtime_kind = str(action.get("runtime") or "").strip().lower()
+        project = str(action.get("project") or "").strip()
+        container_name = str(action.get("container_name") or "").strip()
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        process_names = params.get("process_names") if isinstance(params.get("process_names"), list) else []
+        if str(params.get("auth_mode") or "") != "no_auth":
+            return False, "SOCKS enforcement requires confirmed no-auth evidence"
+        try:
+            set_socks_auth_enforcement(runtime_kind, project, container_name, process_names)
+        except (OSError, ValueError) as exc:
+            return False, f"SOCKS enforcement policy update failed: {exc}"
+        ok, message = stop_unauthenticated_socks(action)
+        prefix = "policy_installed=1; "
+        return ok, prefix + message
     if action_type == "stop_container":
         runtime_kind = str(action.get("runtime") or "").strip().lower()
         container_name = str(action.get("container_name") or "").strip()

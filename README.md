@@ -17,7 +17,8 @@
 - **NAT 场景识别**：不依赖 80/443 等固定端口，结合全部监听端口、运行时端口映射、进程、配置与面板域名判断。
 - **OpenRC/Incus 清理兼容**：若非特权 Incus 容器内 UID 映射导致 `kill` 返回 `EPERM`，Agent 会从宿主机进入目标容器的 PID/挂载命名空间，重新核验精确进程名后终止进程；仍不会停止容器。
 - **一键安装与更新**：`install.sh` 支持安装、更新和卸载；更新会复用 `/opt/narwhal-monitor/*.env` 配置并重建或重启服务。
-- **告警快速处理**：活动告警可选择“禁止”“允许且不再提醒”或“本次取消提醒”；只有 Podman/Incus 的机场面板对接告警可以执行禁止清理，Docker 不执行清理。
+- **告警快速处理**：活动告警可选择“禁止/持续拦截”“允许且不再提醒”或“本次取消提醒”；Podman/Incus 的机场面板对接告警支持定向清理，无认证 SOCKS 告警支持停止服务并持续拦截，Docker 不执行处理。
+- **无认证 SOCKS 持续拦截**：Incus/Podman 的无认证或空密码 SOCKS 告警可一键停止对应进程/服务并保存节点侧策略；以后再次无认证启动会自动停止，检测到非空认证后自动解除策略。不会停止容器，也不会删除 SOCKS 配置或服务文件。
 - **按需深度上报**：可在容器详情页对可疑的 Podman/Incus 容器发起一次性深度采样，在下一 Client 周期查看瞬时流量、详细进程、连接 IP 及进程归属；Docker 默认仅提醒，不执行该任务。
 - **自动更新**：Server 与 Client 默认每 15 分钟检查 GitHub `main`，只进行安全的 fast-forward 更新并记录日志。
 - **统一版本状态**：仓库根目录 `VERSION` 是 Server 与 Client 的唯一版本源；每台主机显示“最新、版本不一致或版本未知”，安装摘要也会显示当前版本。
@@ -340,6 +341,7 @@ SECURITY_PANEL_AUTO_REMEDIATE_FILE=/opt/narwhal-monitor/panel-auto-remediate.jso
 SECURITY_PANEL_PROCESS_PATTERNS=xboard-node,xrayr,v2bx,soga,sspanel-uim-node
 SECURITY_PANEL_CONFIG_PATHS=/etc/XrayR/config.yml,/etc/V2bX/config.json,/etc/V2bX/config.json.bak,/usr/local/V2bX/config.json,/usr/local/V2bX/config.json.bak,/etc/xboard-node/config.yml,/etc/xboard-node/config.yaml,/opt/xboard-node/config.yml,/app/config/config.yml,/etc/soga/soga.conf,/etc/soga/config.yml
 SECURITY_SOCKS_CONFIG_PATHS=/etc/danted.conf,/etc/sockd.conf,/etc/3proxy/3proxy.cfg,/etc/3proxy.cfg,/etc/xray/config.json,/usr/local/etc/xray/config.json,/etc/v2ray/config.json,/usr/local/etc/v2ray/config.json,/etc/sing-box/config.json,/etc/sing-box.json,/etc/gost/config.yaml,/etc/gost/config.json
+SECURITY_SOCKS_AUTH_ENFORCEMENT_FILE=/opt/narwhal-monitor/socks-auth-enforcement.json
 ACTION_POLL_INTERVAL=10
 ALERT_WEB_SCAN_REQUESTS=10
 ALERT_AUTH_FAILURES_PER_IP=20
@@ -352,6 +354,8 @@ Agent 会同时读取宿主机 `SECURITY_ACCESS_LOG_PATHS`，并通过对应的 
 `SECURITY_ALLOWED_PANEL_DOMAINS` 是允许对接的面板域名白名单，支持父域匹配，例如配置 `example.com` 会允许 `panel.example.com`，但不会允许 `example.com.evil.test`。默认留空表示没有允许的第三方面板；发现明确面板域名时产生 critical 告警，只发现节点程序或配置特征但无法提取域名时产生 warning。检测过程不会把配置文件正文、API Key 或 Token 写入上报数据。
 
 SOCKS 检测复用本轮已经读取的容器进程列表；只有发现 SOCKS 候选进程或容器身份特征时，才对 `SECURITY_SOCKS_CONFIG_PATHS` 中最多 30 个精确路径各读取前 256 KiB 并在容器内返回风险标记，不传输配置正文或凭据。无认证/弱密码且确认存在公网或 NAT 暴露时为 critical，未确认公网暴露时为 warning。弱密码判断包含常见默认密码和少于 8 位的命令行密码。
+
+对于已确认 `no_auth` 的 Incus/Podman SOCKS 告警，面板会显示“停止并持续拦截”。确认后，Client 只停止本次检测命中的 SOCKS 进程及其精确 systemd/OpenRC 服务，不禁用或删除服务，不删除配置，也不停止容器。策略按运行时、Incus 项目和容器名称写入 `SECURITY_SOCKS_AUTH_ENFORCEMENT_FILE`；以后正常采集周期复用既有 SOCKS 认证检测结果，如果该容器再次以无认证或空密码方式运行就再次停止。检测到 `configured` 或非空的 `weak_password` 认证后，Client 会自动删除该容器的持续拦截策略，允许服务恢复运行；弱密码本身仍会继续告警，供管理员决定是否放行。Docker 始终仅提醒，不显示此按钮。
 
 ### Critical 机场对接告警的处理
 

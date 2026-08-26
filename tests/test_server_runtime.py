@@ -592,6 +592,105 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertEqual(body["action"]["params"]["process_patterns"], ["v2bx"])
         self.assertEqual(body["action"]["params"]["config_files"], ["/etc/V2bX/config.json"])
 
+    def test_deny_no_auth_socks_queues_persistent_stop_action(self):
+        alert = {
+            "type": "socks_weak_auth",
+            "severity": "critical",
+            "title": "SOCKS risk",
+            "message": "SOCKS no auth",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "proxy",
+            "socks_auth_mode": "no_auth",
+            "socks_processes": ["microsocks"],
+            "socks_process_pids": [42],
+            "socks_config_files": ["/etc/microsocks.conf"],
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class Request:
+            state = State()
+
+            async def json(self):
+                return {"decision": "deny"}
+
+        response = asyncio.run(server.set_security_alert_disposition(alert_id, Request()))
+        body = json.loads(response.body)
+        self.assertTrue(body["queued"])
+        self.assertEqual(body["action"]["action_type"], "enforce_socks_auth")
+        self.assertEqual(body["action"]["params"]["auth_mode"], "no_auth")
+        self.assertEqual(body["action"]["params"]["process_names"], ["microsocks"])
+
+    def test_deny_rejects_nonempty_weak_socks_password(self):
+        alert = {
+            "type": "socks_weak_auth",
+            "severity": "critical",
+            "title": "SOCKS risk",
+            "message": "SOCKS weak password",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "proxy",
+            "socks_auth_mode": "weak_password",
+            "socks_processes": ["microsocks"],
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class Request:
+            state = State()
+
+            async def json(self):
+                return {"decision": "deny"}
+
+        with self.assertRaises(server.HTTPException) as raised:
+            asyncio.run(server.set_security_alert_disposition(alert_id, Request()))
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_allow_socks_alert_queues_enforcement_release(self):
+        alert = {
+            "type": "socks_weak_auth",
+            "severity": "critical",
+            "title": "SOCKS risk",
+            "message": "SOCKS no auth",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "proxy",
+            "socks_auth_mode": "no_auth",
+            "socks_processes": ["microsocks"],
+        }
+        conn = server.db()
+        server.process_security_alerts(conn, "host1", 100, [alert])
+        conn.commit()
+        alert_id = conn.execute("SELECT id FROM security_alerts").fetchone()["id"]
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class Request:
+            state = State()
+
+            async def json(self):
+                return {"decision": "allow_silent"}
+
+        response = asyncio.run(server.set_security_alert_disposition(alert_id, Request()))
+        body = json.loads(response.body)
+        self.assertTrue(body["queued"])
+        self.assertEqual(body["action"]["action_type"], "release_socks_auth")
+
     def test_latest_keeps_same_incus_name_from_different_projects_separate(self):
         self._insert("incus", 10, "default")
         self._insert("incus", 20, "prod")

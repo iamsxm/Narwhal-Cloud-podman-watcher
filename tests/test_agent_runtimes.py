@@ -774,6 +774,21 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertEqual(result["auth_mode"], "no_auth")
         self.assertEqual(result["config_files"], ["/etc/danted.conf"])
 
+    def test_config_confirmed_xray_socks_keeps_safe_process_target(self):
+        process_output = "12 S xray /usr/bin/xray run -config /etc/xray/config.json\n"
+        markers = "@@SOCKS:/etc/xray/config.json\n@@NOAUTH:/etc/xray/config.json\n"
+        with mock.patch.object(agent, "run", side_effect=[process_output, markers, ""]):
+            result = agent.collect_panel_pairing_indicators(
+                "proxy", "incus", "default", "xray:latest"
+            )
+        socks = result["socks_proxy"]
+        self.assertTrue(socks["detected"])
+        self.assertEqual(socks["auth_mode"], "no_auth")
+        self.assertEqual(
+            socks["process_matches"],
+            [{"pid": 12, "process": "xray", "auth_state": "no_auth"}],
+        )
+
     def test_socks_inbound_fanout_replaces_generic_alert(self):
         container = {
             "name": "proxy",
@@ -800,6 +815,126 @@ class SecurityTelemetryTests(unittest.TestCase):
         self.assertIn("socks_weak_auth", types)
         self.assertIn("socks_inbound_fanout", types)
         self.assertNotIn("inbound_ip_fanout", types)
+
+    def test_socks_alert_contains_safe_action_evidence(self):
+        container = {
+            "name": "proxy",
+            "runtime": "incus",
+            "project": "default",
+            "security": {
+                "socks_proxy": {
+                    "detected": True,
+                    "auth_mode": "no_auth",
+                    "public_exposure": True,
+                    "process_matches": [{"pid": 12, "process": "microsocks"}],
+                    "config_files": ["/etc/microsocks.conf"],
+                },
+                "panel_pairing": {},
+            },
+        }
+        with mock.patch.object(agent, "_socks_auth_enforcement_entries", return_value=[]):
+            result = agent.collect_security_summary([container], 60)
+        alert = next(item for item in result["alerts"] if item["type"] == "socks_weak_auth")
+        self.assertEqual(alert["socks_auth_mode"], "no_auth")
+        self.assertEqual(alert["socks_processes"], ["microsocks"])
+        self.assertEqual(alert["socks_process_pids"], [12])
+        self.assertNotIn("password", json.dumps(alert))
+
+    def test_socks_enforcement_repeats_no_auth_stop_and_releases_on_nonempty_auth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = str(Path(tmp) / "socks-policy.json")
+            env = {"SECURITY_SOCKS_AUTH_ENFORCEMENT_FILE": policy_path}
+            with mock.patch.dict(os.environ, env, clear=False):
+                agent.set_socks_auth_enforcement(
+                    "incus", "default", "proxy", ["microsocks"]
+                )
+                entries = agent._socks_auth_enforcement_entries()
+                container = {
+                    "name": "proxy",
+                    "runtime": "incus",
+                    "project": "default",
+                    "security": {
+                        "socks_proxy": {
+                            "detected": True,
+                            "auth_mode": "no_auth",
+                            "process_matches": [{"pid": 42, "process": "microsocks"}],
+                        }
+                    },
+                }
+                with mock.patch.object(
+                    agent,
+                    "stop_unauthenticated_socks",
+                    return_value=(True, "killed_processes=1"),
+                ) as stop_mock:
+                    result = agent.enforce_socks_auth_policy(container, entries)
+                self.assertTrue(result["succeeded"])
+                stop_mock.assert_called_once()
+
+                container["security"]["socks_proxy"]["auth_mode"] = "weak_password"
+                released = agent.enforce_socks_auth_policy(container)
+                self.assertTrue(released["released"])
+                self.assertEqual(agent._socks_auth_enforcement_entries(), [])
+
+    def test_socks_enforcement_action_persists_policy_without_deleting_config(self):
+        action = {
+            "action_type": "enforce_socks_auth",
+            "runtime": "incus",
+            "project": "default",
+            "container_name": "proxy",
+            "params": {
+                "auth_mode": "no_auth",
+                "process_names": ["microsocks"],
+                "process_pids": [42],
+                "config_files": ["/etc/should-not-be-deleted"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "SECURITY_SOCKS_AUTH_ENFORCEMENT_FILE": str(Path(tmp) / "policy.json")
+            }
+            with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+                agent,
+                "stop_unauthenticated_socks",
+                return_value=(True, "stopped_services=1 killed_processes=1 stop_errors=0"),
+            ) as stop_mock:
+                ok, message = agent.execute_security_action(action)
+                stored = agent._socks_auth_enforcement_entries()
+        self.assertTrue(ok)
+        self.assertIn("policy_installed=1", message)
+        self.assertEqual(stored[0]["process_names"], ["microsocks"])
+        self.assertNotIn("config_files", stored[0])
+        stop_mock.assert_called_once_with(action)
+
+    def test_socks_stop_rejects_nonempty_auth_and_docker(self):
+        base = {
+            "container_name": "proxy",
+            "params": {"auth_mode": "weak_password", "process_names": ["microsocks"]},
+        }
+        self.assertFalse(agent.stop_unauthenticated_socks(dict(base, runtime="incus"))[0])
+        base["params"]["auth_mode"] = "no_auth"
+        self.assertFalse(agent.stop_unauthenticated_socks(dict(base, runtime="docker"))[0])
+
+    def test_allow_socks_action_removes_persistent_enforcement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "SECURITY_SOCKS_AUTH_ENFORCEMENT_FILE": str(Path(tmp) / "policy.json")
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                agent.set_socks_auth_enforcement(
+                    "incus", "default", "proxy", ["microsocks"]
+                )
+                ok, message = agent.execute_security_action(
+                    {
+                        "action_type": "release_socks_auth",
+                        "runtime": "incus",
+                        "project": "default",
+                        "container_name": "proxy",
+                    }
+                )
+                remaining = agent._socks_auth_enforcement_entries()
+        self.assertTrue(ok)
+        self.assertIn("policy_removed=1", message)
+        self.assertEqual(remaining, [])
 
     def test_parses_caddy_and_nginx_access_logs(self):
         caddy = agent._parse_access_log_line(

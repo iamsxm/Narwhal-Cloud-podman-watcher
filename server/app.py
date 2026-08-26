@@ -1115,6 +1115,26 @@ def _alert_action_evidence(alert: sqlite3.Row) -> Dict[str, Any]:
     details["process_patterns"] = process_patterns
     details["process_pids"] = process_pids
     details["config_files"] = config_files
+    details["socks_auth_mode"] = (
+        str(details.get("socks_auth_mode") or "unknown")
+        if str(details.get("socks_auth_mode") or "unknown")
+        in ("no_auth", "weak_password", "configured", "unknown")
+        else "unknown"
+    )
+    details["socks_processes"] = [
+        item for item in clean(details.get("socks_processes")) if item.lower() in {
+            "microsocks", "sockd", "danted", "srelay", "hev-socks5-server",
+            "3proxy", "gost", "xray", "v2ray", "sing-box",
+        }
+    ]
+    details["socks_process_pids"] = sorted(
+        {
+            int(item)
+            for item in details.get("socks_process_pids", [])
+            if isinstance(item, int) and 1 < item <= 4194304
+        }
+    ) if isinstance(details.get("socks_process_pids"), list) else []
+    details["socks_config_files"] = clean(details.get("socks_config_files"))
     return details
 
 
@@ -1313,9 +1333,12 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
     action = None
     queued = False
     if decision == "deny":
-        if alert["alert_type"] != "unauthorized_panel_pairing":
+        if alert["alert_type"] not in ("unauthorized_panel_pairing", "socks_weak_auth"):
             conn.close()
-            raise HTTPException(status_code=400, detail="deny currently supports panel-pairing alerts")
+            raise HTTPException(
+                status_code=400,
+                detail="deny supports panel-pairing and confirmed no-auth SOCKS alerts",
+            )
         if alert["runtime"] not in ("podman", "incus"):
             conn.close()
             raise HTTPException(status_code=400, detail="Docker is notice-only and cannot be denied")
@@ -1323,21 +1346,42 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
             conn.close()
             raise HTTPException(status_code=400, detail="alert has no container target")
         details = _alert_action_evidence(alert)
-        process_patterns = details.get("process_patterns") or []
-        process_pids = details.get("process_pids") or []
-        config_files = details.get("config_files") or []
-        if not process_patterns and not config_files:
-            conn.close()
-            raise HTTPException(status_code=400, detail="alert has no safe remediation evidence")
-        params = {
-            "domains": details.get("unapproved_domains") or [],
-            "process_patterns": process_patterns,
-            "process_pids": process_pids,
-            "config_files": config_files,
-        }
-        action, queued = _queue_security_action_row(
-            conn, alert, "remediate_panel_pairing", params, requested_by
-        )
+        if alert["alert_type"] == "socks_weak_auth":
+            if details.get("socks_auth_mode") != "no_auth":
+                conn.close()
+                raise HTTPException(
+                    status_code=400,
+                    detail="only confirmed no-auth SOCKS services can be stopped automatically",
+                )
+            process_names = details.get("socks_processes") or []
+            if not process_names:
+                conn.close()
+                raise HTTPException(status_code=400, detail="alert has no safe SOCKS process evidence")
+            params = {
+                "auth_mode": "no_auth",
+                "process_names": process_names,
+                "process_pids": details.get("socks_process_pids") or [],
+                "config_files": details.get("socks_config_files") or [],
+            }
+            action, queued = _queue_security_action_row(
+                conn, alert, "enforce_socks_auth", params, requested_by
+            )
+        else:
+            process_patterns = details.get("process_patterns") or []
+            process_pids = details.get("process_pids") or []
+            config_files = details.get("config_files") or []
+            if not process_patterns and not config_files:
+                conn.close()
+                raise HTTPException(status_code=400, detail="alert has no safe remediation evidence")
+            params = {
+                "domains": details.get("unapproved_domains") or [],
+                "process_patterns": process_patterns,
+                "process_pids": process_pids,
+                "config_files": config_files,
+            }
+            action, queued = _queue_security_action_row(
+                conn, alert, "remediate_panel_pairing", params, requested_by
+            )
     elif decision == "allow_silent":
         conn.execute(
             """
@@ -1358,6 +1402,10 @@ async def set_security_alert_disposition(alert_id: int, request: Request) -> JSO
                 action, queued = _queue_security_action_row(
                     conn, alert, "allow_panel_domains", {"domains": domains}, requested_by
                 )
+        elif alert["alert_type"] == "socks_weak_auth" and alert["runtime"] in ("podman", "incus"):
+            action, queued = _queue_security_action_row(
+                conn, alert, "release_socks_auth", {}, requested_by
+            )
     else:
         conn.execute("UPDATE security_alerts SET status='dismissed' WHERE id=?", (alert_id,))
 
@@ -1469,7 +1517,9 @@ async def security_action_result(
             "UPDATE security_actions SET status=?, result_message=?, updated_at=? WHERE id=?",
             (status, message, now, action_id),
         )
-        if status == "succeeded" and row["action_type"] == "remediate_panel_pairing":
+        if status == "succeeded" and row["action_type"] in (
+            "remediate_panel_pairing", "enforce_socks_auth"
+        ):
             conn.execute(
                 "UPDATE security_alerts SET status='remediated' WHERE id=? AND status='active'",
                 (row["alert_id"],),
@@ -1823,7 +1873,7 @@ table{background:var(--surface);color:var(--text)}th,td{border-color:var(--borde
 <main id='main-content' class='app-shell'>
 <header class='app-header'><div class='brand'><span class='brand-mark' aria-hidden='true'>NW</span><div><h1>Narwhal Monitor</h1><p>容器安全与运行状态中心</p></div></div><div class='header-actions'><span id='server-version' class='pill'>Server 正在连接</span><span id='last-refresh' class='refresh-time'>尚未刷新</span><a class='nav-link' href='/stats'>数据统计</a></div></header>
 <section class='kpi-grid' aria-label='运行概览'><article class='kpi-card'><span class='kpi-label'>在线主机</span><strong id='kpi-hosts' class='kpi-value'>0</strong></article><article class='kpi-card'><span class='kpi-label'>监控容器</span><strong id='kpi-containers' class='kpi-value'>0</strong></article><article class='kpi-card'><span class='kpi-label'>活动告警</span><strong id='kpi-alerts' class='kpi-value danger'>0</strong></article><article class='kpi-card'><span class='kpi-label'>离线容器</span><strong id='kpi-offline' class='kpi-value'>0</strong></article></section>
-<section class='section-card'><header class='section-head'><div><h2>安全告警 <span class='pill pill-bad'>活动 <span id='active-alert-count'>0</span></span></h2><p>禁止操作只清理已识别的进程、服务和配置，不会停止容器。</p></div></header><div class='section-body'><table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th><th>操作</th></tr></thead><tbody></tbody></table></div></section>
+<section class='section-card'><header class='section-head'><div><h2>安全告警 <span class='pill pill-bad'>活动 <span id='active-alert-count'>0</span></span></h2><p>机场组件禁止操作执行定向清理；无认证 SOCKS 操作只停止对应服务并持续拦截，均不会停止容器。</p></div></header><div class='section-body'><table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th><th>操作</th></tr></thead><tbody></tbody></table></div></section>
 <section class='section-card'><header class='section-head'><div><h2>主机安全遥测</h2><p>低开销汇总网络、连接与访问日志状态。</p></div></header><div class='section-body'><table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table></div></section>
 <section class='section-card'><header class='section-head'><div><h2>容器状态</h2><p>按主机折叠；版本、在线状态与运行时分布集中显示。</p></div></header><div class='section-body'><div id='host-containers' class='host-list' aria-live='polite'><div class='empty-state'>正在加载节点数据…</div></div></div></section>
 </main>
@@ -1893,6 +1943,7 @@ function escapeHtml(value){
   return String(value??'').replace(/[&<>'"]/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
 }
 const alertsById=new Map();
+const submittingAlertActions=new Set();
 function remediationChanged(action){
   if(!action||action.action_type!=='remediate_panel_pairing'||action.status!=='succeeded')return false;
   const text=String(action.result_message||'');
@@ -1902,7 +1953,7 @@ function remediationChanged(action){
 function actionStatusText(action){
   if(!action)return '';
   if(action.status==='queued')return '等待节点领取（正常情况下约 10 秒内）';
-  if(action.status==='dispatched')return '节点已领取，正在执行清理';
+  if(action.status==='dispatched')return action.action_type==='enforce_socks_auth'?'节点已领取，正在停止无认证 SOCKS':(action.action_type==='release_socks_auth'?'节点已领取，正在解除 SOCKS 持续拦截':'节点已领取，正在执行清理');
   if(action.action_type==='remediate_panel_pairing'&&action.status==='succeeded'&&!remediationChanged(action)){
     return `未清理到目标：${action.result_message||'节点未找到匹配的进程、服务或配置'}`;
   }
@@ -1912,18 +1963,30 @@ function actionStatusText(action){
 }
 async function setAlertDisposition(alertId, decision){
   const alert=alertsById.get(Number(alertId)); if(!alert)return;
+  if(submittingAlertActions.has(Number(alertId)))return;
   const details=alert.details||{};
   let promptText='';
   if(decision==='deny'){
-    const processes=(details.process_patterns||[]).join(', ')||'无';
-    const files=(details.config_files||[]).join(', ')||'无';
-    promptText=`确认禁止并清理 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的机场对接组件？\n\n将终止进程特征：${processes}\n停用并删除对应服务，删除配置：${files}\n容器本身不会停止。成功后同一面板域名再次出现会自动清理且不再提醒。`;
+    if(alert.type==='socks_weak_auth'){
+      const processes=(details.socks_processes||[]).join(', ')||'无';
+      promptText=`确认停止 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的无认证 SOCKS 服务并启用持续拦截？\n\n目标进程：${processes}\n不会停止容器，不会删除配置或服务文件。以后检测到该容器再次以无认证/空密码方式运行时会自动停止；检测到非空认证后会自动解除拦截，允许服务恢复。`;
+    }else{
+      const processes=(details.process_patterns||[]).join(', ')||'无';
+      const files=(details.config_files||[]).join(', ')||'无';
+      promptText=`确认禁止并清理 ${alert.host_id} / ${alert.runtime} / ${alert.container_name} 内的机场对接组件？\n\n将终止进程特征：${processes}\n停用并删除对应服务，删除配置：${files}\n容器本身不会停止。成功后同一面板域名再次出现会自动清理且不再提醒。`;
+    }
   }else if(decision==='allow_silent'){
-    promptText=`确认允许此告警且以后不再提醒？\n\n该告警指纹会被永久抑制；机场面板域名还会同步加入节点放行名单。`;
+    promptText=alert.type==='socks_weak_auth'
+      ?`确认允许此 SOCKS 告警且以后不再提醒？\n\n该告警指纹会被永久抑制；如果此前启用了持续拦截，节点会同时解除策略，之后可以正常启动服务。`
+      :`确认允许此告警且以后不再提醒？\n\n该告警指纹会被永久抑制；机场面板域名还会同步加入节点放行名单。`;
   }else{
     promptText=`确认仅取消本次提醒？\n\n当前连续出现期间不再显示；事件消失后如果再次出现，仍会重新告警。`;
   }
   if(!confirm(promptText))return;
+  submittingAlertActions.add(Number(alertId));
+  document.querySelectorAll(`[data-alert-action="${Number(alertId)}"]`).forEach(button=>{button.disabled=true;});
+  const status=document.querySelector(`[data-alert-status="${Number(alertId)}"]`);
+  if(status)status.textContent='正在提交操作…';
   try{
     const response=await fetch(`/api/v1/security/alerts/${Number(alertId)}/disposition`,{
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision})
@@ -1932,6 +1995,7 @@ async function setAlertDisposition(alertId, decision){
     if(!response.ok)throw new Error(result.detail||`HTTP ${response.status}`);
     await loadAlerts();
   }catch(error){window.alert(`操作提交失败：${error.message||error}`);}
+  finally{submittingAlertActions.delete(Number(alertId));}
 }
 async function loadAlerts(){
   const response=await fetch('/api/v1/security/alerts?active_only=true&limit=100');
@@ -1945,21 +2009,31 @@ async function loadAlerts(){
     const tr=document.createElement('tr');
     const runtime=alert.project?`${alert.runtime}/${alert.project}`:(alert.runtime||'-');
     const supportedRuntime=alert.runtime==='podman'||alert.runtime==='incus';
-    const canRemediate=supportedRuntime&&alert.type==='unauthorized_panel_pairing'&&((alert.details?.process_patterns||[]).length>0||(alert.details?.config_files||[]).length>0);
+    const canPanelRemediate=supportedRuntime&&alert.type==='unauthorized_panel_pairing'&&((alert.details?.process_patterns||[]).length>0||(alert.details?.config_files||[]).length>0);
+    const canSocksRemediate=supportedRuntime&&alert.type==='socks_weak_auth'&&alert.details?.socks_auth_mode==='no_auth'&&(alert.details?.socks_processes||[]).length>0;
     const pending=alert.latest_action&&(alert.latest_action.status==='queued'||alert.latest_action.status==='dispatched');
     const lastRemediation=alert.latest_action?.action_type==='remediate_panel_pairing'?alert.latest_action:null;
+    const lastSocksEnforcement=alert.latest_action?.action_type==='enforce_socks_auth'?alert.latest_action:null;
     const changed=remediationChanged(lastRemediation);
     const recurred=changed&&Number(alert.last_seen||0)>Number(lastRemediation?.updated_at||0);
     const denyLabel=pending?'禁止处理中':((lastRemediation&&(lastRemediation.status==='failed'||!changed))?'重试禁止':(recurred?'再次禁止':'禁止'));
-    const denyControl=canRemediate?(changed&&!recurred?`<span class='ok'>已禁止，等待复检</span>`:`<button class='btn btn-danger' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'deny')">${denyLabel}</button>`):'';
+    const socksPolicyActive=lastSocksEnforcement?.status==='succeeded'&&alert.details?.socks_auth_mode==='no_auth';
+    const socksReleased=alert.details?.socks_auth_enforcement?.released===true;
+    let denyControl='';
+    if(canSocksRemediate){
+      const socksLabel=pending?'正在启用持续拦截':(lastSocksEnforcement?.status==='failed'?'重试停止并持续拦截':'停止并持续拦截');
+      denyControl=socksPolicyActive?`<span class='ok'>持续拦截已启用</span>`:`<button class='btn btn-danger' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'deny')">${socksLabel}</button>`;
+    }else if(canPanelRemediate){
+      denyControl=changed&&!recurred?`<span class='ok'>已禁止，等待复检</span>`:`<button class='btn btn-danger' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'deny')">${denyLabel}</button>`;
+    }else if(socksReleased){denyControl=`<span class='ok'>已检测到非空认证，持续拦截已解除</span>`;}
     const actions=denyControl+
-      `<button class='btn btn-allow' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'allow_silent')">允许且不再提醒</button>`+
-      `<button class='btn btn-dismiss' ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'dismiss_once')">本次取消提醒</button>`;
+      `<button class='btn btn-allow' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'allow_silent')">允许且不再提醒</button>`+
+      `<button class='btn btn-dismiss' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'dismiss_once')">本次取消提醒</button>`;
     tr.innerHTML=`<td class='severity-${escapeHtml(alert.severity)}'>${escapeHtml(alert.severity)}</td>`+
       `<td>${escapeHtml(alert.host_id)}</td><td>${escapeHtml(runtime)}</td>`+
       `<td>${escapeHtml(alert.container_name||'-')}</td><td>${escapeHtml(alert.type)}</td>`+
       `<td>${escapeHtml(alert.message)}</td><td>${escapeHtml(alert.last_seen_utc8)}</td>`+
-      `<td>${Number(alert.occurrence_count||0)}</td><td>${actions}<div class='action-status'>${escapeHtml(actionStatusText(alert.latest_action))}</div></td>`;
+      `<td>${Number(alert.occurrence_count||0)}</td><td>${actions}<div class='action-status' data-alert-status="${Number(alert.id)}">${escapeHtml(socksReleased?'非空认证已确认，节点已自动解除持续拦截':actionStatusText(alert.latest_action))}</div></td>`;
     body.appendChild(tr);
   }
   const statusResponse=await fetch('/api/v1/security/status');

@@ -87,8 +87,8 @@ if [[ "$remote_commit" == "$deployed_commit" ]]; then
 fi
 
 if [[ -n "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no)" ]]; then
-  log "ERROR tracked local changes detected; refusing automatic update"
-  exit 1
+  log "WARN tracked local changes detected in $REPO_DIR; discarding to allow automatic update"
+  git -C "$REPO_DIR" checkout -- .
 fi
 
 log "update found: ${deployed_commit:-unknown} -> $remote_commit"

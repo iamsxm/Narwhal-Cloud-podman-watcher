@@ -598,10 +598,31 @@ CADDY
     caddy_image="$selected_image"
   fi
 
-  # 显式拉取 Caddy 镜像，避免仅依赖 podman run 自动拉取时出现不清晰的失败。
-  if ! podman pull "$caddy_image" >/dev/null 2>&1; then
-    echo "[WARN] 拉取 Caddy 镜像 $caddy_image 失败，将尝试由 podman run 自动拉取（若仍失败请检查 registry 可达性）。"
+  # 优先复用配置镜像；若不可达，则尝试多个候选引用（docker.io 被限流/屏蔽时仍可部署）。
+  local -a caddy_candidates=( "$caddy_image" "docker.io/library/caddy:2" "caddy:2" "ghcr.io/caddyserver/caddy:2" )
+  local chosen_caddy=""
+  local cimg=""
+  for cimg in "${caddy_candidates[@]}"; do
+    [[ -z "$cimg" ]] && continue
+    if podman image exists "$cimg" >/dev/null 2>&1; then
+      chosen_caddy="$cimg"
+      echo "[INFO] 使用已缓存 Caddy 镜像: $chosen_caddy"
+      break
+    fi
+    if timeout 90 podman pull "$cimg" >/dev/null 2>&1; then
+      chosen_caddy="$cimg"
+      echo "[INFO] 已拉取 Caddy 镜像: $chosen_caddy"
+      break
+    fi
+    echo "[WARN] Caddy 镜像 $cimg 不可用（拉取失败或本地不存在），尝试下一个候选。"
+  done
+  if [[ -z "$chosen_caddy" ]]; then
+    echo "[ERROR] 无法获取任何 Caddy 镜像（docker.io 可能不可达且本地无缓存）。"
+    echo "[ERROR] 请检查 registry 可达性，或配置 podman 镜像加速器（如 docker.m.daocloud.io）后重试。"
+    echo "[ERROR] 调试：尝试手动拉取 -> podman pull docker.io/library/caddy:2"
+    exit 1
   fi
+  caddy_image="$chosen_caddy"
 
   local -a podman_args=(
     run -d --replace --name "$TLS_CONTAINER_NAME"
@@ -617,8 +638,9 @@ CADDY
   podman_args+=( "$caddy_image" )
 
   local tls_container_id=""
-  if ! tls_container_id="$(podman "${podman_args[@]}")"; then
-    echo "[ERROR] TLS Proxy 容器创建失败。"
+  if ! tls_container_id="$(podman "${podman_args[@]}" 2>&1)"; then
+    echo "[ERROR] TLS Proxy 容器创建失败: ${tls_container_id}"
+    echo "[ERROR] 调试：请手动运行上述等价命令查看完整报错，或执行 podman logs $TLS_CONTAINER_NAME 查看 Caddy 启动日志。"
     exit 1
   fi
   echo "$tls_container_id"

@@ -164,12 +164,12 @@ ensure_narwhal_network() {
       echo "[INFO] 候选子网 $candidate 与宿主机冲突，退避到下一个。"
       continue
     fi
-    create_err="$(podman network create --subnet "$candidate" "$NARWHAL_NETWORK_NAME" 2>&1)"
-    if [[ $? -eq 0 ]]; then
-      echo "[INFO] 已创建专用网络 $NARWHAL_NETWORK_NAME (subnet=$candidate)，规避与宿主机已有私网网卡冲突。"
-      return 0
+    if ! create_err="$(podman network create --subnet "$candidate" "$NARWHAL_NETWORK_NAME" 2>&1)"; then
+      echo "[WARN] 候选子网 $candidate 创建失败：$create_err（尝试下一个）。"
+      continue
     fi
-    echo "[WARN] 候选子网 $candidate 创建失败：$create_err（尝试下一个）。"
+    echo "[INFO] 已创建专用网络 $NARWHAL_NETWORK_NAME (subnet=$candidate)，规避与宿主机已有私网网卡冲突。"
+    return 0
   done
 
   echo "[WARN] 所有候选子网均无法创建专用网络，回退到 Podman 默认网络（可能存在私网冲突风险）。"

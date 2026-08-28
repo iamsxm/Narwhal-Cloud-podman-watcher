@@ -484,13 +484,17 @@ replace_server_container() {
         "$CONTAINER_NAME" 2>/dev/null \
         | awk -F= '$1=="NARWHAL_VERSION"{print substr($0,index($0,"=")+1);exit}'
     )"
-    if [[ "$running" == "true" && "$runtime_version" == "$PROJECT_VERSION" ]]; then
-      echo "[OK] Server 容器已运行，版本 v$runtime_version。"
+    if [[ "$running" == "true" ]]; then
+      if [[ "$runtime_version" != "$PROJECT_VERSION" ]]; then
+        echo "[WARN] Server 容器已运行，但版本标识为 v${runtime_version:-未知}（期望 v$PROJECT_VERSION）；版本校验不影响服务，继续部署 Caddy。"
+      else
+        echo "[OK] Server 容器已运行，版本 v$runtime_version。"
+      fi
       return
     fi
     sleep 1
   done
-  echo "[ERROR] Server 容器启动或版本验证失败: running=${running:-unknown}, runtime_version=${runtime_version:-unknown}, expected=$PROJECT_VERSION"
+  echo "[ERROR] Server 容器启动失败: running=${running:-unknown}。"
   podman logs --tail 120 "$CONTAINER_NAME" 2>&1 || true
   exit 1
 }

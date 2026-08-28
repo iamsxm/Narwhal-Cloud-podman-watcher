@@ -359,7 +359,7 @@ wait_for_backend_http() {
     return 0
   fi
   for attempt in $(seq 1 30); do
-    status="$(curl --max-time 2 -sS -o /dev/null -w '%{http_code}' \
+    status="$(curl --noproxy '*' --max-time 2 -sS -o /dev/null -w '%{http_code}' \
       "http://127.0.0.1:${host_port}/" 2>/dev/null || true)"
     if [[ "$status" =~ ^[1-4][0-9][0-9]$ ]]; then
       echo "[OK] Server 后端 HTTP 可达（127.0.0.1:${host_port}，状态码 $status）。"
@@ -385,7 +385,7 @@ wait_for_tls_http() {
     return 0
   fi
   for attempt in $(seq 1 30); do
-    status="$(curl --max-time 3 -k -sS -o /dev/null -w '%{http_code}' \
+    status="$(curl --noproxy '*' --max-time 3 -k -sS -o /dev/null -w '%{http_code}' \
       --resolve "${host}:443:127.0.0.1" "https://${host}/" 2>/dev/null || true)"
     if [[ "$status" =~ ^[1-4][0-9][0-9]$ ]]; then
       echo "[OK] TLS Proxy HTTP 可达（https://${host}/，状态码 $status）。"

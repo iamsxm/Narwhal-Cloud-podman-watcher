@@ -318,6 +318,7 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("sanitize_server_port", server_installer)
         self.assertIn("wait_for_backend_http", server_installer)
         self.assertIn("wait_for_tls_http", server_installer)
+        self.assertIn("curl --noproxy '*'", server_installer)
         self.assertIn("不会终止宿主机进程", server_installer)
         self.assertNotIn("kill -TERM", server_installer)
         self.assertIn('remove_container_for_replace "$TLS_CONTAINER_NAME" "TLS Proxy"', server_installer)

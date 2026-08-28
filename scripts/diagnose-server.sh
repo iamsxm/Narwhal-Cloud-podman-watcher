@@ -89,13 +89,13 @@ section "NETWORK AND HTTP"
 ss -ltnp 2>/dev/null | grep -E ':(80|443|8080|[0-9]{5})[[:space:]]' || true
 backend_port="$(awk -F= '$1=="PORT"{print $2;exit}' "$BASE_DIR/server-install.env" 2>/dev/null || true)"
 if [[ "$backend_port" =~ ^[0-9]{1,5}$ ]]; then
-  curl --max-time 5 -sS -o /dev/null \
+  curl --noproxy '*' --max-time 5 -sS -o /dev/null \
     -w "backend_127.0.0.1:${backend_port}=%{http_code} error=%{errormsg}\n" \
     "http://127.0.0.1:${backend_port}/" || true
 fi
 tls_host="$(awk -F= '$1=="TLS_HOST"{print substr($0,index($0,"=")+1);exit}' "$BASE_DIR/server-install.env" 2>/dev/null || true)"
 if [[ -n "$tls_host" ]]; then
-  curl --max-time 5 -k -sS -o /dev/null \
+  curl --noproxy '*' --max-time 5 -k -sS -o /dev/null \
     -w "https_${tls_host}=%{http_code} error=%{errormsg}\n" \
     "https://${tls_host}/" || true
 fi

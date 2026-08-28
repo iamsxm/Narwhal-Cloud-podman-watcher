@@ -100,6 +100,11 @@ subnet_conflicts() {
   local iface addr addr_int
   while read -r iface addr; do
     [[ "$iface" == "lo" ]] && continue
+    # 跳过本项目自己创建/管理的网桥，避免把自身路由误判为冲突。
+    [[ "$iface" == "narwhal-monitor0" ]] && continue
+    case "$iface" in
+      *podman*|*narwhal*) continue ;;
+    esac
     addr="${addr%%/*}"
     case "$addr" in
       *:*) continue ;;  # 跳过 IPv6
@@ -110,8 +115,11 @@ subnet_conflicts() {
     fi
   done < <(ip -o -4 addr show 2>/dev/null | awk '{print $2, $4}')
 
-  # 已有指向该子网的路由（排除默认路由 0.0.0.0/0）。
-  if ip route show to "$subnet" 2>/dev/null | grep -v -E '^default' | grep -q .; then
+  # 已有指向该子网的路由（排除默认路由 0.0.0.0/0 及本项目自身网桥）。
+  if ip route show to "$subnet" 2>/dev/null \
+      | grep -v -E '^default' \
+      | grep -v -E '(dev (narwhal-monitor0|podman0)|dev [a-z]*podman|dev [a-z]*narwhal)' \
+      | grep -q .; then
     return 0
   fi
 
@@ -127,17 +135,16 @@ ensure_narwhal_network() {
     return 0
   fi
 
-  # 已存在且子网未冲突，直接复用。
+  # 已存在则直接复用，不再做冲突检测。
+  # 原因：subnet_conflicts 会把本网络自身的路由（如 10.233.0.0/16 dev narwhal-monitor0）
+  # 误判为“与宿主机冲突”，导致更新时反复销毁重建网络、使正在运行的 Server 断网。
+  # 冲突退避仅发生在“首次新建”网络时（见下方候选子网逻辑）。
   if podman network exists "$NARWHAL_NETWORK_NAME" >/dev/null 2>&1; then
     local existing_subnet=""
     existing_subnet="$(podman network inspect "$NARWHAL_NETWORK_NAME" \
       --format '{{range .Subnets}}{{.Subnet}}{{end}}' 2>/dev/null || true)"
-    if [[ -n "$existing_subnet" ]] && ! subnet_conflicts "$existing_subnet"; then
-      echo "[INFO] 复用已存在的专用网络 $NARWHAL_NETWORK_NAME (subnet=$existing_subnet)。"
-      return 0
-    fi
-    echo "[WARN] 已存在的专用网络 $NARWHAL_NETWORK_NAME 子网 $existing_subnet 与宿主机冲突，重建中..."
-    podman network rm -f "$NARWHAL_NETWORK_NAME" >/dev/null 2>&1 || true
+    echo "[INFO] 复用已存在的专用网络 $NARWHAL_NETWORK_NAME (subnet=${existing_subnet:-未知})。"
+    return 0
   fi
 
   # 候选子网，按顺序尝试，选择第一个不冲突的。

@@ -330,6 +330,24 @@ remove_container_for_replace() {
   fi
 }
 
+# 等待指定主机端口不再被监听（netavark 端口回收存在竞态，释放需要一点时间）。
+wait_for_port_free() {
+  local port="$1"
+  local waited=0
+  if ! command -v ss >/dev/null 2>&1; then
+    return 0
+  fi
+  while (( waited < 30 )); do
+    if ! ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "[WARN] 端口 $port 在 30 秒内仍被占用，继续尝试创建容器。"
+  return 0
+}
+
 replace_server_container() {
   local image_name="$1"
   local port_binding="$2"
@@ -341,16 +359,33 @@ replace_server_container() {
     net_args=( --network "$network_name" )
   fi
 
+  # 提取发布端口的主机端口（如 127.0.0.1:61912:8080 -> 61912）。
+  local pb="${port_binding#*:}"
+  local host_port="${pb%%:*}"
+
   local new_id=""
-  if ! new_id="$(podman run -d --replace --name "$CONTAINER_NAME" \
-    --restart=always \
-    "${net_args[@]}" \
-    -p "$port_binding" \
-    --env-file "$SERVER_ENV_FILE" \
-    -v "$SERVER_DATA_DIR:/data" \
-    -v "$TLS_CA_EXPORT_DIR:/tls-ca:ro" \
-    "$image_name")"; then
-    echo "[ERROR] 新 Server 容器创建失败。"
+  local attempt=""
+  for attempt in 1 2 3 4 5; do
+    wait_for_port_free "$host_port"
+    new_id="$(podman run -d --name "$CONTAINER_NAME" \
+      --restart=always \
+      "${net_args[@]}" \
+      -p "$port_binding" \
+      --env-file "$SERVER_ENV_FILE" \
+      -v "$SERVER_DATA_DIR:/data" \
+      -v "$TLS_CA_EXPORT_DIR:/tls-ca:ro" \
+      "$image_name" 2>&1)" && break
+    if [[ "$new_id" == *"address already in use"* ]]; then
+      echo "[WARN] 端口 $host_port 仍被占用（尝试 $attempt/5），清理后重试..."
+      podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+      sleep 3
+      continue
+    fi
+    echo "[ERROR] 新 Server 容器创建失败: $new_id"
+    exit 1
+  done
+  if [[ -z "$new_id" ]]; then
+    echo "[ERROR] 新 Server 容器创建失败（端口 $host_port 持续被占用）。"
     exit 1
   fi
   echo "$new_id"

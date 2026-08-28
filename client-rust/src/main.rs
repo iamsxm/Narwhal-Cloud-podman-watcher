@@ -1,16 +1,19 @@
-mod config;
 mod collector;
+mod config;
 mod reporter;
 
-use config::Config;
 use collector::Collector;
+use config::Config;
 use reporter::Reporter;
 use std::thread::sleep;
 use std::time::Duration;
 
 fn main() {
     println!("==========================================");
-    println!("  Narwhal Monitor Rust Agent v{}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  Narwhal Monitor Rust Agent v{}",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("==========================================");
 
     let config = Config::load();

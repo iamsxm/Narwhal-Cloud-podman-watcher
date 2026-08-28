@@ -1,0 +1,14 @@
+{
+  "date": "2026-08-28",
+  "executor": "Codex",
+  "goal": "完善 Rust Client 的核心资源指标采集，使 Podman、Docker 和 Incus 的 CPU、内存、网络及进程数与 Python Client 的数据口径一致。",
+  "scope": [
+    "兼容多版本 OCI stats JSON 与模板字段",
+    "实现 Incus OpenMetrics 采集与累计计数速率换算",
+    "补充 Rust 单元测试和版本一致性测试",
+    "执行本地格式化、测试与构建验证"
+  ],
+  "out_of_scope": [
+    "完整移植 Python Agent 的安全扫描和远程处置子系统"
+  ]
+}

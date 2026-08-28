@@ -27,13 +27,15 @@ impl Reporter {
     }
 
     pub fn report(&self, payload: &ReportPayload) -> Result<(), String> {
-        let body_bytes = serde_json::to_vec(payload).map_err(|e| format!("JSON encode error: {}", e))?;
+        let body_bytes =
+            serde_json::to_vec(payload).map_err(|e| format!("JSON encode error: {}", e))?;
         let ts = payload.timestamp;
         let sig = self.generate_signature(&body_bytes, ts);
 
         let url = format!("{}/api/v1/report", self.server_url);
 
-        let res = self.agent
+        let res = self
+            .agent
             .post(&url)
             .set("Content-Type", "application/json")
             .set("X-Timestamp", &ts.to_string())

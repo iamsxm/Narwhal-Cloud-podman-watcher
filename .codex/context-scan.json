@@ -1,0 +1,34 @@
+{
+  "date": "2026-08-28",
+  "executor": "Codex",
+  "location": [
+    "client-rust/src/collector.rs",
+    "client-rust/src/main.rs",
+    "client/agent.py",
+    "tests/test_agent_runtimes.py",
+    "tests/test_server_runtime.py"
+  ],
+  "current_state": "Rust Client 仅识别部分 Docker 风格 stats 字段，Podman 常见 snake_case 字段未解析；Incus CPU 和网络固定为零。",
+  "reference_implementations": [
+    "client/agent.py::_parse_stats_json",
+    "client/agent.py::_parse_stats_template",
+    "client/agent.py::_parse_incus_metrics"
+  ],
+  "risks": [
+    "不同 Podman/Docker 版本字段命名和数据类型不一致",
+    "CPU 与网络累计值首轮无法产生速率",
+    "Incus 指标需排除 idle CPU 与 loopback 网络"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test",
+    "cargo build --release",
+    "python -m unittest"
+  ],
+  "sufficiency": {
+    "interface_contract": true,
+    "technical_choice": true,
+    "main_risks_identified": true,
+    "verification_known": true
+  }
+}

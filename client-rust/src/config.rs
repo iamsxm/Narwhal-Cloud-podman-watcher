@@ -42,17 +42,11 @@ impl Config {
             .or_else(|_| fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
             .unwrap_or_else(|_| "unknown-host".to_string());
 
-        let report_interval: u64 = get_var("REPORT_INTERVAL", "300")
-            .parse()
-            .unwrap_or(300);
+        let report_interval: u64 = get_var("REPORT_INTERVAL", "300").parse().unwrap_or(300);
 
-        let action_poll_interval: u64 = get_var("ACTION_POLL_INTERVAL", "10")
-            .parse()
-            .unwrap_or(10);
+        let action_poll_interval: u64 = get_var("ACTION_POLL_INTERVAL", "10").parse().unwrap_or(10);
 
-        let security_enabled = get_var("SECURITY_MONITOR_ENABLED", "true")
-            .to_lowercase()
-            == "true";
+        let security_enabled = get_var("SECURITY_MONITOR_ENABLED", "true").to_lowercase() == "true";
 
         Self {
             server_url: get_var("SERVER_URL", "http://127.0.0.1:8080"),

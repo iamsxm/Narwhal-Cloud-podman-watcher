@@ -402,7 +402,7 @@ resolve_free_server_port() {
     echo "$desired"
     return 0
   fi
-  echo "[WARN] 端口 $desired 无法释放，改用新的随机空闲端口以避免 Server 无法启动。"
+  echo "[WARN] 端口 $desired 无法释放，改用新的随机空闲端口以避免 Server 无法启动。" >&2
   local candidate tries=0
   while (( tries < 50 )); do
     candidate="$(pick_random_port)"

@@ -351,7 +351,7 @@ wait_for_port_free() {
     sleep 1
     waited=$((waited + 1))
   done
-  echo "[WARN] 端口 $port 在 30 秒内仍被占用，继续尝试创建容器。"
+  echo "[WARN] 端口 $port 在 30 秒内仍被占用，继续尝试创建容器。" >&2
   return 0
 }
 
@@ -368,11 +368,11 @@ free_port() {
       comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
       case "$comm" in
         netavark|pasta|slirp4netns|conmon|rootlesskit|vpnkit|containerd*|podman*)
-          echo "[INFO] 释放端口 $port：终止遗留转发进程 pid=$pid ($comm)"
+          echo "[INFO] 释放端口 $port：终止遗留转发进程 pid=$pid ($comm)" >&2
           kill -TERM "$pid" 2>/dev/null || true
           ;;
         *)
-          echo "[WARN] 端口 $port 被非容器转发进程占用 (pid=$pid, $comm)，跳过自动清理。"
+          echo "[WARN] 端口 $port 被非容器转发进程占用 (pid=$pid, $comm)，跳过自动清理。" >&2
           ;;
       esac
     done

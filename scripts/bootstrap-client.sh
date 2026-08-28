@@ -83,30 +83,40 @@ if [[ -z "$DEFAULT_HOST_ID" ]]; then
   DEFAULT_HOST_ID="$(hostname)"
 fi
 
-# 如果不是静默模式（终端可交互且未传参），提示输入
-if [[ -t 0 && -z "${SERVER_URL:-}" ]]; then
-  read -r -p "请输入 Server 地址 [$DEFAULT_SERVER_URL]: " input_url
-  SERVER_URL="${input_url:-$DEFAULT_SERVER_URL}"
-else
-  SERVER_URL="$DEFAULT_SERVER_URL"
+ask_input() {
+  local prompt="$1"
+  local default_val="$2"
+  local user_input=""
+  if [[ -c /dev/tty ]]; then
+    printf "%s" "$prompt" >/dev/tty
+    read -r user_input </dev/tty || true
+  fi
+  if [[ -n "$user_input" ]]; then
+    printf "%s" "$user_input"
+  else
+    printf "%s" "$default_val"
+  fi
+}
+
+# 如果未通过环境变量传入，则从控制台交互式读取
+if [[ -z "${SERVER_URL:-}" ]]; then
+  SERVER_URL="$(ask_input "请输入 Server 地址 [$DEFAULT_SERVER_URL]: " "$DEFAULT_SERVER_URL")"
 fi
 
-if [[ -t 0 && -z "${SHARED_SECRET:-}" ]]; then
-  read -r -p "请输入通信密钥 SHARED_SECRET [${DEFAULT_SECRET:-必填}]: " input_secret
-  SHARED_SECRET="${input_secret:-$DEFAULT_SECRET}"
-else
-  SHARED_SECRET="$DEFAULT_SECRET"
+if [[ -z "${SHARED_SECRET:-}" ]]; then
+  SHARED_SECRET="$(ask_input "请输入通信密钥 SHARED_SECRET [${DEFAULT_SECRET:-必填}]: " "$DEFAULT_SECRET")"
 fi
 
-if [[ -t 0 && -z "${HOST_ID:-}" ]]; then
-  read -r -p "请输入当前主机 ID HOST_ID [$DEFAULT_HOST_ID]: " input_host
-  HOST_ID="${input_host:-$DEFAULT_HOST_ID}"
-else
-  HOST_ID="$DEFAULT_HOST_ID"
+if [[ -z "${HOST_ID:-}" ]]; then
+  HOST_ID="$(ask_input "请输入当前主机 ID HOST_ID [$DEFAULT_HOST_ID]: " "$DEFAULT_HOST_ID")"
 fi
 
 if [[ -z "$SHARED_SECRET" ]]; then
+  echo ""
   echo "[ERROR] SHARED_SECRET 不能为空！"
+  echo "你可以通过以下任一方式运行："
+  echo "1. 交互运行: curl -fsSL $RAW_BASE/scripts/bootstrap-client.sh | sudo bash"
+  echo "2. 带参数运行: sudo SERVER_URL=http://x.x.x.x:8080 SHARED_SECRET=你的密钥 HOST_ID=节点名称 bash -c \"\$(curl -fsSL $RAW_BASE/scripts/bootstrap-client.sh)\""
   exit 1
 fi
 

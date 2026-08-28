@@ -19,3 +19,4 @@
 - 运行说明：首次采样建立累计计数基线，RX/TX、pps、CPU 差值及协议速率从第二个报告周期开始有效。
 - 已知限制：NAT 后原始来源依赖宿主机 conntrack，Rust 当前仅观察容器网络命名空间；无活动远端 socket 时来源 Top3 合理显示为空。
 - 本地结果：`cargo fmt --check`、`cargo metadata --locked --no-deps`、Python `py_compile` 与 `git diff --check` 均通过；本地未编译 Rust。
+- 首次远程验证：GHCR workflow 在测试导入 Python Client 时发现缺少 `requests`，已修复 workflow 依赖安装并重新触发。

@@ -17,3 +17,4 @@
 - `bash -n scripts/install-rust-client.sh`：Windows 沙箱无法创建 WSL Bash 实例（`E_ACCESSDENIED`），由 Ubuntu GitHub Actions 的 shell 步骤继续验证。
 - Rust 测试：已增加 `/proc/net` socket、监听端口、入站来源、OCI 暴露/配置风险和 Server 字段契约测试；按用户要求仅由 GitHub Actions 执行。
 - Server 测试：已增加版本提示和更新动作去重测试；完整 unittest discovery 由 GHCR workflow 安装依赖后执行。
+- 首次 GHCR run `33182033396`：失败于 `requests` 未安装；workflow 已补充 `client/requirements.txt`，不涉及运行时代码。

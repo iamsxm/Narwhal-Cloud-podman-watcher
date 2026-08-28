@@ -594,6 +594,11 @@ CADDY
     caddy_image="$selected_image"
   fi
 
+  # 显式拉取 Caddy 镜像，避免仅依赖 podman run 自动拉取时出现不清晰的失败。
+  if ! podman pull "$caddy_image" >/dev/null 2>&1; then
+    echo "[WARN] 拉取 Caddy 镜像 $caddy_image 失败，将尝试由 podman run 自动拉取（若仍失败请检查 registry 可达性）。"
+  fi
+
   local -a podman_args=(
     run -d --replace --name "$TLS_CONTAINER_NAME"
     --restart=always

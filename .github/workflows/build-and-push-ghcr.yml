@@ -43,6 +43,16 @@ jobs:
           version="$(tr -d '[:space:]' < VERSION)"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Server tests
+        run: |
+          python -m pip install -r server/requirements.txt
+          python -m unittest discover -s tests -p "test_*.py"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 

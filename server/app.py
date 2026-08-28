@@ -50,6 +50,14 @@ def report_agent_version(payload_json: str | None) -> str:
     return str(payload.get("_agent_version") or "unknown")
 
 
+def report_agent_kind(payload_json: str | None) -> str:
+    try:
+        payload = json.loads(payload_json or "{}")
+    except (TypeError, ValueError):
+        return "unknown"
+    return str(payload.get("_agent_kind") or "unknown")
+
+
 app = FastAPI(title="Narwhal Container Monitor")
 
 _AGENT_ONLY_PATHS = {
@@ -655,6 +663,7 @@ async def report(
 
     host_id = data.get("host_id", "unknown")
     agent_version = str(data.get("agent_version") or "unknown").strip() or "unknown"
+    agent_kind = str(data.get("agent_kind") or "unknown").strip().lower() or "unknown"
     ts = int(data.get("timestamp", time.time()))
     network_status = data.get("container_network") or data.get("podman_network") or {}
     podman_v4 = 1 if network_status.get("ipv4_ok") else 0
@@ -674,6 +683,7 @@ async def report(
     for c in containers:
         stored_payload = dict(c)
         stored_payload["_agent_version"] = agent_version
+        stored_payload["_agent_kind"] = agent_kind
         conn.execute(
             """
             INSERT INTO reports(
@@ -820,6 +830,7 @@ def latest(include_stale: bool = False) -> JSONResponse:
         out.append({
             "host_id": r["host_id"],
             "agent_version": str(payload.get("_agent_version") or "unknown"),
+            "agent_kind": str(payload.get("_agent_kind") or "unknown"),
             "container_id": payload.get("id", ""),
             "container_name": r["container_name"],
             "runtime": r["runtime"],
@@ -1281,6 +1292,67 @@ async def agent_update_version(
             "ready": not expected_version or APP_VERSION == expected_version,
         },
         x_timestamp,
+    )
+
+
+@app.post("/api/v1/hosts/{host_id}/update")
+async def request_client_update(host_id: str, request: Request) -> JSONResponse:
+    """Queue a fixed Rust Client self-update for one authenticated reporting host."""
+    host_id = str(host_id or "")[:200].strip()
+    if not host_id:
+        raise HTTPException(status_code=400, detail="host_id is required")
+    requested_by = str(getattr(request.state, "dashboard_user", "dashboard") or "dashboard")[:100]
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    host = conn.execute(
+        "SELECT host_id, agent_version FROM hosts WHERE host_id=?", (host_id,)
+    ).fetchone()
+    if host is None:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(status_code=404, detail="host not found")
+    latest_report = conn.execute(
+        "SELECT payload_json FROM reports WHERE host_id=? ORDER BY ts DESC, id DESC LIMIT 1",
+        (host_id,),
+    ).fetchone()
+    if latest_report is None or report_agent_kind(latest_report["payload_json"]) != "rust":
+        conn.rollback()
+        conn.close()
+        raise HTTPException(status_code=409, detail="host is not reporting with Rust Client")
+    existing = conn.execute(
+        """
+        SELECT * FROM security_actions
+        WHERE host_id=? AND action_type='update_client' AND status IN ('queued','dispatched')
+        ORDER BY id DESC LIMIT 1
+        """,
+        (host_id,),
+    ).fetchone()
+    queued = existing is None
+    if existing is None:
+        now = int(time.time())
+        cursor = conn.execute(
+            """
+            INSERT INTO security_actions(
+                alert_id, host_id, runtime, project, container_name, action_type,
+                params_json, status, requested_by, created_at, updated_at
+            ) VALUES(0,?,'','','','update_client',?,'queued',?,?,?)
+            """,
+            (
+                host_id,
+                json.dumps({"target_version": APP_VERSION}, ensure_ascii=False),
+                requested_by,
+                now,
+                now,
+            ),
+        )
+        existing = conn.execute(
+            "SELECT * FROM security_actions WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()
+    conn.commit()
+    conn.close()
+    return JSONResponse(
+        status_code=202 if queued else 200,
+        content={"ok": True, "queued": queued, "action": _action_item(existing)},
     )
 
 
@@ -2397,13 +2469,22 @@ function containerDetailUrl(host,runtime,project,container){
   return `/container-detail?${q.toString()}`;
 }
 const expandedHosts=new Set();
-function versionBadge(agentVersion,serverVersion){
-  const client=String(agentVersion||'unknown'),server=String(serverVersion||'dev');
-  if(client==='unknown'||client==='dev')return `<span class='pill pill-warn'><i class='version-dot'></i>Client 版本未知</span>`;
-  if(server==='dev')return `<span class='pill pill-warn'><i class='version-dot'></i>Client v${escapeHtml(client)} · Server dev</span>`;
-  if(client===server)return `<span class='pill pill-ok'><i class='version-dot'></i>v${escapeHtml(client)} · 最新</span>`;
-  return `<span class='pill pill-bad'><i class='version-dot'></i>Client v${escapeHtml(client)} · 应为 v${escapeHtml(server)}</span>`;
-}
+ function versionParts(value){return String(value||'').split(/[+-]/,1)[0].split('.').map(x=>Number(x)||0)}
+ function versionCompare(left,right){const a=versionParts(left),b=versionParts(right);for(let i=0;i<Math.max(a.length,b.length);i++){const d=(a[i]||0)-(b[i]||0);if(d)return d>0?1:-1}return 0}
+ function versionBadge(agentVersion,serverVersion){
+   const client=String(agentVersion||'unknown'),server=String(serverVersion||'dev');
+   if(client==='unknown'||client==='dev')return `<span class='pill pill-warn'><i class='version-dot'></i>Client 版本未知</span>`;
+   if(server==='dev')return `<span class='pill pill-warn'><i class='version-dot'></i>Client v${escapeHtml(client)} · Server dev</span>`;
+   if(client===server)return `<span class='pill pill-ok'><i class='version-dot'></i>v${escapeHtml(client)} · 最新</span>`;
+   if(versionCompare(client,server)>0)return `<span class='pill pill-warn'><i class='version-dot'></i>Client v${escapeHtml(client)} · Server v${escapeHtml(server)} 待更新</span>`;
+   return `<span class='pill pill-bad'><i class='version-dot'></i>Client v${escapeHtml(client)} · 可更新至 v${escapeHtml(server)}</span>`;
+ }
+ async function requestClientUpdate(host,button){
+   if(!confirm(`确认更新主机 ${host} 的 Rust Client？节点会下载最新 Release 并重启 Agent。`))return;
+   button.disabled=true;
+   try{const response=await fetch(`/api/v1/hosts/${encodeURIComponent(host)}/update`,{method:'POST'});const data=await response.json();if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);button.textContent=data.queued?'已排队':'更新已在队列中'}catch(error){button.disabled=false;alert(`更新请求失败：${error.message||error}`)}
+ }
+ async function copyClientBootstrap(button){const command='curl -fsSL https://raw.githubusercontent.com/iamsxm/Narwhal-Cloud-podman-watcher/main/scripts/install-rust-client.sh | sudo bash';try{await navigator.clipboard.writeText(command);button.textContent='首次升级命令已复制'}catch(_){prompt('请在 Client 主机执行以下命令',command)}}
 function setHostExpanded(host, group, button, panel, expanded){
   if(expanded)expandedHosts.add(host);else expandedHosts.delete(host);
   group.classList.toggle('is-open',expanded);
@@ -2452,12 +2533,13 @@ async function load(){
       `<span class='pill ${offlineCount?'pill-bad':'pill-ok'}'>${offlineCount?`${offlineCount} 个离线`:'全部在线'}</span>`+
       `<span class='pill ${latest.container_network_ok_v4?'pill-ok':'pill-bad'}'>主机 IPv4 ${latest.container_network_ok_v4?'正常':'异常'}</span>`+
       `<span class='pill ${latest.container_network_ok_v6?'pill-ok':'pill-warn'}'>主机 IPv6 ${latest.container_network_ok_v6?'正常':'不可用'}</span></span>`;
-    const panel=document.createElement('div');
+     const panel=document.createElement('div');
     panel.id=panelId;
     panel.className='host-panel';
     panel.setAttribute('role','region');
-    panel.setAttribute('aria-labelledby',toggleId);
-    const grid=document.createElement('div');
+     panel.setAttribute('aria-labelledby',toggleId);
+     if(versionCompare(latest.agent_version,d.server_version)<0){const updateBar=document.createElement('div');updateBar.className='container-actions';const updateButton=document.createElement('button');updateButton.type='button';updateButton.className='btn';const supportsRemoteUpdate=latest.agent_kind==='rust'&&versionCompare(latest.agent_version,'1.6.33')>=0;updateButton.textContent=supportsRemoteUpdate?`一键更新 Client 至 v${d.server_version}`:'复制首次升级命令';updateButton.addEventListener('click',()=>supportsRemoteUpdate?requestClientUpdate(host,updateButton):copyClientBootstrap(updateButton));updateBar.appendChild(updateButton);panel.appendChild(updateBar)}
+     const grid=document.createElement('div');
     grid.className='containers-grid';
     rows.forEach(x=>{
       const cpuCls=x.alerts.cpu?'bad':'';
@@ -2671,6 +2753,7 @@ svg{width:100%;height:220px;border-top:1px solid #29466f}.kv{display:grid;grid-t
 function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 function fmtBytes(n){const x=Number(n||0);if(x<=0)return '0 B';const u=['B','KB','MB','GB','TB'];let i=0,v=x;while(v>=1024&&i<u.length-1){v/=1024;i++}return `${v.toFixed(v>=100?0:1)} ${u[i]}`}
 function mbps(v){return Number(v||0)*8/1000000}function num(v,d=2){const n=Number(v||0);return Number.isFinite(n)?n.toFixed(d):'0.00'}
+function semverCompare(left,right){const a=String(left||'').split(/[+-]/,1)[0].split('.').map(x=>Number(x)||0),b=String(right||'').split(/[+-]/,1)[0].split('.').map(x=>Number(x)||0);for(let i=0;i<Math.max(a.length,b.length);i++){const d=(a[i]||0)-(b[i]||0);if(d)return d>0?1:-1}return 0}
 function linePoints(values,max,w=900,h=220,pad=18){return values.map((v,i)=>`${i*(w/Math.max(1,values.length-1))},${(h-pad)-(Number(v||0)/Math.max(1,max))*(h-pad*2)}`).join(' ')}
 function drawChart(id,series){const svg=document.getElementById(id);const values=series.flatMap(x=>x.values);const max=Math.max(1,...values);let grid='';for(let i=0;i<=4;i++){const y=18+i*46;grid+=`<line x1='0' y1='${y}' x2='900' y2='${y}' stroke='#29466f' stroke-width='1'/>`}svg.innerHTML=grid+series.map(x=>`<polyline fill='none' stroke='${x.color}' stroke-width='2.5' points='${linePoints(x.values,max)}'/>`).join('')}
     function sourceText(runtime){if(runtime==='incus')return 'Incus 容器级 cgroup/OpenMetrics 与网络命名空间';if(runtime==='podman')return 'Podman 容器 stats 与网络命名空间';return 'Docker 仅提醒模式（不执行深度采集）'}
@@ -2713,7 +2796,8 @@ function drawChart(id,series){const svg=document.getElementById(id);const values
   const clientVersion=String(current?.agent_version||'unknown'),serverVersion=String(latestData.server_version||'dev');
   if(clientVersion!=='unknown'&&clientVersion!=='dev'&&clientVersion===serverVersion){version.className='version-pill ok';version.innerText=`Client / Server v${serverVersion}`}
   else if(clientVersion==='unknown'||clientVersion==='dev'){version.className='version-pill warn';version.innerText=`Client 版本未知 · Server ${serverVersion==='dev'?'dev':`v${serverVersion}`}`}
-      else{version.className='version-pill bad';version.innerText=`Client v${clientVersion} · Server v${serverVersion}`}
+  else if(semverCompare(clientVersion,serverVersion)>0){version.className='version-pill warn';version.innerText=`Client v${clientVersion} · Server v${serverVersion} 待更新`}
+  else{version.className='version-pill bad';version.innerText=`Client v${clientVersion} · 可更新至 v${serverVersion}`}
       renderDiagnostic(diagnosticData,runtime);
   if(current){status.innerHTML=`<span class='source'>${esc(sourceText(runtime))}</span>　最新采样 ${esc(current.timestamp_iso_utc8||'-')}${excludedSamples?`　已忽略 ${excludedSamples} 条旧版本口径样本`:''}${current.alerts?.stale?'　<span class="bad-text">当前离线或上报已过期</span>':''}`}
   else{status.className='status bad';status.innerText='未找到该容器的当前采样，仅显示保留的历史数据。'}

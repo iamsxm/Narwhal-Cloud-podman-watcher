@@ -136,8 +136,11 @@ sudo bash scripts/diagnose-server.sh
 Server 与 Client 必须使用同一个版本号。仓库根目录的 `VERSION` 是唯一版本源，安装器会把它写入两端环境配置，Client 每次上报也会携带自身版本。总览页每台主机的版本指示器含义如下：
 
 - `vX.Y.Z · 最新`：Client 与当前 Server 版本一致。
-- `Client vX.Y.Z · 应为 vA.B.C`：节点尚未更新到 Server 对应版本。
+- `Client vX.Y.Z · 可更新至 vA.B.C`：节点版本落后；Rust Client v1.6.33 及以上可在主机面板一键更新。
+- `Client vX.Y.Z · Server vA.B.C 待更新`：Client 比 Server 新，应先更新 Server，不应回退 Client。
 - `Client 版本未知`：旧版 Client 尚未携带版本；更新该节点并等待下一次上报即可。
+
+Rust Client v1.6.32 及更早版本尚未实现远程动作轮询，因此第一次升级到 v1.6.33 时，面板提供“复制首次升级命令”；完成这一次升级后，后续版本可直接使用“一键更新 Client”。
 
 以后每次功能或修复发布前都必须先提升语义化版本号，再提交代码：
 

@@ -35,6 +35,7 @@ class ServerRuntimeTests(unittest.TestCase):
         project: str = "",
         agent_version: str = "",
         timestamp: int | None = None,
+        agent_kind: str = "",
     ):
         now = timestamp or int(time.time())
         payload = {
@@ -46,6 +47,8 @@ class ServerRuntimeTests(unittest.TestCase):
         }
         if agent_version:
             payload["_agent_version"] = agent_version
+        if agent_kind:
+            payload["_agent_kind"] = agent_kind
         conn = sqlite3.connect(server.DB_PATH)
         conn.execute(
             """
@@ -85,6 +88,7 @@ class ServerRuntimeTests(unittest.TestCase):
         payload = {
             "host_id": "host",
             "agent_version": "1.0.0",
+            "agent_kind": "rust",
             "timestamp": now,
             "container_network": {"ipv4_ok": True, "ipv6_ok": False},
             "security": {
@@ -137,6 +141,7 @@ class ServerRuntimeTests(unittest.TestCase):
         latest_body = json.loads(server.latest().body)
         self.assertEqual(latest_body["server_version"], server.APP_VERSION)
         self.assertEqual(latest_body["items"][0]["agent_version"], "1.0.0")
+        self.assertEqual(latest_body["items"][0]["agent_kind"], "rust")
 
     def test_tls_ca_endpoint_authenticates_request_and_response(self):
         certificate = b"-----BEGIN CERTIFICATE-----\ntest-public-ca\n-----END CERTIFICATE-----\n"
@@ -224,6 +229,11 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("aria-labelledby", html)
         self.assertIn("/container-detail?", html)
         self.assertIn("versionBadge(latest.agent_version,d.server_version)", html)
+        self.assertIn("Server v${escapeHtml(server)} 待更新", html)
+        self.assertIn("可更新至 v${escapeHtml(server)}", html)
+        self.assertIn("/api/v1/hosts/${encodeURIComponent(host)}/update", html)
+        self.assertIn("复制首次升级命令", html)
+        self.assertIn("latest.agent_kind==='rust'", html)
         self.assertIn("容器安全与运行状态中心", html)
         self.assertIn("容器日志正常", html)
         self.assertIn("主机 IPv4", html)
@@ -1072,6 +1082,28 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertEqual(status["action"]["status"], "succeeded")
         self.assertEqual(status["sample"]["process_count"], 7)
         self.assertEqual(status["sample"]["agent_version"], "1.1.0")
+
+    def test_client_update_action_is_deduplicated(self):
+        self._insert("podman", 1, agent_version="1.6.33", agent_kind="rust")
+        conn = sqlite3.connect(server.DB_PATH)
+        conn.execute(
+            "INSERT INTO hosts(host_id,last_seen,agent_version) VALUES('host',1000,'1.0.0')"
+        )
+        conn.commit()
+        conn.close()
+
+        class State:
+            dashboard_user = "operator"
+
+        class UpdateRequest:
+            state = State()
+
+        first = json.loads(asyncio.run(server.request_client_update("host", UpdateRequest())).body)
+        second = json.loads(asyncio.run(server.request_client_update("host", UpdateRequest())).body)
+        self.assertTrue(first["queued"])
+        self.assertFalse(second["queued"])
+        self.assertEqual(first["action"]["id"], second["action"]["id"])
+        self.assertEqual(first["action"]["action_type"], "update_client")
 
     def test_container_detail_includes_on_demand_diagnostic_controls(self):
         html = server.container_detail_page()

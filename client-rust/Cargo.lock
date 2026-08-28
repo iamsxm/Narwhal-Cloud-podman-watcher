@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "narwhal-client"
-version = "1.6.32"
+version = "1.6.33"
 dependencies = [
  "chrono",
  "hex",

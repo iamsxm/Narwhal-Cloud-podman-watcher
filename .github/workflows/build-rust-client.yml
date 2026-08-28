@@ -47,14 +47,15 @@ jobs:
         if: ${{ !matrix.cross }}
         working-directory: ./client-rust
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo test --locked --target ${{ matrix.target }}
+          cargo build --locked --release --target ${{ matrix.target }}
           cp target/${{ matrix.target }}/release/narwhal-client ../${{ matrix.artifact_name }}
 
       - name: Build Cross ARM64 Musl
         if: ${{ matrix.cross }}
         working-directory: ./client-rust
         run: |
-          cross build --release --target ${{ matrix.target }}
+          cross build --locked --release --target ${{ matrix.target }}
           cp target/${{ matrix.target }}/release/narwhal-client ../${{ matrix.artifact_name }}
 
       - name: Upload Artifact

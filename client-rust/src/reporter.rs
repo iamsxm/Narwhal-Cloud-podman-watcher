@@ -1,9 +1,23 @@
 use crate::collector::ReportPayload;
 use hmac::{Hmac, Mac};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
+use std::io::Read;
 use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentAction {
+    pub id: u64,
+    pub action_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionPollResponse {
+    #[serde(default)]
+    actions: Vec<AgentAction>,
+}
 
 pub struct Reporter {
     server_url: String,
@@ -48,6 +62,67 @@ impl Reporter {
         } else {
             Err(format!("Server returned HTTP {}", res.status()))
         }
+    }
+
+    pub fn poll_actions(&self, host_id: &str) -> Result<Vec<AgentAction>, String> {
+        let response: ActionPollResponse = self.signed_post(
+            "/api/v1/actions/poll",
+            &serde_json::json!({"host_id": host_id}),
+        )?;
+        Ok(response.actions)
+    }
+
+    pub fn report_action_result(
+        &self,
+        action_id: u64,
+        host_id: &str,
+        succeeded: bool,
+        message: &str,
+    ) -> Result<(), String> {
+        let _: serde_json::Value = self.signed_post(
+            "/api/v1/actions/result",
+            &serde_json::json!({
+                "action_id": action_id,
+                "host_id": host_id,
+                "status": if succeeded { "succeeded" } else { "failed" },
+                "message": message,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn signed_post<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        payload: &T,
+    ) -> Result<R, String> {
+        let body = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
+        let timestamp = chrono::Utc::now().timestamp();
+        let signature = self.generate_signature(&body, timestamp);
+        let url = format!("{}{}", self.server_url, path);
+        let response = self
+            .agent
+            .post(&url)
+            .set("Content-Type", "application/json")
+            .set("X-Timestamp", &timestamp.to_string())
+            .set("X-Signature", &signature)
+            .send_bytes(&body)
+            .map_err(|error| format!("HTTP action request failed: {}", error))?;
+        let response_signature = response
+            .header("X-Narwhal-Response-Signature")
+            .unwrap_or("")
+            .to_string();
+        let mut response_body = Vec::new();
+        response
+            .into_reader()
+            .read_to_end(&mut response_body)
+            .map_err(|error| format!("action response read failed: {}", error))?;
+        let expected = self.generate_signature(&response_body, timestamp);
+        if response_signature.is_empty() || response_signature != expected {
+            return Err("invalid action response signature".to_string());
+        }
+        serde_json::from_slice(&response_body)
+            .map_err(|error| format!("action response JSON decode failed: {}", error))
     }
 
     fn generate_signature(&self, body: &[u8], ts: i64) -> String {

@@ -53,6 +53,7 @@ def report_agent_version(payload_json: str | None) -> str:
 app = FastAPI(title="Narwhal Container Monitor")
 
 _AGENT_ONLY_PATHS = {
+    "/health",
     "/api/v1/report",
     "/api/v1/tls/ca",
     "/api/v1/actions/poll",
@@ -305,6 +306,11 @@ def signed_json_response(payload: Dict[str, Any], request_timestamp: str, status
         media_type="application/json",
         headers={"X-Narwhal-Response-Signature": signature, "Cache-Control": "no-store"},
     )
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.get("/api/v1/tls/ca")

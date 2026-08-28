@@ -89,6 +89,9 @@ ip_to_int() {
 # 冲突判定：
 #   1) 宿主机任一非 loopback 网卡已配置该子网内的地址；
 #   2) 已存在指向该子网的路由（如其它私网 bridge）。
+# 注意：更新流程会先通过 `podman network exists` 复用同名网络并提前返回，
+# 因此这里无需跳过本项目网桥——否则会漏判与其它 Podman 网络（如默认 podman 网桥）
+# 的子网重叠，导致新建网络失败并错误回退到默认网络。
 subnet_conflicts() {
   local subnet="$1"
   local net="${subnet%/*}"
@@ -100,11 +103,6 @@ subnet_conflicts() {
   local iface addr addr_int
   while read -r iface addr; do
     [[ "$iface" == "lo" ]] && continue
-    # 跳过本项目自己创建/管理的网桥，避免把自身路由误判为冲突。
-    [[ "$iface" == "narwhal-monitor0" ]] && continue
-    case "$iface" in
-      *podman*|*narwhal*) continue ;;
-    esac
     addr="${addr%%/*}"
     case "$addr" in
       *:*) continue ;;  # 跳过 IPv6
@@ -115,10 +113,9 @@ subnet_conflicts() {
     fi
   done < <(ip -o -4 addr show 2>/dev/null | awk '{print $2, $4}')
 
-  # 已有指向该子网的路由（排除默认路由 0.0.0.0/0 及本项目自身网桥）。
+  # 已有指向该子网的路由（排除默认路由 0.0.0.0/0）。
   if ip route show to "$subnet" 2>/dev/null \
       | grep -v -E '^default' \
-      | grep -v -E '(dev (narwhal-monitor0|podman0)|dev [a-z]*podman|dev [a-z]*narwhal)' \
       | grep -q .; then
     return 0
   fi
@@ -147,7 +144,9 @@ ensure_narwhal_network() {
     return 0
   fi
 
-  # 候选子网，按顺序尝试，选择第一个不冲突的。
+  # 候选子网，按顺序尝试：先排除与宿主机冲突的子网，再实际创建；
+  # 若某个子网创建失败（例如与其它 Podman 网络子网重叠），继续尝试下一个，
+  # 而不是直接回退到默认网络，以保证专用网络能尽可能被创建出来。
   local -a candidates=(
     "10.233.0.0/16"
     "10.99.0.0/16"
@@ -158,29 +157,24 @@ ensure_narwhal_network() {
     "172.20.0.0/16"
     "172.28.0.0/16"
   )
-  local subnet=""
   local candidate=""
+  local create_err=""
   for candidate in "${candidates[@]}"; do
-    if ! subnet_conflicts "$candidate"; then
-      subnet="$candidate"
-      break
+    if subnet_conflicts "$candidate"; then
+      echo "[INFO] 候选子网 $candidate 与宿主机冲突，退避到下一个。"
+      continue
     fi
-    echo "[INFO] 候选子网 $candidate 与宿主机冲突，退避到下一个。"
+    create_err="$(podman network create --subnet "$candidate" "$NARWHAL_NETWORK_NAME" 2>&1)"
+    if [[ $? -eq 0 ]]; then
+      echo "[INFO] 已创建专用网络 $NARWHAL_NETWORK_NAME (subnet=$candidate)，规避与宿主机已有私网网卡冲突。"
+      return 0
+    fi
+    echo "[WARN] 候选子网 $candidate 创建失败：$create_err（尝试下一个）。"
   done
 
-  if [[ -z "$subnet" ]]; then
-    echo "[WARN] 所有候选子网均冲突，回退到 Podman 默认网络（可能存在私网冲突风险）。"
-    NARWHAL_NETWORK_NAME=""
-    return 0
-  fi
-
-  if ! podman network create "$NARWHAL_NETWORK_NAME" --subnet "$subnet" >/dev/null 2>&1; then
-    echo "[WARN] 创建专用网络 $NARWHAL_NETWORK_NAME ($subnet) 失败，回退到默认网络。"
-    NARWHAL_NETWORK_NAME=""
-    return 0
-  fi
-
-  echo "[INFO] 已创建专用网络 $NARWHAL_NETWORK_NAME (subnet=$subnet)，规避与宿主机已有私网网卡冲突。"
+  echo "[WARN] 所有候选子网均无法创建专用网络，回退到 Podman 默认网络（可能存在私网冲突风险）。"
+  NARWHAL_NETWORK_NAME=""
+  return 0
 }
 
 ask_with_default() {

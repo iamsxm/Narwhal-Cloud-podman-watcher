@@ -219,8 +219,8 @@ uninstall_narwhal_related() {
     done
 
     # 清理同仓库下可能存在的非 latest 标签镜像（例如手动指定了版本标签）。
-    remove_images_by_repository_pattern '^ghcr\.io/(narwhal-cloud|'"$owner"')/podman-watcher-server$'
-    remove_images_by_repository_pattern '^ghcr\.io/caddy-dns/cloudflare$'
+    remove_images_by_repository_pattern '^ghcr[.]io/(narwhal-cloud|'"$owner"')/podman-watcher-server$'
+    remove_images_by_repository_pattern '^ghcr[.]io/caddy-dns/cloudflare$'
   else
     echo "[WARN] 未检测到 podman，跳过容器/镜像删除，仅清理本项目配置目录。"
   fi

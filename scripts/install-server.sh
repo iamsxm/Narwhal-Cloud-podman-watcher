@@ -434,8 +434,10 @@ replace_server_container() {
 
   local new_id=""
   local attempt=""
+  local tried_default_net="no"
   for attempt in 1 2 3 4 5; do
     ensure_port_free "$host_port"
+    # 注意：不要写成 `... && break`，否则 podman run 失败时 set -e 会静默中止整个脚本。
     new_id="$(podman run -d --name "$CONTAINER_NAME" \
       --restart=always \
       "${net_args[@]}" \
@@ -443,15 +445,28 @@ replace_server_container() {
       --env-file "$SERVER_ENV_FILE" \
       -v "$SERVER_DATA_DIR:/data" \
       -v "$TLS_CA_EXPORT_DIR:/tls-ca:ro" \
-      "$image_name" 2>&1)" && break
+      "$image_name" 2>&1)" || true
+    new_id="$(printf '%s' "$new_id" | tr -d '[:space:]')"
     if [[ "$new_id" == *"address already in use"* ]]; then
       echo "[WARN] 端口 $host_port 仍被占用（尝试 $attempt/5），清理后重试..."
       podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
       sleep 3
       continue
     fi
-    echo "[ERROR] 新 Server 容器创建失败: $new_id"
-    exit 1
+    # 若使用专用网络创建容器失败，回退到默认网络再试一次。
+    # Caddy 以 --network host 反代 127.0.0.1:<host_port>，因此网络选择不影响后端可达性。
+    if [[ -n "$network_name" && "$tried_default_net" != "yes" && ! "$new_id" =~ ^[0-9a-fA-F]{12,}$ ]]; then
+      echo "[WARN] 使用专用网络 $network_name 创建 Server 容器失败（${new_id}），回退到默认网络重试。"
+      net_args=()
+      tried_default_net="yes"
+      podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+      continue
+    fi
+    if [[ ! "$new_id" =~ ^[0-9a-fA-F]{12,}$ ]]; then
+      echo "[ERROR] 新 Server 容器创建失败: $new_id"
+      exit 1
+    fi
+    break
   done
   if [[ -z "$new_id" ]]; then
     echo "[ERROR] 新 Server 容器创建失败（端口 $host_port 持续被占用）。"

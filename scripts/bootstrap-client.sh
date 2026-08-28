@@ -8,7 +8,7 @@ REPO_URL="${REPO_URL:-$REPO_URL_DEFAULT}"
 INSTALL_BASE_DIR="${INSTALL_BASE_DIR:-$INSTALL_BASE_DEFAULT}"
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  echo "[ERROR] 请使用 root 运行：sudo bash bootstrap-install.sh"
+  echo "[ERROR] 请使用 root 运行：sudo bash $0"
   exit 1
 fi
 
@@ -31,11 +31,11 @@ repo_dir="$INSTALL_BASE_DIR/$repo_name"
 if [[ -d "$repo_dir/.git" ]]; then
   echo "[INFO] 检测到已存在仓库，执行更新: $repo_dir"
   git -C "$repo_dir" fetch --all --prune
-  git -C "$repo_dir" pull --ff-only
+  git -C "$repo_dir" pull --ff-only || true
 else
   echo "[INFO] 克隆仓库到: $repo_dir"
   git clone "$REPO_URL" "$repo_dir"
 fi
 
-echo "[INFO] 启动一键安装脚本..."
-bash "$repo_dir/scripts/install.sh"
+echo "[INFO] 直接启动 Client 安装器..."
+bash "$repo_dir/scripts/install-client.sh" "${1:-install}"

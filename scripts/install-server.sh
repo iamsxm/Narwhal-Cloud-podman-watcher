@@ -391,6 +391,30 @@ ensure_port_free() {
   fi
 }
 
+# 解析一个可绑定的 Server 后端端口。
+# 优先复用期望端口（必要时清理遗留转发进程）；若实在无法释放（如被容器命名空间内
+# 的转发进程长期占用且无法归因），则改用新的随机空闲端口，确保 Server 容器必定能启动。
+# 客户端始终通过 HTTPS/443 访问，后端端口对客户端透明，切换端口不影响客户端连接。
+resolve_free_server_port() {
+  local desired="$1"
+  ensure_port_free "$desired"
+  if ! ss -ltnH "sport = :$desired" 2>/dev/null | grep -q .; then
+    echo "$desired"
+    return 0
+  fi
+  echo "[WARN] 端口 $desired 无法释放，改用新的随机空闲端口以避免 Server 无法启动。"
+  local candidate tries=0
+  while (( tries < 50 )); do
+    candidate="$(pick_random_port)"
+    if ! ss -ltnH "sport = :$candidate" 2>/dev/null | grep -q .; then
+      echo "$candidate"
+      return 0
+    fi
+    tries=$((tries + 1))
+  done
+  echo "$desired"
+}
+
 replace_server_container() {
   local image_name="$1"
   local port_binding="$2"
@@ -772,6 +796,8 @@ main() {
   image_source=$(echo "$image_source" | tr '[:upper:]' '[:lower:]')
   github_image="$(ask_with_default "GitHub image (for github source)" "$default_github_image")"
   port="$(ask_with_default "Server listen port" "$default_port")"
+  # 若期望端口被占用且无法释放，则改用新的随机空闲端口（对客户端透明）。
+  port="$(resolve_free_server_port "$port")"
   secret="$(ask_with_default "Shared secret (for client auth)" "$default_secret")"
   th="$(ask_with_default "Disk alert threshold percent" "$default_th")"
   if [[ "$MODE" == "update" ]]; then

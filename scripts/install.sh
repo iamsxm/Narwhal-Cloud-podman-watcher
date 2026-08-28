@@ -192,6 +192,9 @@ uninstall_narwhal_related() {
     remove_container_if_exists "narwhal-monitor-server"
     remove_container_if_exists "narwhal-monitor-caddy"
 
+    # 清理 Server 专用网络（忽略不存在/被其它容器占用的情况）。
+    podman network rm -f "narwhal-monitor-net" >/dev/null 2>&1 || true
+
     UNINSTALL_IMAGES_TO_REMOVE=(
       "narwhal-monitor-server:latest"
       "ghcr.io/narwhal-cloud/podman-watcher-server:latest"

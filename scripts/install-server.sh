@@ -11,6 +11,8 @@ TLS_CA_EXPORT_DIR="/opt/narwhal-monitor/tls-ca"
 CONTAINER_NAME="narwhal-monitor-server"
 TLS_CONTAINER_NAME="narwhal-monitor-caddy"
 DEPLOY_LOCK_FILE="/run/narwhal-monitor-server-deploy-v2.lock"
+# 专用网络：避免使用 Podman 默认 10.88.0.0/16，规避与宿主机已有私网网卡冲突。
+NARWHAL_NETWORK_NAME="narwhal-monitor-net"
 # shellcheck source=scripts/lib/interactive.sh
 source "$ROOT_DIR/scripts/lib/interactive.sh"
 
@@ -73,6 +75,105 @@ pick_random_port() {
   done
 
   echo "$fallback"
+}
+
+# 将 IPv4 地址转换为整数，便于做子网归属判断。
+ip_to_int() {
+  local ip="$1"
+  local a b c d
+  IFS='.' read -r a b c d <<<"$ip"
+  echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+}
+
+# 判断给定的子网是否与宿主机已有网卡/路由冲突。
+# 冲突判定：
+#   1) 宿主机任一非 loopback 网卡已配置该子网内的地址；
+#   2) 已存在指向该子网的路由（如其它私网 bridge）。
+subnet_conflicts() {
+  local subnet="$1"
+  local net="${subnet%/*}"
+  local prefix="${subnet#*/}"
+  local net_int mask_int
+  net_int="$(ip_to_int "$net")"
+  mask_int="$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))"
+
+  local iface addr addr_int
+  while read -r iface addr; do
+    [[ "$iface" == "lo" ]] && continue
+    addr="${addr%%/*}"
+    case "$addr" in
+      *:*) continue ;;  # 跳过 IPv6
+    esac
+    addr_int="$(ip_to_int "$addr")"
+    if (( (addr_int & mask_int) == (net_int & mask_int) )); then
+      return 0
+    fi
+  done < <(ip -o -4 addr show 2>/dev/null | awk '{print $2, $4}')
+
+  # 已有指向该子网的路由（排除默认路由 0.0.0.0/0）。
+  if ip route show to "$subnet" 2>/dev/null | grep -v -E '^default' | grep -q .; then
+    return 0
+  fi
+
+  return 1
+}
+
+# 确保存在专用的 Podman 网络，且子网不与宿主机已有私网冲突。
+# 通过 NARWHAL_NETWORK_NAME 返回网络名称（全局），并打印最终使用的子网。
+ensure_narwhal_network() {
+  if ! command -v podman >/dev/null 2>&1; then
+    echo "[WARN] 未检测到 podman，跳过专用网络创建，Server 将使用默认网络。"
+    NARWHAL_NETWORK_NAME=""
+    return 0
+  fi
+
+  # 已存在且子网未冲突，直接复用。
+  if podman network exists "$NARWHAL_NETWORK_NAME" >/dev/null 2>&1; then
+    local existing_subnet=""
+    existing_subnet="$(podman network inspect "$NARWHAL_NETWORK_NAME" \
+      --format '{{range .Subnets}}{{.Subnet}}{{end}}' 2>/dev/null || true)"
+    if [[ -n "$existing_subnet" ]] && ! subnet_conflicts "$existing_subnet"; then
+      echo "[INFO] 复用已存在的专用网络 $NARWHAL_NETWORK_NAME (subnet=$existing_subnet)。"
+      return 0
+    fi
+    echo "[WARN] 已存在的专用网络 $NARWHAL_NETWORK_NAME 子网 $existing_subnet 与宿主机冲突，重建中..."
+    podman network rm -f "$NARWHAL_NETWORK_NAME" >/dev/null 2>&1 || true
+  fi
+
+  # 候选子网，按顺序尝试，选择第一个不冲突的。
+  local -a candidates=(
+    "10.233.0.0/16"
+    "10.99.0.0/16"
+    "10.135.0.0/16"
+    "10.155.0.0/16"
+    "10.199.0.0/16"
+    "10.209.0.0/16"
+    "172.20.0.0/16"
+    "172.28.0.0/16"
+  )
+  local subnet=""
+  local candidate=""
+  for candidate in "${candidates[@]}"; do
+    if ! subnet_conflicts "$candidate"; then
+      subnet="$candidate"
+      break
+    fi
+    echo "[INFO] 候选子网 $candidate 与宿主机冲突，退避到下一个。"
+  done
+
+  if [[ -z "$subnet" ]]; then
+    echo "[WARN] 所有候选子网均冲突，回退到 Podman 默认网络（可能存在私网冲突风险）。"
+    NARWHAL_NETWORK_NAME=""
+    return 0
+  fi
+
+  if ! podman network create "$NARWHAL_NETWORK_NAME" --subnet "$subnet" >/dev/null 2>&1; then
+    echo "[WARN] 创建专用网络 $NARWHAL_NETWORK_NAME ($subnet) 失败，回退到默认网络。"
+    NARWHAL_NETWORK_NAME=""
+    return 0
+  fi
+
+  echo "[INFO] 已创建专用网络 $NARWHAL_NETWORK_NAME (subnet=$subnet)，规避与宿主机已有私网网卡冲突。"
 }
 
 ask_with_default() {
@@ -232,11 +333,18 @@ remove_container_for_replace() {
 replace_server_container() {
   local image_name="$1"
   local port_binding="$2"
+  local network_name="${3:-}"
   remove_container_for_replace "$CONTAINER_NAME" "Server"
+
+  local -a net_args=()
+  if [[ -n "$network_name" ]]; then
+    net_args=( --network "$network_name" )
+  fi
 
   local new_id=""
   if ! new_id="$(podman run -d --replace --name "$CONTAINER_NAME" \
     --restart=always \
+    "${net_args[@]}" \
     -p "$port_binding" \
     --env-file "$SERVER_ENV_FILE" \
     -v "$SERVER_DATA_DIR:/data" \
@@ -705,9 +813,12 @@ ENV
     port_binding="127.0.0.1:${port}:8080"
   fi
 
+  # 创建专用网络并规避与宿主机已有私网（如 10.88.0.0/16）的冲突。
+  ensure_narwhal_network
+
   # Keep the current Server available until the replacement image is ready, then
   # perform one serialized, verified and idempotent container replacement.
-  replace_server_container "$image_name" "$port_binding"
+  replace_server_container "$image_name" "$port_binding" "$NARWHAL_NETWORK_NAME"
 
   setup_tls_proxy "$tls_host" "$port" "$tls_enable" "$tls_email" "$tls_cert_mode" "$cloudflare_api_token" "$caddy_image"
   bash "$ROOT_DIR/scripts/setup-auto-update.sh" server "$ROOT_DIR"

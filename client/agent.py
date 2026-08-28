@@ -5190,19 +5190,39 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
     ]
     for pattern in patterns:
         quoted_pattern = shlex.quote(pattern)
+        # 彻底移除托管该进程的服务，避免 kill 后由服务管理器自动重启。
+        # 匹配方式：① systemd 单元文件名包含特征串（递归，含 .wants 软链）；
+        # ② 单元 ExecStart* 引用了特征串；③ init.d / OpenRC；④ supervisor；⑤ cron。
         script_parts.append(
-            "for unit_dir in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do "
-            "[ -d \"$unit_dir\" ] || continue; "
-            f"for unit in $(find \"$unit_dir\" -maxdepth 1 -iname {shlex.quote(pattern + '.service')} -print 2>/dev/null); do "
-            "[ -e \"$unit\" ] || [ -L \"$unit\" ] || continue; unit_name=${unit##*/}; "
-            "command -v systemctl >/dev/null 2>&1 && systemctl disable --now \"$unit_name\" >/dev/null 2>&1 || true; "
-            "if rm -f -- \"$unit\"; then removed_services=$((removed_services+1)); "
-            "else cleanup_errors=$((cleanup_errors+1)); fi; done; done; "
-            f"for init_file in $(find /etc/init.d -maxdepth 1 -iname {quoted_pattern} -print 2>/dev/null); do "
-            "[ -e \"$init_file\" ] || [ -L \"$init_file\" ] || continue; \"$init_file\" stop >/dev/null 2>&1 || true; "
-            "if rm -f -- \"$init_file\"; then removed_services=$((removed_services+1)); "
-            "else cleanup_errors=$((cleanup_errors+1)); fi; done; "
-            f"command -v rc-update >/dev/null 2>&1 && rc-update del {quoted_pattern} >/dev/null 2>&1 || true"
+            "_pat=" + pattern + ";\n"
+            "rem_unit() { "
+            "u=\"$1\"; [ -e \"$u\" ] || [ -L \"$u\" ] || return 0; "
+            "un=${u##*/}; "
+            "command -v systemctl >/dev/null 2>&1 && systemctl disable --now \"$un\" >/dev/null 2>&1 || true; "
+            "real=$(readlink -f \"$u\" 2>/dev/null || echo \"$u\"); "
+            "for t in \"$u\" \"$real\"; do "
+            "[ -e \"$t\" ] || [ -L \"$t\" ] || continue; "
+            "if rm -f -- \"$t\"; then removed_services=$((removed_services+1)); else cleanup_errors=$((cleanup_errors+1)); fi; "
+            "done; "
+            "};\n"
+            "for ud in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system /run/systemd/system; do "
+            "[ -d \"$ud\" ] || continue; "
+            "for u in $(find \"$ud\" -type f,l \\( -iname \"*${_pat}*.service\" -o -iname \"*${_pat}*.timer\" -o -iname \"*${_pat}*.socket\" -o -iname \"*${_pat}*.path\" \\) 2>/dev/null); do rem_unit \"$u\"; done; "
+            "for u in $(grep -rIl --include='*.service' --include='*.timer' --include='*.socket' \"${_pat}\" \"$ud\" 2>/dev/null); do "
+            "if grep -Eq \"ExecStart[^ ]*${_pat}|ExecStartPre[^ ]*${_pat}|ExecStartPost[^ ]*${_pat}\" \"$u\"; then rem_unit \"$u\"; fi; "
+            "done; "
+            "done; "
+            "for f in $(find /etc/init.d -maxdepth 2 -type f,l 2>/dev/null); do "
+            "if printf '%s' \"${f##*/}\" | grep -Fiq -- \"${_pat}\" || grep -Fiq -- \"${_pat}\" \"$f\" 2>/dev/null; then "
+            "\"$f\" stop >/dev/null 2>&1 || true; "
+            "if rm -f -- \"$f\"; then removed_services=$((removed_services+1)); else cleanup_errors=$((cleanup_errors+1)); fi; "
+            "fi; done; "
+            "command -v rc-update >/dev/null 2>&1 && rc-update del \"${_pat}\" >/dev/null 2>&1 || true; "
+            "for sc in $(grep -rIl --include='*.conf' \"${_pat}\" /etc/supervisor 2>/dev/null); do "
+            "if rm -f -- \"$sc\"; then removed_services=$((removed_services+1)); else cleanup_errors=$((cleanup_errors+1)); fi; done; "
+            "command -v supervisorctl >/dev/null 2>&1 && supervisorctl reread >/dev/null 2>&1 && supervisorctl update >/dev/null 2>&1 || true; "
+            "for cf in $(grep -rIl \"${_pat}\" /etc/cron.d /etc/cron.daily /etc/cron.hourly /var/spool/cron 2>/dev/null); do "
+            "grep -vF \"${_pat}\" \"$cf\" > \"$cf.tmp\" 2>/dev/null && mv -f \"$cf.tmp\" \"$cf\" || true; done"
         )
         if process_pids:
             for pid in process_pids:

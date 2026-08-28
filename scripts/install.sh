@@ -40,6 +40,13 @@ update_repo_self() {
     return
   fi
 
+  # 若脚本目录存在被跟踪的本地改动，先丢弃，否则 git pull --ff-only 会失败，
+  # 导致一直用旧的 install-server.sh 运行（例如旧的端口污染 bug 无法被修复）。
+  if [[ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=no)" ]]; then
+    echo "[WARN] 检测到脚本目录存在本地改动，先丢弃被跟踪的改动以便拉取最新安装脚本。"
+    git -C "$ROOT_DIR" checkout -- .
+  fi
+
   echo "[INFO] 更新安装脚本与仓库代码（git pull --ff-only）..."
   git -C "$ROOT_DIR" fetch --all --prune
   git -C "$ROOT_DIR" pull --ff-only

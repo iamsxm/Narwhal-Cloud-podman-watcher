@@ -201,6 +201,8 @@ load_kv_from_file() {
   [[ -f "$f" ]] || return 1
   awk -v k="$key" '
     {
+      gsub(/\r/, "")
+      pos = index($0, "=")
       pos = index($0, "=")
       if (pos > 0) {
         current_key = substr($0, 1, pos - 1)
@@ -397,6 +399,12 @@ ensure_port_free() {
 # 客户端始终通过 HTTPS/443 访问，后端端口对客户端透明，切换端口不影响客户端连接。
 resolve_free_server_port() {
   local desired="$1"
+  # 仅保留数字：防止 server-install.env 中的 PORT 被旧版本误写为诊断文本
+  # （如 "PORT=[WARN] ... 61912 ..."）后持续污染端口绑定。
+  desired="${desired//[^0-9]/}"
+  if [[ -z "$desired" ]]; then
+    desired="$(pick_random_port)"
+  fi
   ensure_port_free "$desired"
   if ! ss -ltnH "sport = :$desired" 2>/dev/null | grep -q .; then
     echo "$desired"

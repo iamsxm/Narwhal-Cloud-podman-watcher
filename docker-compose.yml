@@ -1,11 +1,6 @@
 services:
   narwhal-server:
-    build:
-      context: ./server
-      dockerfile: Dockerfile
-      args:
-        APP_VERSION: "1.6.25"
-    image: narwhal-monitor-server:latest
+    image: ghcr.io/iamsxm/podman-watcher-server:sha-2b2ca50
     container_name: narwhal-monitor-server
     restart: unless-stopped
     ports:

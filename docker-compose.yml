@@ -1,6 +1,6 @@
 services:
   narwhal-server:
-    image: ghcr.io/iamsxm/podman-watcher-server:sha-2b2ca50
+    image: ghcr.io/iamsxm/podman-watcher-server:latest
     container_name: narwhal-monitor-server
     restart: unless-stopped
     ports:

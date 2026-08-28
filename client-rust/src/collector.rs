@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ContainerDisk {
@@ -72,6 +73,7 @@ pub struct Collector {
     has_docker: bool,
     has_podman: bool,
     has_incus: bool,
+    prev_net_io: Mutex<HashMap<String, (u64, u64, i64)>>, // name -> (rx_bytes, tx_bytes, timestamp)
 }
 
 impl Collector {
@@ -88,6 +90,7 @@ impl Collector {
             has_docker: has_cmd("docker"),
             has_podman: has_cmd("podman"),
             has_incus: has_cmd("incus"),
+            prev_net_io: Mutex::new(HashMap::new()),
         }
     }
 
@@ -99,11 +102,11 @@ impl Collector {
         let auto = allowed_runtimes == "auto";
 
         if self.has_podman && (auto || allowed_runtimes.contains("podman")) {
-            self.collect_podman_containers(&mut containers);
+            self.collect_podman_containers(&mut containers, now);
         }
 
         if self.has_docker && (auto || allowed_runtimes.contains("docker")) && docker_mode != "off" {
-            self.collect_docker_containers(&mut containers, docker_mode == "full");
+            self.collect_docker_containers(&mut containers, docker_mode == "full", now);
         }
 
         if self.has_incus && (auto || allowed_runtimes.contains("incus")) {
@@ -125,6 +128,20 @@ impl Collector {
         }
     }
 
+    fn calculate_net_rates(&self, key: &str, cur_rx: u64, cur_tx: u64, now: i64) -> (f64, f64) {
+        let mut map = self.prev_net_io.lock().unwrap();
+        if let Some((prev_rx, prev_tx, prev_ts)) = map.get(key).copied() {
+            let dt = (now - prev_ts).max(1) as f64;
+            let rx_diff = cur_rx.saturating_sub(prev_rx) as f64;
+            let tx_diff = cur_tx.saturating_sub(prev_tx) as f64;
+            map.insert(key.to_string(), (cur_rx, cur_tx, now));
+            (rx_diff / dt, tx_diff / dt)
+        } else {
+            map.insert(key.to_string(), (cur_rx, cur_tx, now));
+            (0.0, 0.0)
+        }
+    }
+
     fn check_network(&self) -> NetworkStatus {
         let ipv4_ok = Command::new("curl")
             .args(["-4", "-s", "--max-time", "3", "https://ip.sb"])
@@ -141,7 +158,7 @@ impl Collector {
         NetworkStatus { ipv4_ok, ipv6_ok }
     }
 
-    fn collect_docker_containers(&self, out: &mut Vec<ContainerInfo>, is_full: bool) {
+    fn collect_docker_containers(&self, out: &mut Vec<ContainerInfo>, is_full: bool, now: i64) {
         let output = match Command::new("docker")
             .args(["ps", "--format", "{{json .}}"])
             .output()
@@ -187,6 +204,7 @@ impl Collector {
                 let mut mem_perc = 0.0;
                 let mut rx_bps = 0.0;
                 let mut tx_bps = 0.0;
+                let mut pids = 0;
 
                 if let Some(stats) = stats_map.get(&name) {
                     if let Some(cpu_str) = stats.get("CPUPerc").and_then(|c| c.as_str()) {
@@ -196,15 +214,25 @@ impl Collector {
                         mem_perc = mem_str.trim_end_matches('%').parse().unwrap_or(0.0);
                     }
                     if let Some(mem_usage) = stats.get("MemUsage").and_then(|m| m.as_str()) {
-                        if let Some((used_part, _)) = mem_usage.split_once('/') {
+                        if let Some((used_part, total_part)) = mem_usage.split_once('/') {
                             mem_bytes = parse_size_bytes(used_part.trim());
+                            let total_bytes = parse_size_bytes(total_part.trim());
+                            if mem_perc <= 0.0 && total_bytes > 0 {
+                                mem_perc = (mem_bytes as f64 / total_bytes as f64) * 100.0;
+                            }
                         }
                     }
                     if let Some(net_io) = stats.get("NetIO").and_then(|n| n.as_str()) {
                         if let Some((rx_part, tx_part)) = net_io.split_once('/') {
-                            rx_bps = parse_size_bytes(rx_part.trim()) as f64;
-                            tx_bps = parse_size_bytes(tx_part.trim()) as f64;
+                            let total_rx = parse_size_bytes(rx_part.trim());
+                            let total_tx = parse_size_bytes(tx_part.trim());
+                            let (r_bps, t_bps) = self.calculate_net_rates(&format!("docker:{}", name), total_rx, total_tx, now);
+                            rx_bps = r_bps;
+                            tx_bps = t_bps;
                         }
+                    }
+                    if let Some(pids_str) = stats.get("PIDs").and_then(|p| p.as_str()) {
+                        pids = pids_str.parse().unwrap_or(0);
                     }
                 }
 
@@ -219,7 +247,7 @@ impl Collector {
                     mem_percent: mem_perc,
                     net_rx_bps: rx_bps,
                     net_tx_bps: tx_bps,
-                    conn_count: 0,
+                    conn_count: pids,
                     disk: disk_info,
                     deep_sample: None,
                     image,
@@ -229,7 +257,7 @@ impl Collector {
         }
     }
 
-    fn collect_podman_containers(&self, out: &mut Vec<ContainerInfo>) {
+    fn collect_podman_containers(&self, out: &mut Vec<ContainerInfo>, now: i64) {
         let output = match Command::new("podman")
             .args(["ps", "--format", "json"])
             .output()
@@ -273,26 +301,49 @@ impl Collector {
             let mut mem_perc = 0.0;
             let mut rx_bps = 0.0;
             let mut tx_bps = 0.0;
+            let mut pids = 0;
 
             if let Some(stats) = stats_map.get(&name) {
                 if let Some(cpu) = stats.get("CPUPerc").and_then(|c| c.as_str()) {
                     cpu_perc = cpu.trim_end_matches('%').parse().unwrap_or(0.0);
                 } else if let Some(cpu_num) = stats.get("CPU").and_then(|c| c.as_f64()) {
                     cpu_perc = cpu_num;
+                } else if let Some(cpu_str) = stats.get("CPU").and_then(|c| c.as_str()) {
+                    cpu_perc = cpu_str.trim_end_matches('%').parse().unwrap_or(0.0);
                 }
+
                 if let Some(mem_p) = stats.get("MemPerc").and_then(|m| m.as_str()) {
                     mem_perc = mem_p.trim_end_matches('%').parse().unwrap_or(0.0);
+                } else if let Some(mem_p_num) = stats.get("MemPerc").and_then(|m| m.as_f64()) {
+                    mem_perc = mem_p_num;
                 }
+
                 if let Some(mem_u) = stats.get("MemUsage").and_then(|m| m.as_str()) {
-                    if let Some((used_part, _)) = mem_u.split_once('/') {
+                    if let Some((used_part, total_part)) = mem_u.split_once('/') {
                         mem_bytes = parse_size_bytes(used_part.trim());
+                        let total_bytes = parse_size_bytes(total_part.trim());
+                        if mem_perc <= 0.0 && total_bytes > 0 {
+                            mem_perc = (mem_bytes as f64 / total_bytes as f64) * 100.0;
+                        }
                     }
+                } else if let Some(mem_b) = stats.get("MemUsageBytes").and_then(|m| m.as_u64()) {
+                    mem_bytes = mem_b;
                 }
+
                 if let Some(net) = stats.get("NetIO").and_then(|n| n.as_str()) {
                     if let Some((rx_part, tx_part)) = net.split_once('/') {
-                        rx_bps = parse_size_bytes(rx_part.trim()) as f64;
-                        tx_bps = parse_size_bytes(tx_part.trim()) as f64;
+                        let total_rx = parse_size_bytes(rx_part.trim());
+                        let total_tx = parse_size_bytes(tx_part.trim());
+                        let (r_bps, t_bps) = self.calculate_net_rates(&format!("podman:{}", name), total_rx, total_tx, now);
+                        rx_bps = r_bps;
+                        tx_bps = t_bps;
                     }
+                }
+
+                if let Some(p) = stats.get("PIDs").and_then(|p| p.as_u64()) {
+                    pids = p;
+                } else if let Some(p_str) = stats.get("PIDs").and_then(|p| p.as_str()) {
+                    pids = p_str.parse().unwrap_or(0);
                 }
             }
 
@@ -307,7 +358,7 @@ impl Collector {
                 mem_percent: mem_perc,
                 net_rx_bps: rx_bps,
                 net_tx_bps: tx_bps,
-                conn_count: 0,
+                conn_count: pids,
                 disk: disk_info,
                 deep_sample: None,
                 image,

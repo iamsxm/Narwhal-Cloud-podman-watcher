@@ -375,6 +375,7 @@ wait_for_tls_http() {
   local host="$1"
   local attempt=""
   local status=""
+  local -a target_args=()
   if ! command -v curl >/dev/null 2>&1; then
     echo "[WARN] curl 不可用，跳过 TLS Proxy HTTP 健康检查。"
     return 0
@@ -384,9 +385,16 @@ wait_for_tls_http() {
     echo "[WARN] TLS host 为 IPv6，跳过本机 --resolve HTTP 检查。"
     return 0
   fi
+  if [[ "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    # curl 对 IP 字面量不发送 SNI；将 IP --resolve 到 127.0.0.1 会导致
+    # Caddy 无法选择 IP 证书并返回 TLS internal error，因此直接访问公网 IP。
+    target_args=( "https://${host}/" )
+  else
+    target_args=( --resolve "${host}:443:127.0.0.1" "https://${host}/" )
+  fi
   for attempt in $(seq 1 30); do
     status="$(curl --noproxy '*' --max-time 3 -k -sS -o /dev/null -w '%{http_code}' \
-      --resolve "${host}:443:127.0.0.1" "https://${host}/" 2>/dev/null || true)"
+      "${target_args[@]}" 2>/dev/null || true)"
     if [[ "$status" =~ ^[1-4][0-9][0-9]$ ]]; then
       echo "[OK] TLS Proxy HTTP 可达（https://${host}/，状态码 $status）。"
       return 0

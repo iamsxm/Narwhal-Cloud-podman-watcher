@@ -348,6 +348,42 @@ wait_for_port_free() {
   return 0
 }
 
+# 释放被遗留转发进程（pasta/conmon/netavark 等）占用的端口。
+# 仅清理容器运行时相关进程，避免误杀无关进程。
+free_port() {
+  local port="$1"
+  command -v ss >/dev/null 2>&1 || return 1
+  local attempt pid comm holders
+  for attempt in $(seq 1 10); do
+    holders="$(ss -ltnp "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | sed 's/pid=//' | sort -u)"
+    [[ -z "$holders" ]] && return 0
+    for pid in $holders; do
+      comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+      case "$comm" in
+        netavark|pasta|slirp4netns|conmon|rootlesskit|vpnkit|containerd*|podman*)
+          echo "[INFO] 释放端口 $port：终止遗留转发进程 pid=$pid ($comm)"
+          kill -TERM "$pid" 2>/dev/null || true
+          ;;
+        *)
+          echo "[WARN] 端口 $port 被非容器转发进程占用 (pid=$pid, $comm)，跳过自动清理。"
+          ;;
+      esac
+    done
+    sleep 1
+  done
+  return 1
+}
+
+# 等待端口释放；若仍被容器转发进程占用则主动清理后重试。
+ensure_port_free() {
+  local port="$1"
+  wait_for_port_free "$port"
+  if ss -ltnp "sport = :$port" 2>/dev/null | grep -q .; then
+    free_port "$port" || true
+    sleep 1
+  fi
+}
+
 replace_server_container() {
   local image_name="$1"
   local port_binding="$2"
@@ -366,7 +402,7 @@ replace_server_container() {
   local new_id=""
   local attempt=""
   for attempt in 1 2 3 4 5; do
-    wait_for_port_free "$host_port"
+    ensure_port_free "$host_port"
     new_id="$(podman run -d --name "$CONTAINER_NAME" \
       --restart=always \
       "${net_args[@]}" \

@@ -1,6 +1,6 @@
 [package]
 name = "narwhal-client"
-version = "1.6.30"
+version = "1.6.31"
 edition = "2021"
 authors = ["iamsxm"]
 description = "Lightweight Rust client for Narwhal Cloud Container Watcher"

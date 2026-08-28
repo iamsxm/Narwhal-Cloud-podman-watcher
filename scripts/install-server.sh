@@ -197,7 +197,6 @@ load_kv_from_file() {
     {
       gsub(/\r/, "")
       pos = index($0, "=")
-      pos = index($0, "=")
       if (pos > 0) {
         current_key = substr($0, 1, pos - 1)
         if (current_key == k) {
@@ -340,105 +339,214 @@ wait_for_port_free() {
   if ! command -v ss >/dev/null 2>&1; then
     return 0
   fi
-  while (( waited < 30 )); do
+  while (( waited < 15 )); do
     if ! ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
       return 0
     fi
     sleep 1
     waited=$((waited + 1))
   done
-  echo "[WARN] 端口 $port 在 30 秒内仍被占用，继续尝试创建容器。" >&2
+  echo "[WARN] 端口 $port 在 15 秒内仍被占用。" >&2
   return 0
 }
 
-# 释放被遗留转发进程（pasta/conmon/netavark 等）占用的端口。
-# 仅清理容器运行时相关进程，避免误杀无关进程。
-free_port() {
-  local port="$1"
-  command -v ss >/dev/null 2>&1 || return 1
-  local attempt pid comm holders
-  for attempt in $(seq 1 10); do
-    holders="$(ss -ltnp "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | sed 's/pid=//' | sort -u)"
-    [[ -z "$holders" ]] && return 0
-    for pid in $holders; do
-      comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
-      case "$comm" in
-        netavark|pasta|slirp4netns|conmon|rootlesskit|vpnkit|containerd*|podman*)
-          echo "[INFO] 释放端口 $port：终止遗留转发进程 pid=$pid ($comm)" >&2
-          kill -TERM "$pid" 2>/dev/null || true
-          ;;
-        *)
-          echo "[WARN] 端口 $port 被非容器转发进程占用 (pid=$pid, $comm)，跳过自动清理。" >&2
-          ;;
-      esac
-    done
+wait_for_backend_http() {
+  local host_port="$1"
+  local attempt=""
+  local status=""
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "[WARN] curl 不可用，跳过 Server 后端 HTTP 健康检查。"
+    return 0
+  fi
+  for attempt in $(seq 1 30); do
+    status="$(curl --max-time 2 -sS -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:${host_port}/" 2>/dev/null || true)"
+    if [[ "$status" =~ ^[1-4][0-9][0-9]$ ]]; then
+      echo "[OK] Server 后端 HTTP 可达（127.0.0.1:${host_port}，状态码 $status）。"
+      return 0
+    fi
     sleep 1
   done
+  echo "[ERROR] Server 容器虽显示运行，但后端端口 127.0.0.1:${host_port} 未返回 HTTP。"
   return 1
 }
 
-# 等待端口释放；若仍被容器转发进程占用则主动清理后重试。
-ensure_port_free() {
-  local port="$1"
-  wait_for_port_free "$port"
-  if ss -ltnp "sport = :$port" 2>/dev/null | grep -q .; then
-    free_port "$port" || true
+wait_for_tls_http() {
+  local host="$1"
+  local attempt=""
+  local status=""
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "[WARN] curl 不可用，跳过 TLS Proxy HTTP 健康检查。"
+    return 0
+  fi
+  # curl --resolve 的 IPv6 目标语法差异较大；Caddy 配置校验仍会覆盖该场景。
+  if [[ "$host" == *:* ]]; then
+    echo "[WARN] TLS host 为 IPv6，跳过本机 --resolve HTTP 检查。"
+    return 0
+  fi
+  for attempt in $(seq 1 30); do
+    status="$(curl --max-time 3 -k -sS -o /dev/null -w '%{http_code}' \
+      --resolve "${host}:443:127.0.0.1" "https://${host}/" 2>/dev/null || true)"
+    if [[ "$status" =~ ^[1-4][0-9][0-9]$ ]]; then
+      echo "[OK] TLS Proxy HTTP 可达（https://${host}/，状态码 $status）。"
+      return 0
+    fi
     sleep 1
+  done
+  echo "[ERROR] TLS Proxy 虽显示运行，但 https://${host}/ 未返回有效 HTTP。"
+  return 1
+}
+
+stage_container_replacement() {
+  local container_name="$1"
+  local display_name="$2"
+  local backup_name="${container_name}-rollback"
+
+  if podman container inspect "$backup_name" >/dev/null 2>&1; then
+    if ! podman container inspect "$container_name" >/dev/null 2>&1; then
+      echo "[WARN] 发现上次未完成的 $display_name 回滚容器，先恢复服务。"
+      podman rename "$backup_name" "$container_name"
+      podman start "$container_name" >/dev/null
+    else
+      podman rm -f "$backup_name" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if ! podman container inspect "$container_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "[INFO] 暂存现有 $display_name 容器用于失败回滚。"
+  if ! podman stop --time 10 "$container_name" >/dev/null; then
+    echo "[ERROR] 无法停止现有 $display_name 容器，保留原服务并中止更新。"
+    return 1
+  fi
+  if ! podman rename "$container_name" "$backup_name"; then
+    echo "[ERROR] 无法暂存现有 $display_name 容器，正在恢复原服务。"
+    podman start "$container_name" >/dev/null 2>&1 || true
+    return 1
   fi
 }
 
-# 解析一个可绑定的 Server 后端端口。
-# 优先复用期望端口（必要时清理遗留转发进程）；若实在无法释放（如被容器命名空间内
-# 的转发进程长期占用且无法归因），则改用新的随机空闲端口，确保 Server 容器必定能启动。
-# 客户端始终通过 HTTPS/443 访问，后端端口对客户端透明，切换端口不影响客户端连接。
-resolve_free_server_port() {
-  local desired="$1"
-  # 仅保留数字：防止 server-install.env 中的 PORT 被旧版本误写为诊断文本
-  # （如 "PORT=[WARN] ... 61912 ..."）后持续污染端口绑定。
-  desired="${desired//[^0-9]/}"
-  if [[ -z "$desired" ]]; then
-    desired="$(pick_random_port)"
-  fi
-  ensure_port_free "$desired"
-  if ! ss -ltnH "sport = :$desired" 2>/dev/null | grep -q .; then
-    echo "$desired"
-    return 0
-  fi
-  echo "[WARN] 端口 $desired 无法释放，改用新的随机空闲端口以避免 Server 无法启动。" >&2
-  local candidate tries=0
-  while (( tries < 50 )); do
-    candidate="$(pick_random_port)"
-    if ! ss -ltnH "sport = :$candidate" 2>/dev/null | grep -q .; then
-      echo "$candidate"
+rollback_container_replacement() {
+  local container_name="$1"
+  local display_name="$2"
+  local backup_name="${container_name}-rollback"
+  podman rm -f "$container_name" >/dev/null 2>&1 || true
+  if podman container inspect "$backup_name" >/dev/null 2>&1; then
+    echo "[WARN] $display_name 更新失败，正在自动恢复上一版本容器。"
+    if podman rename "$backup_name" "$container_name" \
+      && podman start "$container_name" >/dev/null; then
+      echo "[OK] 已恢复上一版本 $display_name 容器。"
       return 0
     fi
-    tries=$((tries + 1))
-  done
-  echo "$desired"
+    echo "[ERROR] 上一版本 $display_name 容器自动恢复失败，请检查 Podman 状态。"
+  fi
+  return 1
+}
+
+commit_container_replacement() {
+  local container_name="$1"
+  local backup_name="${container_name}-rollback"
+  podman rm -f "$backup_name" >/dev/null 2>&1 || true
+}
+
+restore_caddy_config() {
+  local caddyfile="$TLS_DIR/Caddyfile"
+  local backup="$TLS_DIR/Caddyfile.rollback"
+  rm -f "$TLS_DIR/Caddyfile.new"
+  if [[ -f "$backup" ]]; then
+    mv -f "$backup" "$caddyfile"
+  elif [[ -f "$TLS_DIR/Caddyfile.rollback.absent" ]]; then
+    rm -f "$caddyfile"
+  fi
+  rm -f "$TLS_DIR/Caddyfile.rollback.absent"
+}
+
+commit_caddy_config() {
+  rm -f "$TLS_DIR/Caddyfile.new" "$TLS_DIR/Caddyfile.rollback" \
+    "$TLS_DIR/Caddyfile.rollback.absent"
+}
+
+# 只接受合法 TCP 端口；旧配置若混入日志文本则重新选择随机端口，绝不拼接其中的数字。
+sanitize_server_port() {
+  local desired="$1"
+  if [[ "$desired" =~ ^[0-9]{1,5}$ ]] \
+    && (( 10#$desired >= 1024 && 10#$desired <= 65535 )); then
+    echo "$((10#$desired))"
+    return
+  fi
+  echo "[WARN] Server 后端端口配置无效，改用新的随机空闲端口。" >&2
+  pick_random_port
+}
+
+verify_server_image_version() {
+  local image_name="$1"
+  local image_version=""
+  # metadata-action 会把 OCI version 标签写成 latest，因此读取镜像实际运行环境。
+  image_version="$(podman image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$image_name" 2>/dev/null \
+    | awk -F= '$1=="NARWHAL_VERSION"{print substr($0,index($0,"=")+1);exit}')"
+  if [[ "$image_version" != "$PROJECT_VERSION" ]]; then
+    echo "[ERROR] Server 镜像版本不匹配: image=${image_version:-未知}, expected=$PROJECT_VERSION"
+    echo "[INFO] 保留当前 Server 容器；请等待 GHCR 对应版本构建完成后重试。"
+    exit 1
+  fi
 }
 
 replace_server_container() {
   local image_name="$1"
   local port_binding="$2"
   local network_name="${3:-}"
-  remove_container_for_replace "$CONTAINER_NAME" "Server"
-
+  RESOLVED_SERVER_PORT=""
+  RESOLVED_SERVER_BINDING="$port_binding"
   local -a net_args=()
   if [[ -n "$network_name" ]]; then
     net_args=( --network "$network_name" )
   fi
 
-  # 提取发布端口的主机端口（如 127.0.0.1:61912:8080 -> 61912）。
-  local pb="${port_binding#*:}"
-  local host_port="${pb%%:*}"
+  # 提取发布端口，兼容 61912:8080 与 127.0.0.1:61912:8080。
+  local bind_host=""
+  local host_port=""
+  local container_port=""
+  local -a binding_parts=()
+  IFS=':' read -r -a binding_parts <<<"$port_binding"
+  if (( ${#binding_parts[@]} == 2 )); then
+    host_port="${binding_parts[0]}"
+    container_port="${binding_parts[1]}"
+  elif (( ${#binding_parts[@]} == 3 )); then
+    bind_host="${binding_parts[0]}"
+    host_port="${binding_parts[1]}"
+    container_port="${binding_parts[2]}"
+  else
+    echo "[ERROR] 无效的 Server 端口绑定: $port_binding"
+    exit 1
+  fi
+
+  if ! stage_container_replacement "$CONTAINER_NAME" "Server"; then
+    exit 1
+  fi
+  wait_for_port_free "$host_port"
+  if command -v ss >/dev/null 2>&1 \
+    && ss -ltnH "sport = :$host_port" 2>/dev/null | grep -q .; then
+    local replacement_port=""
+    replacement_port="$(pick_random_port)"
+    echo "[WARN] 旧 Server 删除后端口 $host_port 仍被占用；不会终止宿主机进程，改用端口 $replacement_port。"
+    host_port="$replacement_port"
+    if [[ -n "$bind_host" ]]; then
+      port_binding="${bind_host}:${host_port}:${container_port}"
+    else
+      port_binding="${host_port}:${container_port}"
+    fi
+  fi
+  RESOLVED_SERVER_PORT="$host_port"
+  RESOLVED_SERVER_BINDING="$port_binding"
 
   local new_id=""
   local attempt=""
   local tried_default_net="no"
   for attempt in 1 2 3 4 5; do
-    ensure_port_free "$host_port"
     # 注意：不要写成 `... && break`，否则 podman run 失败时 set -e 会静默中止整个脚本。
-    new_id="$(podman run -d --name "$CONTAINER_NAME" \
+    new_id="$(podman run -d --cgroups=split --name "$CONTAINER_NAME" \
       --restart=always \
       "${net_args[@]}" \
       -p "$port_binding" \
@@ -448,8 +556,19 @@ replace_server_container() {
       "$image_name" 2>&1)" || true
     new_id="$(printf '%s' "$new_id" | tr -d '[:space:]')"
     if [[ "$new_id" == *"address already in use"* ]]; then
-      echo "[WARN] 端口 $host_port 仍被占用（尝试 $attempt/5），清理后重试..."
+      local retry_port=""
+      retry_port="$(pick_random_port)"
+      echo "[WARN] 端口 $host_port 出现并发占用（尝试 $attempt/5）；不会清理宿主机进程，改用端口 $retry_port。"
       podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+      host_port="$retry_port"
+      if [[ -n "$bind_host" ]]; then
+        port_binding="${bind_host}:${host_port}:${container_port}"
+      else
+        port_binding="${host_port}:${container_port}"
+      fi
+      RESOLVED_SERVER_PORT="$host_port"
+      RESOLVED_SERVER_BINDING="$port_binding"
+      new_id=""
       sleep 3
       continue
     fi
@@ -464,12 +583,14 @@ replace_server_container() {
     fi
     if [[ ! "$new_id" =~ ^[0-9a-fA-F]{12,}$ ]]; then
       echo "[ERROR] 新 Server 容器创建失败: $new_id"
+      rollback_container_replacement "$CONTAINER_NAME" "Server" || true
       exit 1
     fi
     break
   done
-  if [[ -z "$new_id" ]]; then
+  if [[ ! "$new_id" =~ ^[0-9a-fA-F]{12,}$ ]]; then
     echo "[ERROR] 新 Server 容器创建失败（端口 $host_port 持续被占用）。"
+    rollback_container_replacement "$CONTAINER_NAME" "Server" || true
     exit 1
   fi
   echo "$new_id"
@@ -486,16 +607,24 @@ replace_server_container() {
     )"
     if [[ "$running" == "true" ]]; then
       if [[ "$runtime_version" != "$PROJECT_VERSION" ]]; then
-        echo "[WARN] Server 容器已运行，但版本标识为 v${runtime_version:-未知}（期望 v$PROJECT_VERSION）；版本校验不影响服务，继续部署 Caddy。"
-      else
-        echo "[OK] Server 容器已运行，版本 v$runtime_version。"
+        echo "[ERROR] Server 运行版本不匹配: runtime=${runtime_version:-未知}, expected=$PROJECT_VERSION"
+        podman logs --tail 120 "$CONTAINER_NAME" 2>&1 || true
+        rollback_container_replacement "$CONTAINER_NAME" "Server" || true
+        exit 1
       fi
+      if ! wait_for_backend_http "$host_port"; then
+        podman logs --tail 120 "$CONTAINER_NAME" 2>&1 || true
+        rollback_container_replacement "$CONTAINER_NAME" "Server" || true
+        exit 1
+      fi
+      echo "[OK] Server 容器已运行，版本 v$runtime_version。"
       return
     fi
     sleep 1
   done
   echo "[ERROR] Server 容器启动失败: running=${running:-unknown}。"
   podman logs --tail 120 "$CONTAINER_NAME" 2>&1 || true
+  rollback_container_replacement "$CONTAINER_NAME" "Server" || true
   exit 1
 }
 
@@ -508,10 +637,11 @@ setup_tls_proxy() {
   local cloudflare_api_token="$6"
   local caddy_image="$7"
 
-  remove_container_for_replace "$TLS_CONTAINER_NAME" "TLS Proxy"
   mkdir -p "$TLS_CA_EXPORT_DIR"
 
   if [[ "$enable_tls" != "yes" ]]; then
+    remove_container_for_replace "$TLS_CONTAINER_NAME" "TLS Proxy"
+    commit_caddy_config
     rm -f "$TLS_CA_EXPORT_DIR/root.crt"
     return
   fi
@@ -523,7 +653,8 @@ setup_tls_proxy() {
     host_is_ip="yes"
   fi
 
-  local caddyfile="$TLS_DIR/Caddyfile"
+  local caddyfile="$TLS_DIR/Caddyfile.new"
+  rm -f "$caddyfile"
   if [[ "$tls_cert_mode" == "internal" || "$host_is_ip" == "yes" ]]; then
     cat >"$caddyfile" <<CADDY
 https://$host {
@@ -535,7 +666,8 @@ CADDY
     if [[ "$tls_cert_mode" == "cloudflare_dns" ]]; then
       if [[ -z "$cloudflare_api_token" ]]; then
         echo "[ERROR] TLS cert mode 'cloudflare_dns' requires Cloudflare API token."
-        exit 1
+        rm -f "$caddyfile"
+        return 1
       fi
       cat >"$caddyfile" <<CADDY
 {
@@ -593,7 +725,8 @@ CADDY
       echo "[ERROR] Unable to pull Cloudflare DNS Caddy image."
       echo "        Tried: ${cf_caddy_candidates[*]}"
       echo "        Please verify network access / registry reachability, or set tls_cert_mode=auto/internal."
-      exit 1
+      rm -f "$caddyfile"
+      return 1
     fi
     caddy_image="$selected_image"
   fi
@@ -620,12 +753,26 @@ CADDY
     echo "[ERROR] 无法获取任何 Caddy 镜像（docker.io 可能不可达且本地无缓存）。"
     echo "[ERROR] 请检查 registry 可达性，或配置 podman 镜像加速器（如 docker.m.daocloud.io）后重试。"
     echo "[ERROR] 调试：尝试手动拉取 -> podman pull docker.io/library/caddy:2"
-    exit 1
+    rm -f "$caddyfile"
+    return 1
   fi
   caddy_image="$chosen_caddy"
 
+  if [[ -f "$TLS_DIR/Caddyfile" ]]; then
+    cp -p "$TLS_DIR/Caddyfile" "$TLS_DIR/Caddyfile.rollback"
+    rm -f "$TLS_DIR/Caddyfile.rollback.absent"
+  else
+    rm -f "$TLS_DIR/Caddyfile.rollback"
+    : >"$TLS_DIR/Caddyfile.rollback.absent"
+  fi
+  mv -f "$caddyfile" "$TLS_DIR/Caddyfile"
+  if ! stage_container_replacement "$TLS_CONTAINER_NAME" "TLS Proxy"; then
+    restore_caddy_config
+    return 1
+  fi
+
   local -a podman_args=(
-    run -d --replace --name "$TLS_CONTAINER_NAME"
+    run -d --cgroups=split --name "$TLS_CONTAINER_NAME"
     --restart=always
     --network host
     -v "$TLS_DIR/Caddyfile:/etc/caddy/Caddyfile:ro"
@@ -641,7 +788,9 @@ CADDY
   if ! tls_container_id="$(podman "${podman_args[@]}" 2>&1)"; then
     echo "[ERROR] TLS Proxy 容器创建失败: ${tls_container_id}"
     echo "[ERROR] 调试：请手动运行上述等价命令查看完整报错，或执行 podman logs $TLS_CONTAINER_NAME 查看 Caddy 启动日志。"
-    exit 1
+    restore_caddy_config
+    rollback_container_replacement "$TLS_CONTAINER_NAME" "TLS Proxy" || true
+    return 1
   fi
   echo "$tls_container_id"
 
@@ -657,11 +806,19 @@ CADDY
   if [[ "$tls_running" != "true" ]]; then
     echo "[ERROR] TLS Proxy 容器未能进入运行状态。"
     podman logs --tail 100 "$TLS_CONTAINER_NAME" 2>&1 || true
-    exit 1
+    restore_caddy_config
+    rollback_container_replacement "$TLS_CONTAINER_NAME" "TLS Proxy" || true
+    return 1
   fi
   if ! podman exec "$TLS_CONTAINER_NAME" caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
     echo "[WARN] TLS Proxy 配置校验未通过（若容器已在运行通常不影响实际服务）；日志如下："
     podman logs --tail 100 "$TLS_CONTAINER_NAME" 2>&1 || true
+  fi
+  if ! wait_for_tls_http "$host"; then
+    podman logs --tail 100 "$TLS_CONTAINER_NAME" 2>&1 || true
+    restore_caddy_config
+    rollback_container_replacement "$TLS_CONTAINER_NAME" "TLS Proxy" || true
+    return 1
   fi
   echo "[OK] TLS Proxy 容器已运行。"
 
@@ -673,15 +830,21 @@ CADDY
         install -m 0644 "$generated_root" "$TLS_CA_EXPORT_DIR/root.crt.tmp"
         mv -f "$TLS_CA_EXPORT_DIR/root.crt.tmp" "$TLS_CA_EXPORT_DIR/root.crt"
         echo "[OK] Internal TLS CA exported for authenticated Client bootstrap."
+        commit_container_replacement "$TLS_CONTAINER_NAME"
+        commit_caddy_config
         return
       fi
       sleep 1
     done
     echo "[ERROR] Caddy internal CA was not generated within 30 seconds."
     podman logs --tail 100 "$TLS_CONTAINER_NAME" 2>&1 || true
+    restore_caddy_config
+    rollback_container_replacement "$TLS_CONTAINER_NAME" "TLS Proxy" || true
     return 1
   fi
   rm -f "$TLS_CA_EXPORT_DIR/root.crt"
+  commit_container_replacement "$TLS_CONTAINER_NAME"
+  commit_caddy_config
 }
 
 replace_kv_in_file() {
@@ -843,8 +1006,7 @@ main() {
   image_source=$(echo "$image_source" | tr '[:upper:]' '[:lower:]')
   github_image="$(ask_with_default "GitHub image (for github source)" "$default_github_image")"
   port="$(ask_with_default "Server listen port" "$default_port")"
-  # 若期望端口被占用且无法释放，则改用新的随机空闲端口（对客户端透明）。
-  port="$(resolve_free_server_port "$port")"
+  port="$(sanitize_server_port "$port")"
   secret="$(ask_with_default "Shared secret (for client auth)" "$default_secret")"
   th="$(ask_with_default "Disk alert threshold percent" "$default_th")"
   if [[ "$MODE" == "update" ]]; then
@@ -967,11 +1129,28 @@ ENV
   # 创建专用网络并规避与宿主机已有私网（如 10.88.0.0/16）的冲突。
   ensure_narwhal_network
 
+  # 镜像版本必须与安装脚本一致；校验发生在删除当前 Server 之前。
+  verify_server_image_version "$image_name"
+
   # Keep the current Server available until the replacement image is ready, then
   # perform one serialized, verified and idempotent container replacement.
   replace_server_container "$image_name" "$port_binding" "$NARWHAL_NETWORK_NAME"
+  local resolved_port_changed="no"
+  if [[ "$RESOLVED_SERVER_PORT" != "$port" ]]; then
+    port="$RESOLVED_SERVER_PORT"
+    port_binding="$RESOLVED_SERVER_BINDING"
+    resolved_port_changed="yes"
+  fi
 
-  setup_tls_proxy "$tls_host" "$port" "$tls_enable" "$tls_email" "$tls_cert_mode" "$cloudflare_api_token" "$caddy_image"
+  if ! setup_tls_proxy "$tls_host" "$port" "$tls_enable" "$tls_email" "$tls_cert_mode" "$cloudflare_api_token" "$caddy_image"; then
+    rollback_container_replacement "$CONTAINER_NAME" "Server" || true
+    echo "[ERROR] TLS Proxy 部署失败，Server 已回滚到上一版本。"
+    exit 1
+  fi
+  if [[ "$resolved_port_changed" == "yes" ]]; then
+    replace_kv_in_file "$SERVER_INSTALL_ENV_FILE" PORT "$port"
+  fi
+  commit_container_replacement "$CONTAINER_NAME"
   bash "$ROOT_DIR/scripts/setup-auto-update.sh" server "$ROOT_DIR"
 
   if [[ "$tls_enable" == "yes" ]]; then

@@ -123,6 +123,12 @@ sudo env SKIP_CLEANUP_ON_UPDATE=1 bash scripts/install.sh
 
 更新完成后，用首次部署后的检查命令确认 Server 与 Client 正常运行。若 `git pull --ff-only` 报错，请先处理仓库中的本地修改或分支分叉，不要使用会覆盖配置或代码的强制重置命令。
 
+一键安装器中可选择 `诊断 Server（只读）`。该操作不重启、不删除也不修改容器，会集中显示更新单元、Podman 数据库、libpod scope、端口、HTTP 健康、脱敏配置及最近日志；也可直接运行：
+
+```bash
+sudo bash scripts/diagnose-server.sh
+```
+
 人工执行 Server 的 `install` 或 `update` 时，安装摘要会直接显示当前 `Dashboard Username` 和 `Dashboard Password`。systemd 后台自动更新会隐藏这些凭据，避免密码进入自动更新日志。
 
 ### 版本发布规则
@@ -164,16 +170,20 @@ sudo bash scripts/install-server.sh reset-password
 Timer 每 15 分钟比较 GitHub `origin/main` 与已部署提交。自动更新具有以下保护：
 
 - 仓库存在已跟踪的本地修改、分支分叉或不能 fast-forward 时拒绝更新，不会强制覆盖。
+- Server 后端端口只接受 `1024-65535` 的纯数字；旧配置污染或旧容器删除后端口仍被占用时，会选择新的随机空闲端口并同步 Caddy/安装配置，不会终止宿主机上的 Podman、conmon、pasta 或其他业务进程。
+- Server 镜像内的 `NARWHAL_VERSION` 必须与仓库 `VERSION` 一致，校验发生在删除当前 Server 容器之前；版本不一致时保留现有服务并等待正确镜像。
+- Server 与 Caddy 使用事务式容器替换：旧容器先停止并改名为临时回滚副本，新容器运行及版本/TLS 校验成功后才删除副本；创建或启动失败会自动恢复上一版本，避免更新失败后长期出现 502。
 - Server 使用 GHCR 镜像时，会核对镜像的提交 revision；新提交对应的多架构镜像未构建完成时保留现有容器，稍后重试。
 - Server 同时核对状态文件、Git 提交与容器内 `NARWHAL_VERSION`；状态文件显示最新但容器仍为旧版时，会识别为 `deployment drift` 并重新部署。
-- Server 手动安装与后台自动更新共用独占部署锁，防止两个流程同时替换容器。镜像准备完成后，会复检并删除旧的同名容器，使用 Podman `--replace` 幂等创建新容器，再确认容器运行状态及 `NARWHAL_VERSION`；删除、启动或版本校验失败都会明确停止并输出诊断，不再吞掉错误后继续执行。
-- Server TLS Proxy（Caddy）与主容器共用该部署锁和幂等替换流程；更新会保留 Caddy 数据卷中的证书，确认旧代理容器名称释放后以 `--replace` 重建，并验证代理容器进入运行状态。
+- Server 手动安装与后台自动更新共用独占部署锁，防止两个流程同时替换容器。镜像准备完成后，旧容器会先改名暂存，新容器使用独立 cgroup 创建并接受版本、运行状态及真实 HTTP 检查；失败时恢复暂存容器，不依赖 `--replace` 覆盖正在运行的实例。
+- Server TLS Proxy（Caddy）与主容器共用部署锁和事务替换流程；更新会保留 Caddy 数据卷中的证书，并同时回滚旧代理容器与旧 Caddyfile。
 - 手工更新恰好与后台自动更新重叠时，安装器会明确显示部署锁等待原因，每 30 秒报告进度；后台流程结束后自动继续，最长等待 5 分钟，不再停在 `Already up to date.` 后看似无响应。
 - 部署锁由独立的 `flock --close` 进程持有，安装脚本及 Podman/Caddy 子进程不会继承锁文件描述符；这避免了容器后台监控进程在安装结束后继续占锁。新版使用 `narwhal-monitor-server-deploy-v2.lock`，可直接避开旧版本已经泄漏的锁 inode。
 - Client 更新前通过 HMAC 签名接口 `/api/v1/update/version` 核对 Server 的实际运行版本。Server 未升级、接口尚不可用或暂时无法连接时，Client 保持原版本并在下个 timer 周期自动重试。
 - 首次人工安装 Client 时，若目标是尚无版本接口的旧 Server（旧版会返回 HTTP 401），安装器会明确警告并继续安装；这是为了避免新节点无法部署。后续自动更新仍执行严格的 Server-first 门禁。
 - 更新成功才写入部署版本；失败会保留当前服务，并在下一周期重试。
-- 自动更新 systemd oneshot 的启动超时为 30 分钟，覆盖 GHCR 多架构镜像最长约 15 分钟的等待窗口，避免 systemd 默认短超时提前终止正常更新。
+- 自动更新 systemd oneshot 的启动超时为 30 分钟，覆盖 GHCR 多架构镜像最长约 15 分钟的等待窗口；更新单元使用 `KillMode=process`，Server/Caddy 容器显式使用独立 cgroup，避免 oneshot 退出时 systemd 误杀 Podman `conmon` 并留下孤立容器进程。
+- Server 更新不是只检查 Podman 的 `Running=true`：安装器还会校验镜像/运行时版本并实际访问回环后端 HTTP。Server 或 Caddy 任一步失败时，自动恢复上一版本容器和 Caddy 配置。
 - 原有共享密钥、Dashboard 登录凭据、TLS 配置、数据库、Client CA 和节点域名白名单均保留。
 
 查看自动更新状态和审计日志：
@@ -192,7 +202,7 @@ sudo tail -n 100 /opt/narwhal-monitor/client-auto-update.log
 
 ```bash
 sudo mkdir -p /etc/systemd/system/narwhal-monitor-server-update.service.d
-printf '[Service]\nTimeoutStartSec=30min\nTimeoutStopSec=2min\n' | \
+printf '[Service]\nKillMode=process\nDelegate=yes\nTimeoutStartSec=30min\nTimeoutStopSec=2min\n' | \
   sudo tee /etc/systemd/system/narwhal-monitor-server-update.service.d/timeout.conf >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl reset-failed narwhal-monitor-server-update.service

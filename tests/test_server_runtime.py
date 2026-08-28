@@ -260,6 +260,8 @@ class ServerRuntimeTests(unittest.TestCase):
         client_installer = (ROOT / "scripts" / "install-client.sh").read_text(encoding="utf-8")
         server_installer = (ROOT / "scripts" / "install-server.sh").read_text(encoding="utf-8")
         self.assertIn('os.getenv("NARWHAL_VERSION", "dev")', agent_source)
+        self.assertIn('"_pat=" + quoted_pattern', agent_source)
+        self.assertNotIn('"_pat=" + pattern', agent_source)
         self.assertIn('os.getenv("NARWHAL_VERSION", "dev")', server_source)
         self.assertIn("NARWHAL_VERSION=$PROJECT_VERSION", client_installer)
         self.assertIn("ALERT_INBOUND_UNIQUE_IPS=$inbound_unique_ips", client_installer)
@@ -295,6 +297,8 @@ class ServerRuntimeTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("TimeoutStartSec=30min", setup)
+        self.assertIn("KillMode=process", setup)
+        self.assertIn("Delegate=yes", setup)
         self.assertIn("for _ in $(seq 1 30)", updater)
         self.assertIn("sleep 30", updater)
         self.assertIn("deployment drift detected", updater)
@@ -305,13 +309,28 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertNotIn('exec 9>"$DEPLOY_LOCK_FILE"', server_installer)
         self.assertIn("仍在等待其他部署完成", server_installer)
         self.assertIn("部署锁现已释放", server_installer)
-        self.assertIn("podman run -d --replace", server_installer)
+        self.assertIn("podman run -d --cgroups=split", server_installer)
+        self.assertNotIn("podman run -d --replace", server_installer)
         self.assertIn("容器仍占用名称", server_installer)
-        self.assertIn("Server 容器启动或版本验证失败", server_installer)
+        self.assertIn("Server 容器启动失败", server_installer)
+        self.assertIn("Server 运行版本不匹配", server_installer)
+        self.assertIn("Server 镜像版本不匹配", server_installer)
+        self.assertIn("sanitize_server_port", server_installer)
+        self.assertIn("wait_for_backend_http", server_installer)
+        self.assertIn("wait_for_tls_http", server_installer)
+        self.assertIn("不会终止宿主机进程", server_installer)
+        self.assertNotIn("kill -TERM", server_installer)
         self.assertIn('remove_container_for_replace "$TLS_CONTAINER_NAME" "TLS Proxy"', server_installer)
-        self.assertIn('run -d --replace --name "$TLS_CONTAINER_NAME"', server_installer)
+        self.assertIn('run -d --cgroups=split --name "$TLS_CONTAINER_NAME"', server_installer)
         self.assertIn("TLS Proxy 容器未能进入运行状态", server_installer)
         self.assertIn('caddy validate --config /etc/caddy/Caddyfile', server_installer)
+        self.assertIn("stage_container_replacement", server_installer)
+        self.assertIn("rollback_container_replacement", server_installer)
+        self.assertIn("TLS Proxy 部署失败，Server 已回滚", server_installer)
+        install_entry = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+        self.assertNotIn("git -C \"$REPO_DIR\" checkout -- .", updater)
+        self.assertNotIn("git -C \"$ROOT_DIR\" checkout -- .", install_entry)
+        self.assertIn("refusing automatic update to preserve operator changes", updater)
 
     def test_install_menus_support_arrows_and_numeric_choices(self):
         interactive = (ROOT / "scripts" / "lib" / "interactive.sh").read_text(
@@ -324,6 +343,14 @@ class ServerRuntimeTests(unittest.TestCase):
         self.assertIn("'[B'", interactive)
         self.assertIn('action="$(narwhal_choose', installer)
         self.assertIn('mode="$(narwhal_choose', installer)
+        self.assertIn("diagnose-server|诊断 Server（只读）", installer)
+        diagnostic = (ROOT / "scripts" / "diagnose-server.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("REDACTED SERVER CONFIG", diagnostic)
+        self.assertIn("[REDACTED]", diagnostic)
+        self.assertNotIn("podman rm", diagnostic)
+        self.assertNotIn("systemctl restart", diagnostic)
 
     def test_signed_agent_version_endpoint_reports_runtime_server_version(self):
         original_version = server.APP_VERSION

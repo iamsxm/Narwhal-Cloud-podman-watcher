@@ -5194,7 +5194,7 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
         # 匹配方式：① systemd 单元文件名包含特征串（递归，含 .wants 软链）；
         # ② 单元 ExecStart* 引用了特征串；③ init.d / OpenRC；④ supervisor；⑤ cron。
         script_parts.append(
-            "_pat=" + pattern + ";\n"
+            "_pat=" + quoted_pattern + ";\n"
             "rem_unit() { "
             "u=\"$1\"; [ -e \"$u\" ] || [ -L \"$u\" ] || return 0; "
             "un=${u##*/}; "
@@ -5209,7 +5209,7 @@ def remediate_panel_pairing(action: Dict) -> Tuple[bool, str]:
             "[ -d \"$ud\" ] || continue; "
             "for u in $(find \"$ud\" -type f,l \\( -iname \"*${_pat}*.service\" -o -iname \"*${_pat}*.timer\" -o -iname \"*${_pat}*.socket\" -o -iname \"*${_pat}*.path\" \\) 2>/dev/null); do rem_unit \"$u\"; done; "
             "for u in $(grep -rIl --include='*.service' --include='*.timer' --include='*.socket' \"${_pat}\" \"$ud\" 2>/dev/null); do "
-            "if grep -Eq \"ExecStart[^ ]*${_pat}|ExecStartPre[^ ]*${_pat}|ExecStartPost[^ ]*${_pat}\" \"$u\"; then rem_unit \"$u\"; fi; "
+            "if grep -E '^[[:space:]]*Exec(Start|StartPre|StartPost)=' \"$u\" 2>/dev/null | grep -Fqi -- \"${_pat}\"; then rem_unit \"$u\"; fi; "
             "done; "
             "done; "
             "for f in $(find /etc/init.d -maxdepth 2 -type f,l 2>/dev/null); do "

@@ -40,11 +40,11 @@ update_repo_self() {
     return
   fi
 
-  # 若脚本目录存在被跟踪的本地改动，先丢弃，否则 git pull --ff-only 会失败，
-  # 导致一直用旧的 install-server.sh 运行（例如旧的端口污染 bug 无法被修复）。
+  # 不自动丢弃运维人员的本地修改；明确报错并要求人工审查。
   if [[ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=no)" ]]; then
-    echo "[WARN] 检测到脚本目录存在本地改动，先丢弃被跟踪的改动以便拉取最新安装脚本。"
-    git -C "$ROOT_DIR" checkout -- .
+    echo "[ERROR] 检测到仓库存在已跟踪的本地改动，拒绝自动覆盖。"
+    echo "[INFO] 请先执行 git -C '$ROOT_DIR' status 并人工提交、暂存或还原后重试。"
+    exit 1
   fi
 
   echo "[INFO] 更新安装脚本与仓库代码（git pull --ff-only）..."
@@ -261,6 +261,7 @@ main() {
   action="$(narwhal_choose "请选择操作" "install" \
     "install|安装" \
     "update|更新" \
+    "diagnose-server|诊断 Server（只读）" \
     "reset-server-password|重置 Server 登录密码" \
     "uninstall|卸载")"
 
@@ -306,6 +307,9 @@ main() {
     reset-server-password|reset-password)
       install_deps
       bash "$ROOT_DIR/scripts/install-server.sh" reset-password
+      ;;
+    diagnose-server|diagnose)
+      bash "$ROOT_DIR/scripts/diagnose-server.sh"
       ;;
     uninstall)
       uninstall_narwhal_related

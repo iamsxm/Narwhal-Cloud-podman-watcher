@@ -9,10 +9,12 @@ import sqlite3
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 DB_PATH = os.getenv("DB_PATH", "/data/monitor.db")
 SHARED_SECRET = os.getenv("SHARED_SECRET", "change-me")
@@ -59,6 +61,10 @@ def report_agent_kind(payload_json: str | None) -> str:
 
 
 app = FastAPI(title="Narwhal Container Monitor")
+
+# 静态资源：设计令牌 / 组件样式 / 共享前端组件库（受 Dashboard Basic Auth 保护）
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 _AGENT_ONLY_PATHS = {
     "/health",
@@ -2106,35 +2112,41 @@ def stats(minutes: int = 720) -> JSONResponse:
     )
 
 
+def _page_head(title: str) -> str:
+    """共享页面骨架：关键内联样式 + 设计令牌/组件样式表 + 共享组件脚本。
+
+    内联的 overflow-x:hidden 与 prefers-reduced-motion 属于关键路径样式，
+    必须在外部样式表加载前生效；其余样式/脚本由 /static 提供。"""
+    return f"""<!doctype html>
+<html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1, viewport-fit=cover'><meta name='color-scheme' content='dark light'><meta name='theme-color' content='#000000'><title>{title}</title>
+<style>*{{box-sizing:border-box}}html,body{{max-width:100%;overflow-x:hidden}}@media(max-width:640px){{.page-shell{{padding:12px}}}}@media(prefers-reduced-motion:reduce){{*,*::before,*::after{{transition:none!important;animation:none!important}}}}</style>
+<link rel='stylesheet' href='/static/css/tokens.css'>
+<link rel='stylesheet' href='/static/css/components.css'>
+<link rel='stylesheet' href='/static/css/pages.css'>
+<script src='/static/js/narwhal.js'></script>
+</head>"""
+
+
 @app.get("/alerts/history", response_class=HTMLResponse)
 def security_alert_history_page() -> str:
-    return """
-<!doctype html>
-<html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>告警历史 · Narwhal Monitor</title>
-<style>
-*{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}:root{color-scheme:dark;--bg:#020617;--surface:#0f172a;--surface2:#172033;--surface3:#1e293b;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--success:#22c55e;--warning:#f59e0b;--danger:#ef4444;--focus:#7dd3fc}
-body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}.skip-link{position:fixed;top:-70px;left:12px;z-index:1000;padding:10px 14px;border-radius:8px;background:var(--accent);color:#082f49;font-weight:750}.skip-link:focus{top:12px}.shell{width:min(1500px,100%);margin:auto;padding:20px}.header{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding:18px 20px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(135deg,#0f172a,#111d34)}h1{margin:0;font-size:22px}.subtitle{margin:5px 0 0;color:var(--muted);font-size:13px}.header-actions,.actions,.status-tabs{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.btn,.nav-link{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;background:var(--surface3);color:var(--text);font:inherit;text-decoration:none;cursor:pointer;touch-action:manipulation;transition:filter 180ms ease,opacity 180ms ease}.btn:hover,.nav-link:hover{filter:brightness(1.13)}.btn:focus-visible,.nav-link:focus-visible,input:focus-visible,select:focus-visible,.status-chip:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.btn:disabled{opacity:.55;cursor:wait}.btn-danger{border-color:#b91c1c;background:#7f1d1d}.btn-secondary{background:#334155}.panel{margin-top:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface);overflow:hidden}.panel-head{padding:14px 16px;border-bottom:1px solid var(--border);background:var(--surface2)}.panel-head h2{margin:0;font-size:17px}.filters{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;padding:16px}.field{min-width:0}.field label{display:block;margin-bottom:5px;color:#cbd5e1;font-size:12px;font-weight:650}.field input,.field select{width:100%;min-height:44px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:#0b1220;color:var(--text);font:inherit}.filter-actions{display:flex;align-items:end;gap:8px}.status-tabs{padding:12px 16px;border-top:1px solid var(--border)}.status-chip{min-height:44px;padding:6px 10px;border:1px solid var(--border);border-radius:999px;background:#111827;color:#cbd5e1;cursor:pointer;touch-action:manipulation}.status-chip.active{border-color:#0ea5e9;background:#082f49;color:#bae6fd}.alert-list{display:grid;gap:12px;padding:16px}.alert-card{min-width:0;border:1px solid var(--border);border-left:4px solid var(--warning);border-radius:12px;background:#0b1220;padding:15px}.alert-card.critical{border-left-color:var(--danger)}.alert-card.info{border-left-color:var(--accent)}.alert-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.alert-title{min-width:0}.alert-title h3{margin:0;font-size:16px;overflow-wrap:anywhere}.meta{display:flex;gap:7px;flex-wrap:wrap;margin-top:7px}.pill{display:inline-flex;align-items:center;min-height:28px;padding:3px 9px;border:1px solid var(--border);border-radius:999px;background:#111827;color:#cbd5e1;font-size:12px;overflow-wrap:anywhere}.pill.active{border-color:#b91c1c;background:#450a0a;color:#fca5a5}.pill.suppressed{border-color:#166534;background:#052e16;color:#86efac}.pill.dismissed{border-color:#92400e;background:#451a03;color:#fcd34d}.pill.remediated{border-color:#0369a1;background:#082f49;color:#7dd3fc}.pill.resolved{color:#cbd5e1}.message{margin:13px 0;color:#e2e8f0;overflow-wrap:anywhere}.evidence{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.evidence-block{min-width:0;padding:10px;border:1px solid #26364e;border-radius:9px;background:#0f172a}.evidence-block span{display:block;color:var(--muted);font-size:11px}.evidence-block strong{display:block;margin-top:4px;font-size:13px;font-weight:600;overflow-wrap:anywhere}.result{margin-top:10px;padding:10px;border-radius:8px;background:#111827;color:#cbd5e1;font-size:12px;overflow-wrap:anywhere}.card-footer{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;margin-top:12px}.timestamps{color:var(--muted);font-size:12px}.empty{padding:36px;text-align:center;color:var(--muted)}.load-more{display:flex;justify-content:center;padding:0 16px 18px}.toast{position:fixed;right:18px;bottom:18px;z-index:10;max-width:min(440px,calc(100% - 36px));padding:12px 14px;border:1px solid #166534;border-radius:10px;background:#052e16;color:#bbf7d0;box-shadow:0 12px 35px #0008}.toast.error{border-color:#991b1b;background:#450a0a;color:#fecaca}[hidden]{display:none!important}
-@media(max-width:1000px){.filters{grid-template-columns:repeat(2,minmax(0,1fr))}.evidence{grid-template-columns:1fr}.filter-actions{align-items:center}.card-footer{align-items:flex-start;flex-direction:column}}
-@media(max-width:640px){.shell{padding:8px}.header{padding:14px;flex-direction:column}.filters{grid-template-columns:1fr;padding:10px}.alert-list{padding:10px}.alert-top{flex-direction:column}.actions{width:100%}.actions .btn{flex:1 1 100%}.status-tabs{padding:10px}.status-chip{flex:1 1 calc(50% - 8px)}}
-@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
-</style></head><body><a class='skip-link' href='#history-main'>跳到主要内容</a><main id='history-main' class='shell'>
-<header class='header'><div><h1>安全告警历史</h1><p class='subtitle'>保留活动、已忽略、已处理和已恢复事件；可重新禁止或恢复提醒。</p></div><div class='header-actions'><span id='server-version' class='pill'>Server</span><a class='nav-link' href='/'>返回总览</a><button class='btn' type='button' onclick='loadHistory(true)'>刷新</button></div></header>
-<section class='panel' aria-labelledby='filter-title'><header class='panel-head'><h2 id='filter-title'>检索与筛选</h2></header><div class='filters'>
+    return _page_head("告警历史 · Narwhal Monitor") + """
+<body><a class='skip-link' href='#history-main'>跳到主要内容</a><main id='history-main' class='page-shell'>
+<header class='page-header'><div><h1 class='page-title'>安全告警历史</h1><p class='page-subtitle'>保留活动、已忽略、已处理和已恢复事件；可重新禁止或恢复提醒。</p></div><div class='page-header-actions'><button id='theme-toggle' class='theme-toggle' type='button' data-icon='sun' aria-label='切换到白天主题'></button><span id='server-version' class='pill'>Server</span><a class='nav-link' href='/'><span data-icon='arrow-left'></span>返回总览</a><button class='btn' type='button' onclick='loadHistory(true)'><span data-icon='rotate-cw'></span>刷新</button></div></header>
+<section class='section-card' data-reveal aria-labelledby='filter-title'><header class='section-head'><h2 id='filter-title'>检索与筛选</h2></header><div class='filters'>
 <div class='field'><label for='severity'>级别</label><select id='severity'><option value='all'>全部级别</option><option value='critical'>Critical</option><option value='warning'>Warning</option><option value='info'>Info</option></select></div>
 <div class='field'><label for='alert-type'>告警类型</label><select id='alert-type'><option value='all'>全部类型</option></select></div>
 <div class='field'><label for='host-id'>主机</label><select id='host-id'><option value=''>全部主机</option></select></div>
 <div class='field'><label for='query'>关键词</label><input id='query' type='search' placeholder='容器、主机、说明'></div>
 <div class='filter-actions'><button class='btn' type='button' onclick='applyFilters()'>应用筛选</button><button class='btn btn-secondary' type='button' onclick='resetFilters()'>重置</button></div>
 </div><div id='status-tabs' class='status-tabs' aria-label='处理状态'></div></section>
-<section class='panel' aria-labelledby='history-title'><header class='panel-head'><h2 id='history-title'>告警记录 <span id='result-count' class='pill'>0</span></h2></header><div id='alert-list' class='alert-list' aria-live='polite'><div class='empty'>正在加载告警历史…</div></div><div class='load-more'><button id='load-more' class='btn' type='button' hidden onclick='loadMore()'>加载更多</button></div></section>
-</main><div id='toast' class='toast' role='status' aria-live='polite' hidden></div>
+<section class='section-card' data-reveal aria-labelledby='history-title'><header class='section-head'><h2 id='history-title'>告警记录 <span id='result-count' class='pill'>0</span></h2></header><div id='alert-list' class='alert-list' aria-live='polite'><div class='empty'><span data-icon='inbox'></span>正在加载告警历史…</div></div><div class='load-more'><button id='load-more' class='btn' type='button' hidden onclick='loadMore()'>加载更多</button></div></section>
+</main>
 <script>
 const state={status:'all',offset:0,limit:50,total:0,loading:false};
 const labels={active:'活动',suppressed:'允许且不再提醒',dismissed:'本次取消提醒',resolved:'已恢复',remediated:'已处理'};
 const decisions={deny:'禁止/处理',allow_silent:'允许且不再提醒',dismiss_once:'本次取消提醒',reopen:'恢复提醒'};
-function esc(value){return String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));}
-function showToast(message,error=false){const toast=document.getElementById('toast');toast.textContent=message;toast.className=`toast${error?' error':''}`;toast.hidden=false;setTimeout(()=>{toast.hidden=true},4500)}
+const esc=NW.escapeHtml;
+function showToast(message,error=false){NW.toast(message,{error});}
 function actionable(alert){const details=alert.details||{};const supported=alert.runtime==='incus'||alert.runtime==='podman';if(!supported)return false;if(alert.type==='unauthorized_panel_pairing')return (details.process_patterns||[]).length>0||(details.config_files||[]).length>0;if(alert.type==='socks_weak_auth')return details.socks_auth_mode==='no_auth'&&(details.socks_processes||[]).length>0;if(alert.type==='malicious_process')return (details.malicious_processes||[]).some(x=>x.process==='xmrig');return false;}
 function evidenceText(alert){const d=alert.details||{};if(alert.type==='unauthorized_panel_pairing')return [`域名：${(d.unapproved_domains||[]).join(', ')||'-'}`,`进程：${(d.process_patterns||[]).join(', ')||'-'}`,`配置：${(d.config_files||[]).join(', ')||'-'}`];if(alert.type==='socks_weak_auth')return [`认证：${d.socks_auth_mode||'unknown'}`,`进程：${(d.socks_processes||[]).join(', ')||'-'}`,`配置：${(d.socks_config_files||[]).join(', ')||'-'}`];if(alert.type==='malicious_process')return [`进程：${(d.malicious_processes||[]).map(x=>x.process).join(', ')||'-'}`,`PID：${(d.malicious_processes||[]).map(x=>x.pid||'-').join(', ')||'-'}`,'策略：仅精确匹配 XMRig'];return [`指标：${alert.value||0}`,`阈值：${alert.threshold||0}`,`类型：${alert.type}`];}
 function resultText(alert){const automatic=alert.details?.automatic_remediation;const action=alert.latest_action;const decision=alert.latest_decision;const parts=[];if(automatic?.attempted)parts.push(`自动处置：${automatic.succeeded?'成功':'失败'} · ${automatic.message||'-'}`);if(action)parts.push(`节点操作：${action.status} · ${action.result_message||action.action_type}`);if(decision)parts.push(`人工决定：${decisions[decision.decision]||decision.decision} · ${decision.requested_by} · ${decision.created_at_utc8}`);return parts.join('<br>');}
@@ -2144,6 +2156,7 @@ function renderTabs(counts){const tabs=document.getElementById('status-tabs');ta
 async function loadHistory(reset=false){if(state.loading)return;if(reset)state.offset=0;state.loading=true;const params=new URLSearchParams({status:state.status,severity:document.getElementById('severity').value,alert_type:document.getElementById('alert-type').value,host_id:document.getElementById('host-id').value,query:document.getElementById('query').value,limit:String(state.limit),offset:String(state.offset)});try{const response=await fetch(`/api/v1/security/history?${params}`);const data=await response.json();if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);state.total=Number(data.total||0);document.getElementById('server-version').textContent='Server 已连接';document.getElementById('result-count').textContent=`${state.total} 条`;renderTabs(data.counts);if(reset){fillOptions('alert-type',data.alert_types||[],document.getElementById('alert-type').value,'全部类型');fillOptions('host-id',data.hosts||[],document.getElementById('host-id').value,'全部主机');document.getElementById('alert-list').innerHTML='';}const list=document.getElementById('alert-list');if(reset)list.innerHTML='';list.insertAdjacentHTML('beforeend',(data.items||[]).map(card).join(''));state.offset+=(data.items||[]).length;if(state.total===0)list.innerHTML='<div class="empty">没有符合条件的告警记录</div>';document.getElementById('load-more').hidden=state.offset>=state.total;}catch(error){showToast(`加载失败：${error.message||error}`,true)}finally{state.loading=false}}
 function selectStatus(status){state.status=status;loadHistory(true)}function applyFilters(){loadHistory(true)}function resetFilters(){state.status='all';document.getElementById('severity').value='all';document.getElementById('alert-type').value='all';document.getElementById('host-id').value='';document.getElementById('query').value='';loadHistory(true)}function loadMore(){loadHistory(false)}
 async function decide(id,decision){const warning=decision==='deny'?'确认重新执行定向处置？只会处理已识别的进程、服务和配置，不会停止容器。':'确认撤销忽略策略并恢复提醒？';if(!confirm(warning))return;document.querySelectorAll(`[data-action-id="${id}"]`).forEach(x=>x.disabled=true);try{const response=await fetch(`/api/v1/security/alerts/${id}/disposition`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision})});const data=await response.json();if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);showToast(data.queued?'操作已排队，等待节点执行':'状态已更新');await loadHistory(true)}catch(error){showToast(`操作失败：${error.message||error}`,true);document.querySelectorAll(`[data-action-id="${id}"]`).forEach(x=>x.disabled=false)}}
+NW.initReveal('[data-reveal]');NW.decorateIcons();NW.initTheme();NW.initSheen('.card,.kpi-card,.section-card,.panel,.alert-card,.container-card,.host-group,.page-header');
 document.getElementById('query').addEventListener('keydown',event=>{if(event.key==='Enter')loadHistory(true)});loadHistory(true);setInterval(()=>loadHistory(true),30000);
 </script></body></html>
 """
@@ -2151,138 +2164,40 @@ document.getElementById('query').addEventListener('keydown',event=>{if(event.key
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
-    return """
-<!doctype html>
-<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Narwhal Container Monitor</title>
-<style>
-*{box-sizing:border-box}
-html,body{max-width:100%;overflow-x:hidden}
-body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:1rem;background:#0f1a2e;color:#dbe7ff;line-height:1.5}
-table{border-collapse:collapse;width:100%;max-width:100%;table-layout:fixed;background:#13213b;color:#dbe7ff}
-th,td{border:1px solid #233b61;padding:8px;vertical-align:middle;text-align:center;overflow-wrap:anywhere;word-break:break-word}
-th{background:#1a2c4e}
-.bad{color:#ff6b78;font-weight:bold}
-.ok{color:#72dfa7}
-.severity-critical{color:#ff5f6d;font-weight:bold}
-.severity-warning{color:#ffbf4b;font-weight:bold}
-.btn{border:1px solid #4b6fa8;min-height:44px;padding:7px 11px;border-radius:8px;background:#1a2c4e;color:#dbe7ff;cursor:pointer;touch-action:manipulation}
-.btn-danger{background:#7c2330;border-color:#d94b61;margin-right:6px}
-.btn-allow{background:#185d4a;border-color:#36a77f;margin-right:6px}
-.btn-dismiss{background:#34445e;border-color:#6e85a8}
-.btn:disabled{opacity:.55;cursor:not-allowed}
-.security-action-state{display:flex;align-items:center;justify-content:center;min-height:28px;margin-bottom:7px;font-weight:650}
-.security-action-buttons{display:flex;align-items:center;justify-content:center;gap:6px;flex-wrap:wrap}
-.security-action-buttons .btn{margin-right:0}
-.action-status{font-size:12px;margin-top:7px;color:#a9bddc}
-#modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center}
-#card{background:#0d1730;border-radius:12px;padding:16px;width:min(1380px,96vw);max-height:94vh;overflow-y:auto}
-.legend{display:flex;gap:14px;align-items:center;margin:8px 0 4px 0;font-size:14px}
-.legend-item{display:flex;align-items:center;gap:6px}
-.dot{width:10px;height:10px;border-radius:50%}
-.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.panel{background:#13213b;border:1px solid #233b61;border-radius:10px;padding:10px}
-.panel h4{margin:0 0 6px 0}
-svg{width:100%;height:220px;border-top:1px solid #28436c}
-#traffic{height:280px}
-.snapshot-grid{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:10px;margin-top:12px}
-.snapshot-list{margin:6px 0 0 18px;padding:0;text-align:left;max-height:180px;overflow:auto}
-#security-alerts th:nth-child(6){width:28%}
-#security-alerts th:nth-child(9){width:25%}
-.host-list{display:grid;gap:12px;width:100%;min-width:0}
-.host-group{min-width:0;overflow:hidden;border:1px solid #29466f;border-radius:14px;background:#111f38;box-shadow:0 8px 24px rgba(3,10,24,.18)}
-.host-toggle{width:100%;min-height:76px;border:0;background:#172844;color:#dbe7ff;display:grid;grid-template-columns:24px minmax(0,1fr) minmax(240px,auto);align-items:center;gap:12px;padding:14px 16px;text-align:left;cursor:pointer;touch-action:manipulation}
-.host-toggle:hover{background:#1b3153}
-.host-toggle:focus-visible,.btn:focus-visible{outline:3px solid #8cc7ff;outline-offset:-3px}
-.host-chevron{width:20px;height:20px;transition:transform 180ms ease;color:#8cc7ff}
-.host-group.is-open .host-chevron{transform:rotate(90deg)}
-.host-title{min-width:0}
-.host-name{font-size:18px;font-weight:750;overflow-wrap:anywhere}
-.host-subtitle{display:block;margin-top:3px;color:#9fb5d5;font-size:13px}
-.host-summary{display:flex;justify-content:flex-end;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
-.pill{display:inline-flex;align-items:center;min-height:28px;padding:3px 9px;border:1px solid #365680;border-radius:999px;background:#10213c;color:#c9dbf5;font-size:12px;white-space:normal}
-.pill-ok{border-color:#2f8568;background:#123e35;color:#8ee6c2}
-.pill-warn{border-color:#b78035;background:#49371b;color:#ffd58c}
-.pill-bad{border-color:#a84655;background:#4f202a;color:#ffadb8}
-.host-panel{padding:14px;border-top:1px solid #29466f}
-.host-panel[hidden]{display:none}
-.containers-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(520px,100%),1fr));gap:14px;min-width:0}
-.container-card{min-width:0;border:1px solid #2a456d;border-radius:12px;background:#13213b;padding:14px;box-shadow:0 5px 16px rgba(4,11,26,.16)}
-.container-card:hover{border-color:#4472aa;box-shadow:0 8px 24px rgba(4,11,26,.26)}
-.container-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
-.container-name{font-size:17px;font-weight:750;overflow-wrap:anywhere}
-.container-meta{margin-top:2px;color:#9fb5d5;font-size:12px;overflow-wrap:anywhere}
-.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:10px}
-.metric{min-width:0;border:1px solid #274365;border-radius:9px;background:#0f1c33;padding:8px}
-.metric-label{display:block;color:#91a9cb;font-size:11px;line-height:1.25}
-.metric-value{display:block;margin-top:4px;font-size:15px;font-weight:700;overflow-wrap:anywhere}
-.container-info-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
-.info-block{min-width:0;border:1px solid #274365;border-radius:9px;background:#101e36;padding:10px}
-.info-block h4{margin:0 0 7px;font-size:13px;color:#9fc8ff}
-.kv{display:grid;grid-template-columns:minmax(76px,auto) minmax(0,1fr);gap:5px 8px;margin:0;font-size:12px}
-.kv dt{color:#8fa8ca}
-.kv dd{min-width:0;margin:0;text-align:right;overflow-wrap:anywhere}
-.container-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-top:12px}
-.empty-state{border:1px dashed #365680;border-radius:12px;padding:22px;text-align:center;color:#9fb5d5}
-:root{color-scheme:dark;--bg:#020617;--surface:#0f172a;--surface-2:#172033;--surface-3:#1e293b;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--success:#22c55e;--warning:#f59e0b;--danger:#ef4444;--focus:#7dd3fc}
-body{margin:0;background:var(--bg);color:var(--text)}
-.skip-link{position:fixed;left:12px;top:-60px;z-index:1000;background:var(--accent);color:#082f49;padding:10px 14px;border-radius:8px;font-weight:700}.skip-link:focus{top:12px}
-.app-shell{width:min(1600px,100%);margin:0 auto;padding:20px}
-.app-header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;padding:18px 20px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(135deg,#0f172a,#111d34)}
-.brand{display:flex;align-items:center;gap:12px}.brand-mark{width:38px;height:38px;display:grid;place-items:center;border:1px solid #0ea5e9;border-radius:10px;background:#082f49;color:#7dd3fc;font:800 16px ui-monospace,monospace}.brand h1{font-size:22px;line-height:1.2;margin:0}.brand p{margin:5px 0 0;color:var(--muted);font-size:13px}
-.header-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.nav-link{display:inline-flex;align-items:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;color:var(--text);text-decoration:none;background:var(--surface-3)}
-.nav-link:hover,.btn:hover{filter:brightness(1.12)}.nav-link:focus-visible,.btn:focus-visible,.host-toggle:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
-.refresh-time{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
-.kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}.kpi-card{padding:14px 16px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}.kpi-label{color:var(--muted);font-size:12px}.kpi-value{display:block;margin-top:5px;font-size:24px;font-weight:750;font-variant-numeric:tabular-nums}.kpi-value.danger{color:#fca5a5}
-.section-card{margin-bottom:18px;border:1px solid var(--border);border-radius:14px;background:var(--surface);overflow:hidden}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:15px 16px;border-bottom:1px solid var(--border);background:var(--surface-2)}.section-head h2{margin:0;font-size:17px}.section-head p{margin:4px 0 0;color:var(--muted);font-size:12px}.section-body{padding:14px;min-width:0}
-table{background:var(--surface);color:var(--text)}th,td{border-color:var(--border)}th{background:var(--surface-3);color:#cbd5e1;font-size:12px;letter-spacing:.02em}td{font-size:13px}.bad,.severity-critical{color:#fca5a5}.ok{color:#86efac}.severity-warning{color:#fcd34d}
-.host-group,.container-card,.panel{background:var(--surface);border-color:var(--border);box-shadow:none}.host-toggle{background:var(--surface-2);color:var(--text)}.host-toggle:hover{background:#1e293b}.metric,.info-block{background:#0b1220;border-color:var(--border)}.host-subtitle,.metric-label,.kv dt,.action-status{color:var(--muted)}
-.pill{border-color:var(--border);background:#111827;color:#cbd5e1}.pill-ok{border-color:#166534;background:#052e16;color:#86efac}.pill-warn{border-color:#92400e;background:#451a03;color:#fcd34d}.pill-bad{border-color:#991b1b;background:#450a0a;color:#fca5a5}.version-dot{width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:6px;flex:none}
-#modal{background:rgba(2,6,23,.82);backdrop-filter:blur(3px)}#card{background:var(--surface);border:1px solid var(--border)}
-@media (max-width:1000px){
-  .host-toggle{grid-template-columns:24px minmax(0,1fr)}
-  .host-summary{grid-column:2;justify-content:flex-start}
-  .container-info-grid{grid-template-columns:1fr}
-  .snapshot-grid,.detail-grid{grid-template-columns:1fr}
-}
-@media (max-width:680px){
-  .app-shell{padding:8px}.app-header{padding:14px;flex-direction:column}.header-actions{justify-content:flex-start}.kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.section-body{padding:8px}
-  th,td{padding:6px;font-size:12px}
-  .host-toggle{padding:12px 10px;gap:8px}
-  .host-panel{padding:9px}
-  .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .container-head{flex-direction:column}
-  .host-summary{gap:5px}
-  #security-alerts th:nth-child(4),#security-alerts td:nth-child(4),#security-alerts th:nth-child(7),#security-alerts td:nth-child(7),#security-alerts th:nth-child(8),#security-alerts td:nth-child(8){display:none}
-}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
-</style>
-</head><body>
+    return _page_head("Narwhal Container Monitor") + """
+<body>
 <a class='skip-link' href='#main-content'>跳到主要内容</a>
-<main id='main-content' class='app-shell'>
-<header class='app-header'><div class='brand'><span class='brand-mark' aria-hidden='true'>NW</span><div><h1>Narwhal Monitor</h1><p>容器安全与运行状态中心</p></div></div><div class='header-actions'><span id='server-version' class='pill'>Server 正在连接</span><span id='last-refresh' class='refresh-time'>尚未刷新</span><a class='nav-link' href='/alerts/history'>告警历史</a><a class='nav-link' href='/stats'>数据统计</a></div></header>
-<section class='kpi-grid' aria-label='运行概览'><article class='kpi-card'><span class='kpi-label'>在线主机</span><strong id='kpi-hosts' class='kpi-value'>0</strong></article><article class='kpi-card'><span class='kpi-label'>监控容器</span><strong id='kpi-containers' class='kpi-value'>0</strong></article><article class='kpi-card'><span class='kpi-label'>活动告警</span><strong id='kpi-alerts' class='kpi-value danger'>0</strong></article><article class='kpi-card'><span class='kpi-label'>离线容器</span><strong id='kpi-offline' class='kpi-value'>0</strong></article></section>
-<section class='section-card'><header class='section-head'><div><h2>安全告警 <span class='pill pill-bad'>活动 <span id='active-alert-count'>0</span></span></h2><p>机场组件禁止操作执行定向清理；无认证 SOCKS 操作只停止对应服务并持续拦截，均不会停止容器。</p></div></header><div class='section-body'><table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th><th>操作</th></tr></thead><tbody></tbody></table></div></section>
-<section class='section-card'><header class='section-head'><div><h2>主机安全遥测</h2><p>低开销汇总网络、连接与访问日志状态。</p></div></header><div class='section-body'><table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table></div></section>
-<section class='section-card'><header class='section-head'><div><h2>容器状态</h2><p>按主机折叠；版本、在线状态与运行时分布集中显示。</p></div></header><div class='section-body'><div id='host-containers' class='host-list' aria-live='polite'><div class='empty-state'>正在加载节点数据…</div></div></div></section>
+<main id='main-content' class='page-shell'>
+<header class='page-header'><div class='brand'><span class='brand-mark' aria-hidden='true'>NW</span><div><h1 class='page-title'>Narwhal Monitor</h1><p class='page-subtitle'>容器安全与运行状态中心</p></div></div><div class='page-header-actions'><button id='theme-toggle' class='theme-toggle' type='button' data-icon='sun' aria-label='切换到白天主题'></button><span id='server-version' class='pill'>Server 正在连接</span><span id='last-refresh' class='refresh-time'>尚未刷新</span><a class='nav-link' href='/alerts/history'><span data-icon='bell'></span>告警历史</a><a class='nav-link' href='/stats'><span data-icon='bar-chart'></span>数据统计</a></div></header>
+<section class='kpi-grid' aria-label='运行概览'>
+  <article class='kpi-card' data-reveal><span class='kpi-label'>在线主机</span><strong id='kpi-hosts' class='kpi-value'>0</strong></article>
+  <article class='kpi-card' data-reveal><span class='kpi-label'>监控容器</span><strong id='kpi-containers' class='kpi-value'>0</strong></article>
+  <article class='kpi-card' data-reveal><span class='kpi-label'>活动告警</span><strong id='kpi-alerts' class='kpi-value danger'>0</strong></article>
+  <article class='kpi-card' data-reveal><span class='kpi-label'>离线容器</span><strong id='kpi-offline' class='kpi-value'>0</strong></article>
+</section>
+<section class='section-card' data-reveal><header class='section-head'><div><h2>安全告警 <span class='pill pill-bad'>活动 <span id='active-alert-count'>0</span></span></h2><p>机场组件禁止操作执行定向清理；无认证 SOCKS 操作只停止对应服务并持续拦截，均不会停止容器。</p></div></header><div class='section-body'><div class='table-scroll'><table id='security-alerts'><thead><tr><th>级别</th><th>主机</th><th>运行时/项目</th><th>容器</th><th>类型</th><th>说明</th><th>最近出现</th><th>次数</th><th>操作</th></tr></thead><tbody></tbody></table></div></div></section>
+<section class='section-card' data-reveal><header class='section-head'><div><h2>主机安全遥测</h2><p>低开销汇总网络、连接与访问日志状态。</p></div></header><div class='section-body'><div class='table-scroll'><table id='security-status'><thead><tr><th>主机</th><th>RX Mbps</th><th>RX pps</th><th>SYN_RECV</th><th>HTTP RPS</th><th>最高单IP RPS</th><th>访问日志</th><th>采样时间</th></tr></thead><tbody></tbody></table></div></div></section>
+<section class='section-card' data-reveal><header class='section-head'><div><h2>容器状态</h2><p>按主机折叠；版本、在线状态与运行时分布集中显示。</p></div></header><div class='section-body'><div id='host-containers' class='host-list' aria-live='polite'><div class='empty-state'><span data-icon='inbox'></span>正在加载节点数据…</div></div></div></section>
 </main>
-<div id='modal'><div id='card'>
+<div id='modal' class='modal-overlay' role='dialog' aria-modal='true' aria-labelledby='detail-title' hidden><div id='card' class='modal-card'>
+  <button class='modal-close' type='button' aria-label='关闭详情' onclick='closeDetail()'><span data-icon='x'></span></button>
   <h3 id='detail-title'></h3>
   <div class='detail-grid'>
     <div class='panel'>
       <h4>负载详情</h4>
       <div class='legend'>
-        <span class='legend-item'><span class='dot' style='background:#4a90e2'></span>CPU%</span>
-        <span class='legend-item'><span class='dot' style='background:#16a085'></span>内存%</span>
-        <span class='legend-item'><span class='dot' style='background:#9b59b6'></span>连接数</span>
-        <span class='legend-item'><span class='dot' style='background:#f39c12'></span>总网速 Mbps</span>
+        <span class='legend-item'><span class='dot' style='background:#0A84FF'></span>CPU%</span>
+        <span class='legend-item'><span class='dot' style='background:#30D158'></span>内存%</span>
+        <span class='legend-item'><span class='dot' style='background:#BF5AF2'></span>连接数</span>
+        <span class='legend-item'><span class='dot' style='background:#FF9F0A'></span>总网速 Mbps</span>
       </div>
       <svg id='chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg>
     </div>
     <div class='panel'>
       <h4>带宽监控</h4>
       <div class='legend'>
-        <span class='legend-item'><span class='dot' style='background:#2ecc71'></span>下行 RX Mbps</span>
-        <span class='legend-item'><span class='dot' style='background:#4a90e2'></span>上行 TX Mbps</span>
+        <span class='legend-item'><span class='dot' style='background:#30D158'></span>下行 RX Mbps</span>
+        <span class='legend-item'><span class='dot' style='background:#0A84FF'></span>上行 TX Mbps</span>
       </div>
       <svg id='bandwidth' viewBox='0 0 900 220' preserveAspectRatio='none'></svg>
     </div>
@@ -2292,22 +2207,14 @@ table{background:var(--surface);color:var(--text)}th,td{border-color:var(--borde
     <div class='panel'><h4>进程排查</h4><div id='detail-processes'></div></div>
     <div class='panel'><h4>安全与暴露面</h4><div id='detail-risks'></div></div>
   </div>
-  <div class='panel' style='margin-top:12px'>
+  <div class='panel traffic-panel'>
     <h4>流量统计（累计字节）</h4>
     <svg id='traffic' viewBox='0 0 1200 280' preserveAspectRatio='none'></svg>
   </div>
-  <p><button class='btn' onclick='closeDetail()'>关闭</button></p>
+  <div class='modal-actions'><button class='btn' type='button' onclick='closeDetail()'>关闭</button></div>
 </div></div>
 <script>
-function fmtBytes(n){
-  const x = Number(n||0); if (x<=0) return '0 B';
-  const units=['B','KB','MB','GB','TB']; let i=0; let v=x;
-  while(v>=1024 && i<units.length-1){v/=1024;i++;}
-  return `${v.toFixed(v>=100?0:1)}${units[i]}`;
-}
-function bpsToMbps(v){
-  return (Number(v||0) * 8) / 1000 / 1000;
-}
+const {fmtBytes,bpsToMbps,buildPolyline}=NW;
 function formatSmallNumber(v, digits=2){
   const n = Number(v||0);
   if (!Number.isFinite(n)) return '0.00';
@@ -2328,9 +2235,10 @@ function formatCapacity(total, avail){
   return Number(total||0)>0 ? `${fmtBytes(total)} / ${fmtBytes(avail)}` : '采集不可用';
 }
 function escapeHtml(value){
-  return String(value??'').replace(/[&<>'"]/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+  return NW.escapeHtml(value);
 }
 const alertsById=new Map();
+const detailModal=NW.Modal(document.getElementById('modal'));
 const submittingAlertActions=new Set();
 function remediationChanged(action){
   if(!action||!['remediate_panel_pairing','remediate_malicious_process'].includes(action.action_type)||action.status!=='succeeded')return false;
@@ -2429,8 +2337,8 @@ async function loadAlerts(){
     const allowLabel=socksPolicyActive?'解除拦截并允许（不再提醒）':'允许且不再提醒';
     const dismissLabel=socksPolicyActive?'仅隐藏本次告警（保留拦截）':'本次取消提醒';
     const actions=`<div class='security-action-state'>${denyControl}</div><div class='security-action-buttons'>`+
-      `<button class='btn btn-allow' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'allow_silent')">${allowLabel}</button>`+
-      `<button class='btn btn-dismiss' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'dismiss_once')">${dismissLabel}</button></div>`;
+      `<button class='btn btn-success' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'allow_silent')">${allowLabel}</button>`+
+      `<button class='btn btn-secondary' data-alert-action="${Number(alert.id)}" ${pending?'disabled':''} onclick="setAlertDisposition(${Number(alert.id)},'dismiss_once')">${dismissLabel}</button></div>`;
     tr.innerHTML=`<td class='severity-${escapeHtml(alert.severity)}'>${escapeHtml(alert.severity)}</td>`+
       `<td>${escapeHtml(alert.host_id)}</td><td>${escapeHtml(runtime)}</td>`+
       `<td>${escapeHtml(alert.container_name||'-')}</td><td>${escapeHtml(alert.type)}</td>`+
@@ -2503,7 +2411,7 @@ async function load(){
   document.getElementById('kpi-containers').innerText=(d.items||[]).length;
   document.getElementById('kpi-offline').innerText=offlineTotal;
   if(!groups.length){
-    hostList.innerHTML="<div class='empty-state'>暂未收到容器上报</div>";
+    hostList.innerHTML=`<div class='empty-state'>${NW.icon('inbox')}暂未收到容器上报</div>`;
     return;
   }
   groups.forEach(([host, rows],hostIndex)=>{
@@ -2580,7 +2488,7 @@ async function load(){
         `<section class='info-block'><h4>流量与连接</h4><dl class='kv'><dt>RX pps</dt><dd>${formatSmallNumber(security.net_rx_pps,1)}</dd><dt>SYN_RECV</dt><dd>${Number(security.syn_recv_count||0)}</dd><dt>入站 IP</dt><dd class='${inboundCls}'>${inboundUniqueIps} / 阈值 ${inboundThreshold}</dd><dt>入站连接</dt><dd>${Number(security.incoming_established||0)}</dd><dt>出站 IP</dt><dd>${Number(security.outbound_unique_ips||0)}</dd><dt>TCP 建连/s</dt><dd>${formatSmallNumber(protocolRates.Tcp_ActiveOpens_per_second,1)}</dd><dt>TCP 失败/s</dt><dd>${formatSmallNumber(protocolRates.Tcp_AttemptFails_per_second,1)}</dd></dl></section>`+
         `<section class='info-block'><h4>端口与网络</h4><dl class='kv'><dt>监听端口</dt><dd>${escapeHtml(listeningPorts||'-')}</dd><dt>NAT/代理</dt><dd>${escapeHtml(exposureText)}</dd><dt>来源 Top3</dt><dd>${formatCountryStats(x.tcp_country_stats,x.udp_country_stats)}</dd></dl></section>`+
         `<section class='info-block'><h4>安全检查</h4><dl class='kv'><dt>面板对接</dt><dd class='${panelPairing.detected&&!panelPairing.approved?'bad':''}'>${escapeHtml(pairingText)}</dd><dt>可疑进程</dt><dd class='${suspiciousCount?'bad':''}'>${suspiciousCount}</dd><dt>配置风险</dt><dd class='${riskCount?'bad':''}'>${riskCount}</dd><dt>采样时间</dt><dd>${escapeHtml(x.timestamp_iso_utc8||'-')}</dd></dl></section></div>`+
-        `<div class='container-actions'><button type='button' class='btn detail-button'>查看容器详情</button></div>`;
+        `<div class='container-actions'><button type='button' class='btn detail-button'>${NW.icon('external-link')}查看容器详情</button></div>`;
       card.querySelector('.detail-button').addEventListener('click',()=>{
         location.href=containerDetailUrl(host,x.runtime,x.project||'',x.container_name);
       });
@@ -2595,16 +2503,12 @@ async function load(){
     toggle.addEventListener('click',()=>setHostExpanded(host,group,toggle,panel,!expandedHosts.has(host)));
   });
 }
-function closeDetail(){ document.getElementById('modal').style.display='none'; }
-function buildPolyline(vals,maxv,w,h,pad){
-  const useMax=Math.max(1,maxv);
-  return vals.map((v,i)=>`${i*(w/Math.max(1,vals.length-1))},${(h-pad)-((v/useMax)*(h-pad*2))}`).join(' ');
-}
+function closeDetail(){ detailModal.close(); }
 function drawAxes(svg,w,h){
   const lines=[];
   for(let i=0;i<=5;i++){
     const y=(h-20)-(i*((h-40)/5));
-    lines.push(`<line x1='0' y1='${y}' x2='${w}' y2='${y}' stroke='#29466f' stroke-width='1' />`);
+    lines.push(`<line x1='0' y1='${y}' x2='${w}' y2='${y}' style='stroke:var(--chart-grid)' stroke-width='1' />`);
   }
   svg.innerHTML=lines.join('');
 }
@@ -2647,7 +2551,7 @@ async function openDetail(host, runtime, project, container){
     svg.innerHTML = '';
     bandwidthSvg.innerHTML = '';
     trafficSvg.innerHTML = '';
-    document.getElementById('modal').style.display='flex';
+    detailModal.open();
     return;
   }
   const cpuVals=recent.map(x=>Number(x.cpu_percent||0));
@@ -2675,28 +2579,28 @@ async function openDetail(host, runtime, project, container){
   const connPoints=buildPolyline(connVals, Math.max(1, ...connVals), 900, 220, 20);
   const speedPoints=buildPolyline(speedVals, Math.max(1, ...speedVals), 900, 220, 20);
   svg.innerHTML += `
-    <polyline fill='none' stroke='#4a90e2' stroke-width='2.5' points='${cpuPoints}' />
-    <polyline fill='none' stroke='#16a085' stroke-width='2.5' points='${memPoints}' />
-    <polyline fill='none' stroke='#9b59b6' stroke-width='2.5' points='${connPoints}' />
-    <polyline fill='none' stroke='#f39c12' stroke-width='2.5' points='${speedPoints}' />
+    <polyline fill='none' stroke='#0A84FF' stroke-width='2.5' points='${cpuPoints}' />
+    <polyline fill='none' stroke='#30D158' stroke-width='2.5' points='${memPoints}' />
+    <polyline fill='none' stroke='#BF5AF2' stroke-width='2.5' points='${connPoints}' />
+    <polyline fill='none' stroke='#FF9F0A' stroke-width='2.5' points='${speedPoints}' />
   `;
 
   drawAxes(bandwidthSvg,900,220);
   const rxPoints=buildPolyline(rxMbpsVals, Math.max(1, ...rxMbpsVals, ...txMbpsVals), 900, 220, 20);
   const txPoints=buildPolyline(txMbpsVals, Math.max(1, ...rxMbpsVals, ...txMbpsVals), 900, 220, 20);
   bandwidthSvg.innerHTML += `
-    <polyline fill='none' stroke='#2ecc71' stroke-width='2.5' points='${rxPoints}' />
-    <polyline fill='none' stroke='#4a90e2' stroke-width='2.5' points='${txPoints}' />
+    <polyline fill='none' stroke='#30D158' stroke-width='2.5' points='${rxPoints}' />
+    <polyline fill='none' stroke='#0A84FF' stroke-width='2.5' points='${txPoints}' />
   `;
 
   drawAxes(trafficSvg,1200,280);
   const rxCumPoints=buildPolyline(rxBytesCum, Math.max(1, ...rxBytesCum, ...txBytesCum), 1200, 280, 20);
   const txCumPoints=buildPolyline(txBytesCum, Math.max(1, ...rxBytesCum, ...txBytesCum), 1200, 280, 20);
   trafficSvg.innerHTML += `
-    <polyline fill='none' stroke='#2ecc71' stroke-width='2.5' points='${rxCumPoints}' />
-    <polyline fill='none' stroke='#4a90e2' stroke-width='2.5' points='${txCumPoints}' />
+    <polyline fill='none' stroke='#30D158' stroke-width='2.5' points='${rxCumPoints}' />
+    <polyline fill='none' stroke='#0A84FF' stroke-width='2.5' points='${txCumPoints}' />
   `;
-  document.getElementById('modal').style.display='flex';
+  detailModal.open();
 }
 let openedFromUrl=false;
 async function loadAndOpenRequestedDetail(){
@@ -2708,6 +2612,7 @@ async function loadAndOpenRequestedDetail(){
     await openDetail(q.get('host'),q.get('runtime'),q.get('project')||'',q.get('container'));
   }
 }
+NW.initReveal('[data-reveal]');NW.decorateIcons();NW.initTheme();NW.initSheen('.card,.kpi-card,.section-card,.panel,.alert-card,.container-card,.host-group,.page-header');
 loadAndOpenRequestedDetail(); loadAlerts(); setInterval(()=>{load();loadAlerts();}, 15000);
 </script>
 </body></html>
@@ -2716,46 +2621,20 @@ loadAndOpenRequestedDetail(); loadAlerts(); setInterval(()=>{load();loadAlerts()
 
 @app.get("/container-detail", response_class=HTMLResponse)
 def container_detail_page() -> str:
-    return """
-<!doctype html>
-<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>Container Detail</title>
-<style>
-*{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}
-:root{color-scheme:dark;--bg:#020617;--surface:#0f172a;--surface-2:#172033;--surface-3:#1e293b;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--success:#22c55e;--danger:#ef4444;--focus:#7dd3fc}
-body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}.skip-link{position:fixed;left:12px;top:-60px;z-index:10;background:var(--accent);color:#082f49;padding:10px 14px;border-radius:8px;font-weight:700}.skip-link:focus{top:12px}
-.page{width:min(1500px,100%);margin:auto;padding:20px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:16px;padding:17px 18px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(135deg,var(--surface),#111d34)}
-h1{margin:0;font-size:24px;overflow-wrap:anywhere}.subtitle{color:var(--muted);margin-top:4px;overflow-wrap:anywhere}.actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
-    .btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);text-decoration:none;cursor:pointer;font:inherit}.btn.primary{border-color:#0284c7;background:#075985}.btn:disabled{cursor:not-allowed;opacity:.58}
-    .btn:not(:disabled):hover{filter:brightness(1.12)}.btn:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.status{border:1px solid var(--border);border-radius:10px;background:var(--surface-2);padding:10px 12px;margin-bottom:14px;color:#cbd5e1}
-.status.bad{border-color:#a84655;color:#ffadb8}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
-.metric,.panel{min-width:0;border:1px solid var(--border);border-radius:12px;background:var(--surface);padding:13px}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{display:block;margin-top:4px;font-size:20px;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
-.metric.metric-alert{border-color:#b91c1c;background:#2b0b12}.metric.metric-alert strong{color:#fca5a5}
-.charts,.details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:14px}.panel h2{font-size:16px;margin:0 0 10px}.panel h3{font-size:14px;margin:12px 0 6px;color:#9fc8ff}
-.legend{display:flex;gap:14px;flex-wrap:wrap;color:#9fb5d5;font-size:12px;margin-bottom:7px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
-svg{width:100%;height:220px;border-top:1px solid #29466f}.kv{display:grid;grid-template-columns:minmax(115px,auto) minmax(0,1fr);gap:6px 10px;margin:0}.kv dt{color:#91a9cb}.kv dd{margin:0;text-align:right;overflow-wrap:anywhere}
-.list{margin:6px 0 0 18px;padding:0}.ok{color:#72dfa7}.bad-text{color:#ff6b78}.samples{display:grid;gap:7px}.sample{display:grid;grid-template-columns:1.4fr repeat(5,minmax(75px,1fr));gap:8px;padding:8px;border:1px solid #274365;border-radius:8px;background:#101e36;font-size:12px}.sample span{overflow-wrap:anywhere}
-.source,.version-pill{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:999px;padding:3px 9px;background:#111827;color:#cbd5e1;font-size:12px}.version-pill.ok{border-color:#166534;background:#052e16;color:#86efac}.version-pill.bad{border-color:#991b1b;background:#450a0a;color:#fca5a5}.version-pill.warn{border-color:#92400e;background:#451a03;color:#fcd34d}
-    .comm-process-grid,.socket-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr));gap:9px}.comm-process,.socket-card{min-width:0;border:1px solid #274365;border-radius:9px;background:#0b1220;padding:10px}.comm-process strong,.socket-head strong{overflow-wrap:anywhere}.comm-meta,.socket-meta{margin-top:4px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.socket-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}.direction{display:inline-flex;border-radius:999px;padding:2px 7px;font-size:11px;border:1px solid var(--border)}.direction.inbound{border-color:#b91c1c;background:#450a0a;color:#fca5a5}.direction.outbound{border-color:#075985;background:#082f49;color:#7dd3fc}.comm-note{margin:0 0 10px;color:var(--muted);font-size:12px}
-    .diagnostic{margin-bottom:14px;border-color:#315574;background:linear-gradient(135deg,#0f172a,#0b1d31)}.diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.diagnostic-head p{margin:3px 0 0;color:var(--muted);font-size:12px}.diagnostic-state{margin:12px 0;padding:9px 11px;border:1px solid var(--border);border-radius:8px;background:#0b1220;color:#cbd5e1}.diagnostic-state.ok{border-color:#166534}.diagnostic-state.warn{border-color:#92400e;color:#fcd34d}.diagnostic-state.bad{border-color:#991b1b;color:#fca5a5}.deep-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px}.deep-metric{min-width:0;padding:9px;border:1px solid #274365;border-radius:8px;background:#101e36}.deep-metric span{display:block;color:var(--muted);font-size:11px}.deep-metric strong{display:block;margin-top:3px;overflow-wrap:anywhere}.deep-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.deep-section{min-width:0;border-top:1px solid #274365;padding-top:9px}.deep-section h3{margin:0 0 7px}.deep-list{display:grid;gap:6px}.deep-row{min-width:0;padding:8px;border:1px solid #253b59;border-radius:7px;background:#0b1220;font-size:12px;overflow-wrap:anywhere}.deep-row strong{color:#dbeafe}.deep-errors{margin-top:9px;color:#fca5a5;font-size:12px}
-    @media(max-width:900px){.top{flex-direction:column}.charts,.details,.deep-grid{grid-template-columns:1fr}.sample{grid-template-columns:repeat(2,minmax(0,1fr))}.diagnostic-head{flex-direction:column}}
-@media(max-width:520px){.page{padding:10px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metric strong{font-size:17px}.kv{grid-template-columns:1fr}.kv dd{text-align:left}.actions{width:100%}.btn{flex:1}}
-</style></head><body><a class='skip-link' href='#detail-main'>跳到主要内容</a><main id='detail-main' class='page'>
-    <header class='top'><div><h1 id='title'>容器详情</h1><div id='subtitle' class='subtitle'>正在读取容器内部指标…</div></div><nav class='actions'><span id='detail-version' class='version-pill warn'>版本检查中</span><a class='btn' href='/stats'>返回统计页</a><a class='btn' href='/'>返回总览</a></nav></header>
+    return _page_head("Container Detail · Narwhal Monitor") + """
+<body><a class='skip-link' href='#detail-main'>跳到主要内容</a><main id='detail-main' class='page-shell'>
+    <header class='page-header'><div><h1 id='title' class='page-title'>容器详情</h1><div id='subtitle' class='page-subtitle'>正在读取容器内部指标…</div></div><nav class='actions'><button id='theme-toggle' class='theme-toggle' type='button' data-icon='sun' aria-label='切换到白天主题'></button><span id='detail-version' class='version-pill warn'>版本检查中</span><a class='btn' href='/stats'><span data-icon='bar-chart'></span>返回统计页</a><a class='btn' href='/'><span data-icon='arrow-left'></span>返回总览</a></nav></header>
     <div id='status' class='status'>正在加载最新采样与历史数据…</div>
-    <section class='panel diagnostic' aria-labelledby='diagnostic-title'><div class='diagnostic-head'><div><h2 id='diagnostic-title'>按需深度上报</h2><p>仅在下一周期对当前 Incus/Podman 容器做一次有界快照；不抓包、不扫描文件，上报成功后自动恢复普通采集。</p></div><button id='request-diagnostic' class='btn primary' type='button' aria-label='请求当前容器在下一周期上报深度详情' onclick='requestDeepSample()'>请求深度上报</button></div><div id='diagnostic-state' class='diagnostic-state'>尚未请求深度上报。</div><div id='diagnostic-report'><div class='comm-note'>收到报告后将在这里显示瞬时流量、详细进程、连接 IP 和进程归属。</div></div></section>
-<section id='metrics' class='metrics'></section>
-<section class='charts'><article class='panel'><h2>容器 CPU / 内存历史</h2><div class='legend'><span><i class='dot' style='background:#4a90e2'></i>CPU%</span><span><i class='dot' style='background:#16a085'></i>内存%</span></div><svg id='resource-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article><article class='panel'><h2>容器网络速率历史</h2><div class='legend'><span><i class='dot' style='background:#2ecc71'></i>RX Mbps</span><span><i class='dot' style='background:#f39c12'></i>TX Mbps</span></div><svg id='network-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article></section>
-<section class='details'><article class='panel'><h2>容器内部进程</h2><div id='processes'></div></article><article class='panel'><h2>容器网络命名空间</h2><dl id='network' class='kv'></dl></article><article class='panel'><h2>安全与面板检查</h2><div id='security'></div></article><article class='panel'><h2>容器文件系统</h2><dl id='filesystem' class='kv'></dl></article></section>
-<section class='panel'><h2>通信进程与连接明细</h2><div id='communications'></div></section>
-<section class='panel'><h2>最近采样</h2><div id='samples' class='samples'></div></section>
+    <section class='panel diagnostic' aria-labelledby='diagnostic-title'><div class='diagnostic-head'><div><h2 id='diagnostic-title'>按需深度上报</h2><p>仅在下一周期对当前 Incus/Podman 容器做一次有界快照；不抓包、不扫描文件，上报成功后自动恢复普通采集。</p></div><button id='request-diagnostic' class='btn btn-primary' type='button' aria-label='请求当前容器在下一周期上报深度详情' onclick='requestDeepSample()'><span data-icon='rotate-cw'></span>请求深度上报</button></div><div id='diagnostic-state' class='diagnostic-state'>尚未请求深度上报。</div><div id='diagnostic-report'><div class='comm-note'>收到报告后将在这里显示瞬时流量、详细进程、连接 IP 和进程归属。</div></div></section>
+<section id='metrics' class='metrics' data-reveal></section>
+<section class='charts' data-reveal><article class='panel'><h2>容器 CPU / 内存历史</h2><div class='legend'><span><i class='dot' style='background:#0A84FF'></i>CPU%</span><span><i class='dot' style='background:#30D158'></i>内存%</span></div><svg id='resource-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article><article class='panel'><h2>容器网络速率历史</h2><div class='legend'><span><i class='dot' style='background:#30D158'></i>RX Mbps</span><span><i class='dot' style='background:#FF9F0A'></i>TX Mbps</span></div><svg id='network-chart' viewBox='0 0 900 220' preserveAspectRatio='none'></svg></article></section>
+<section class='details' data-reveal><article class='panel'><h2>容器内部进程</h2><div id='processes'></div></article><article class='panel'><h2>容器网络命名空间</h2><dl id='network' class='kv'></dl></article><article class='panel'><h2>安全与面板检查</h2><div id='security'></div></article><article class='panel'><h2>容器文件系统</h2><dl id='filesystem' class='kv'></dl></article></section>
+<section class='panel' data-reveal><h2>通信进程与连接明细</h2><div id='communications'></div></section>
+<section class='panel' data-reveal><h2>最近采样</h2><div id='samples' class='samples'></div></section>
 </main><script>
-function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
-function fmtBytes(n){const x=Number(n||0);if(x<=0)return '0 B';const u=['B','KB','MB','GB','TB'];let i=0,v=x;while(v>=1024&&i<u.length-1){v/=1024;i++}return `${v.toFixed(v>=100?0:1)} ${u[i]}`}
-function mbps(v){return Number(v||0)*8/1000000}function num(v,d=2){const n=Number(v||0);return Number.isFinite(n)?n.toFixed(d):'0.00'}
-function semverCompare(left,right){const a=String(left||'').split(/[+-]/,1)[0].split('.').map(x=>Number(x)||0),b=String(right||'').split(/[+-]/,1)[0].split('.').map(x=>Number(x)||0);for(let i=0;i<Math.max(a.length,b.length);i++){const d=(a[i]||0)-(b[i]||0);if(d)return d>0?1:-1}return 0}
-function linePoints(values,max,w=900,h=220,pad=18){return values.map((v,i)=>`${i*(w/Math.max(1,values.length-1))},${(h-pad)-(Number(v||0)/Math.max(1,max))*(h-pad*2)}`).join(' ')}
-function drawChart(id,series){const svg=document.getElementById(id);const values=series.flatMap(x=>x.values);const max=Math.max(1,...values);let grid='';for(let i=0;i<=4;i++){const y=18+i*46;grid+=`<line x1='0' y1='${y}' x2='900' y2='${y}' stroke='#29466f' stroke-width='1'/>`}svg.innerHTML=grid+series.map(x=>`<polyline fill='none' stroke='${x.color}' stroke-width='2.5' points='${linePoints(x.values,max)}'/>`).join('')}
+const esc=NW.escapeHtml;const fmtBytes=NW.fmtBytes;const mbps=NW.bpsToMbps;function num(v,d=2){const n=Number(v||0);return Number.isFinite(n)?n.toFixed(d):'0.00'}
+const semverCompare=NW.semverCompare;const linePoints=NW.buildPolyline;
+function drawChart(id,series){const svg=document.getElementById(id);const values=series.flatMap(x=>x.values);const max=Math.max(1,...values);let grid='';for(let i=0;i<=4;i++){const y=18+i*46;grid+=`<line x1='0' y1='${y}' x2='900' y2='${y}' style='stroke:var(--chart-grid)' stroke-width='1'/>`}svg.innerHTML=grid+series.map(x=>`<polyline fill='none' stroke='${x.color}' stroke-width='2.5' points='${linePoints(x.values,max)}'/>`).join('')}
     function sourceText(runtime){if(runtime==='incus')return 'Incus 容器级 cgroup/OpenMetrics 与网络命名空间';if(runtime==='podman')return 'Podman 容器 stats 与网络命名空间';return 'Docker 仅提醒模式（不执行深度采集）'}
     function listHtml(items,empty,mapper){return items.length?`<ul class='list'>${items.map(mapper).join('')}</ul>`:`<div class='ok'>${esc(empty)}</div>`}
     let diagnosticSubmitting=false;
@@ -2805,7 +2684,7 @@ function drawChart(id,series){const svg=document.getElementById(id);const values
   const inboundUniqueIps=Number(sec.inbound_unique_ips||0),inboundThreshold=Number(sec.inbound_unique_ip_threshold||10),inboundAlert=inboundUniqueIps>inboundThreshold;
   const cards=[['CPU',`${num(current?.cpu_percent)}%`],['内存',`${num(current?.mem_percent)}%`],['内存 已用/总量',`${fmtBytes(used)} / ${fmtBytes(limit)}`],['RX',`${num(mbps(current?.net_rx_bps))} Mbps`],['TX',`${num(mbps(current?.net_tx_bps))} Mbps`],['入站去重 IP',`${inboundUniqueIps} / 阈值 ${inboundThreshold}`,inboundAlert?'metric-alert':''],['连接数',Number(current?.conn_count||0)],['进程数',Number(sec.process_count||0)],['有效 CPU',Number(current?.cpu_effective_cpus||0)||'未限制']];
   document.getElementById('metrics').innerHTML=cards.map(x=>`<article class='metric ${x[2]||''}'><span>${esc(x[0])}</span><strong>${esc(x[1])}</strong></article>`).join('');
-  const recent=pts.slice(-80);drawChart('resource-chart',[{values:recent.map(x=>Number(x.cpu_percent||0)),color:'#4a90e2'},{values:recent.map(x=>Number(x.mem_percent||0)),color:'#16a085'}]);drawChart('network-chart',[{values:recent.map(x=>mbps(x.net_rx_bps)),color:'#2ecc71'},{values:recent.map(x=>mbps(x.net_tx_bps)),color:'#f39c12'}]);
+  const recent=pts.slice(-80);drawChart('resource-chart',[{values:recent.map(x=>Number(x.cpu_percent||0)),color:'#0A84FF'},{values:recent.map(x=>Number(x.mem_percent||0)),color:'#30D158'}]);drawChart('network-chart',[{values:recent.map(x=>mbps(x.net_rx_bps)),color:'#30D158'},{values:recent.map(x=>mbps(x.net_tx_bps)),color:'#FF9F0A'}]);
   const suspicious=Array.isArray(sec.suspicious_processes)?sec.suspicious_processes:[];const top=current?.top_cpu_process_command?`PID ${Number(current.top_cpu_process_pid||0)} · CPU ${num(current.top_cpu_process_cpu_percent)}% · ${esc(current.top_cpu_process_command)}`:'未采集到高 CPU 进程';document.getElementById('processes').innerHTML=`<div>${top}</div>`+listHtml(suspicious,'未发现可疑进程',x=>`<li>PID ${Number(x.pid||0)} · ${esc(x.command||x.pattern||'')}</li>`);
   const countries=(arr)=>(Array.isArray(arr)&&arr.length?arr.slice(0,5).map(x=>`${x.country||'UN'} (${Number(x.connections||0)})`).join('、'):'-');const exposure=Array.isArray(sec.network_exposure)?sec.network_exposure:[];const inboundMode=sec.inbound_ip_observation==='host_conntrack'?'宿主机 NAT/conntrack 还原':'容器 socket 观察';const inboundTop=Array.isArray(sec.inbound_top_ips)?sec.inbound_top_ips:[];document.getElementById('network').innerHTML=`<dt>监听端口</dt><dd>${esc((sec.listening_ports||[]).join(', ')||'-')}</dd><dt>NAT/代理</dt><dd>${esc(exposure.map(x=>`${x.listen||'?'} → ${x.target||'?'}`).join(', ')||'-')}</dd><dt>入站去重 IP</dt><dd class='${inboundAlert?'bad-text':''}'>${inboundUniqueIps} / 阈值 ${inboundThreshold}</dd><dt>入站来源口径</dt><dd>${esc(inboundMode)}</dd><dt>主要入站来源</dt><dd>${esc(inboundTop.slice(0,10).map(x=>`${x.ip||'?'} (${Number(x.connections||0)})`).join('、')||'-')}</dd><dt>入站连接</dt><dd>${Number(sec.incoming_established||0)}</dd><dt>出站去重 IP</dt><dd>${Number(sec.outbound_unique_ips||0)}</dd><dt>TCP 来源</dt><dd>${esc(countries(current?.tcp_country_stats))}</dd><dt>UDP 来源</dt><dd>${esc(countries(current?.udp_country_stats))}</dd><dt>RX pps</dt><dd>${num(sec.net_rx_pps,1)}</dd><dt>SYN_RECV</dt><dd>${Number(sec.syn_recv_count||0)}</dd>`;
   const risks=Array.isArray(sec.configuration_risks)?sec.configuration_risks:[],pair=sec.panel_pairing||{},socks=sec.socks_proxy||{};const socksAuth={no_auth:'无认证',weak_password:'弱密码',configured:'已配置认证',unknown:'认证未知'}[socks.auth_mode||'unknown'];document.getElementById('security').innerHTML=`<div>面板对接：<strong class='${pair.detected&&!pair.approved?'bad-text':'ok'}'>${pair.detected?(pair.approved?'已放行':'检测到特征'):'未发现'}</strong></div><div>SOCKS 代理：<strong class='${socks.detected&&['no_auth','weak_password'].includes(socks.auth_mode)?'bad-text':'ok'}'>${socks.detected?`已识别 · ${esc(socksAuth)}${socks.public_exposure?' · 公网/NAT 暴露':''}`:'未发现'}</strong></div>`+listHtml(risks,'未发现配置风险',x=>`<li>${esc(x.message||x.code||'配置风险')}</li>`);
@@ -2817,6 +2696,7 @@ function drawChart(id,series){const svg=document.getElementById(id);const values
   document.getElementById('samples').innerHTML=pts.length?pts.slice(-20).reverse().map(x=>`<div class='sample'><span>${esc(x.timestamp_iso_utc8||'-')}</span><span>CPU ${num(x.cpu_percent)}%</span><span>内存 ${num(x.mem_percent)}%</span><span>RX ${num(mbps(x.net_rx_bps))}M</span><span>TX ${num(mbps(x.net_tx_bps))}M</span><span>连接 ${Number(x.conn_count||0)}</span></div>`).join(''):`<div class='ok'>暂无历史采样</div>`;
  }catch(error){const status=document.getElementById('status');status.className='status bad';status.innerText=`详情加载失败：${error.message||error}`}
 }
+NW.initReveal('[data-reveal]');NW.decorateIcons();NW.initTheme();NW.initSheen('.card,.kpi-card,.section-card,.panel,.alert-card,.container-card,.host-group,.page-header');
 loadDetail();setInterval(loadDetail,15000);
 </script></body></html>
 """
@@ -2824,75 +2704,50 @@ loadDetail();setInterval(loadDetail,15000);
 
 @app.get("/stats", response_class=HTMLResponse)
 def stats_page() -> str:
-    return """
-<!doctype html>
-<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Container Stats</title>
-<style>
-*{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}
-:root{color-scheme:dark;--bg:#020617;--surface:#0f172a;--surface-2:#172033;--surface-3:#1e293b;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--focus:#7dd3fc}
-body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.5}.page{width:min(1600px,100%);margin:auto;padding:20px}.skip-link{position:fixed;left:12px;top:-60px;z-index:10;background:var(--accent);color:#082f49;padding:10px 14px;border-radius:8px;font-weight:700}.skip-link:focus{top:12px}
-.page-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:18px 20px;margin-bottom:16px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(135deg,var(--surface),#111d34)}.page-header h1{margin:0;font-size:22px}.page-header p{margin:4px 0 0;color:var(--muted);font-size:13px}
-.topbar{display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap}.topbar label{color:var(--muted);font-size:13px}.topbar input{width:110px;min-height:44px;padding:7px 9px;border:1px solid var(--border);border-radius:8px;background:#0b1220;color:var(--text)}.btn-link,.topbar button{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 13px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);text-decoration:none;cursor:pointer}.btn-link:hover,.topbar button:hover{filter:brightness(1.12)}.btn-link:focus-visible,.topbar button:focus-visible,.topbar input:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
-.card-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-bottom:12px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;color:var(--muted);font-size:12px}
-.value{font-size:22px;font-weight:700;margin-top:6px}
-.value{color:var(--text);font-variant-numeric:tabular-nums}.section{margin:14px 0;border:1px solid var(--border);border-radius:12px;background:var(--surface);overflow:hidden}.section h2{margin:0;padding:13px 15px;border-bottom:1px solid var(--border);background:var(--surface-2);font-size:16px}
-table{border-collapse:collapse;width:100%;max-width:100%;table-layout:fixed;background:var(--surface);color:var(--text)}
-th,td{border:1px solid var(--border);padding:8px;text-align:center;overflow-wrap:anywhere;word-break:break-word;font-size:12px}th{background:var(--surface-3);color:#cbd5e1}
-a{color:#7dd3fc}.detail-link{display:inline-flex;align-items:center;justify-content:center;min-height:40px;border:1px solid var(--border);border-radius:7px;padding:5px 9px;text-decoration:none;background:var(--surface-3);color:var(--text)}.version-pill{display:inline-flex;align-items:center;border:1px solid #166534;border-radius:999px;padding:4px 9px;background:#052e16;color:#86efac;font-size:12px}.version-pill.warn{border-color:#92400e;background:#451a03;color:#fcd34d}
-@media(max-width:800px){.page{padding:8px}.page-header{flex-direction:column;padding:14px}.topbar{justify-content:flex-start}.card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}th,td{padding:5px;font-size:11px}#all-containers th:nth-child(6),#all-containers td:nth-child(6),#all-containers th:nth-child(7),#all-containers td:nth-child(7),#all-containers th:nth-child(9),#all-containers td:nth-child(9){display:none}}
-@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}}
-</style>
-</head><body><a class='skip-link' href='#stats-main'>跳到主要内容</a><main id='stats-main' class='page'>
+    return _page_head("数据统计 · Narwhal Monitor") + """
+<body><a class='skip-link' href='#stats-main'>跳到主要内容</a><main id='stats-main' class='page-shell'>
 <header class='page-header'><div><h1>数据统计</h1><p>资源、连接与累计流量分析；点击排查进入独立容器详情。</p></div><div class='topbar'>
+  <button id='theme-toggle' class='theme-toggle' type='button' data-icon='sun' aria-label='切换到白天主题'></button>
   <span id='stats-server-version' class='version-pill warn'>Server 版本检查中</span>
   <label>统计窗口(分钟)：<input id='minutes' type='number' value='720' min='5' max='10080' /></label>
-  <button onclick='loadStats()'>刷新</button>
-  <a class='btn-link' href='/'>返回总览</a>
+  <button class='btn' type='button' data-icon='rotate-cw' onclick='loadStats()'>刷新</button>
+  <a class='nav-link' href='/' data-icon='arrow-left'>返回总览</a>
 </div></header>
 <div class='card-grid'>
-  <div class='card'><div>容器数</div><div class='value' id='kpi-containers'>0</div></div>
-  <div class='card'><div>样本数</div><div class='value' id='kpi-samples'>0</div></div>
-  <div class='card'><div>建议采样间隔</div><div class='value' id='kpi-interval'>--</div></div>
-  <div class='card'><div>窗口</div><div class='value' id='kpi-window'>--</div></div>
+  <div class='card' data-reveal><div>容器数</div><div class='value' id='kpi-containers'>0</div></div>
+  <div class='card' data-reveal><div>样本数</div><div class='value' id='kpi-samples'>0</div></div>
+  <div class='card' data-reveal><div>建议采样间隔</div><div class='value' id='kpi-interval'>--</div></div>
+  <div class='card' data-reveal><div>窗口</div><div class='value' id='kpi-window'>--</div></div>
 </div>
 
-<section class='section'><h2>Top10：平均 CPU</h2>
+<section class='section-card' data-reveal><div class='section-head'><h2>Top10：平均 CPU</h2></div><div class='section-body'><div class='table-scroll'>
   <table id='cpu-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均 CPU%</th><th>峰值 CPU%</th><th>估算间隔(秒)</th><th>排查</th></tr></thead><tbody></tbody></table>
-</section>
+</div></div></section>
 
-<section class='section'><h2>Top10：平均连接数</h2>
+<section class='section-card' data-reveal><div class='section-head'><h2>Top10：平均连接数</h2></div><div class='section-body'><div class='table-scroll'>
   <table id='conn-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>平均连接</th><th>峰值连接</th><th>样本数</th><th>排查</th></tr></thead><tbody></tbody></table>
-</section>
+</div></div></section>
 
-<section class='section'><h2>Top10：累计流量</h2>
+<section class='section-card' data-reveal><div class='section-head'><h2>Top10：累计流量</h2></div><div class='section-body'><div class='table-scroll'>
   <table id='traffic-top'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th><th>排查</th></tr></thead><tbody></tbody></table>
-</section>
+</div></div></section>
 
-<section class='section'><h2>全部容器</h2>
+<section class='section-card' data-reveal><div class='section-head'><h2>全部容器</h2></div><div class='section-body'><div class='table-scroll'>
 <table id='all-containers'><thead><tr><th>主机</th><th>运行时</th><th>容器</th><th>当前 CPU%</th><th>当前内存%</th><th>当前 RX</th><th>当前 TX</th><th>当前连接</th><th>样本数</th><th>排查</th></tr></thead><tbody></tbody></table>
-</section>
+</div></div></section>
 
-<section class='section'><h2>主机汇总</h2>
+<section class='section-card' data-reveal><div class='section-head'><h2>主机汇总</h2></div><div class='section-body'><div class='table-scroll'>
 <table id='host-summary'><thead><tr><th>主机</th><th>累计 RX</th><th>累计 TX</th><th>累计总流量</th><th>样本数</th></tr></thead><tbody></tbody></table>
-</section>
+</div></div></section>
 
 <script>
-function fmtBytes(n){
-  const x = Number(n||0); if (x<=0) return '0 B';
-  const units=['B','KB','MB','GB','TB']; let i=0; let v=x;
-  while(v>=1024 && i<units.length-1){v/=1024;i++;}
-  return `${v.toFixed(v>=100?0:1)} ${units[i]}`;
-}
-function escapeHtml(value){
-  return String(value??'').replace(/[&<>'"]/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
-}
+const {fmtBytes,escapeHtml}=NW;
 function detailHref(x){
   const q=new URLSearchParams({host:x.host_id,runtime:x.runtime,project:x.project||'',container:x.container_name});
   return `/container-detail?${q.toString()}`;
 }
 function detailCell(x){
-  return `<a class='detail-link' href='${escapeHtml(detailHref(x))}'>容器详情</a>`;
+  return `<a class='detail-link' href='${escapeHtml(detailHref(x))}'>${NW.icon('external-link')}容器详情</a>`;
 }
 function renderRows(id, rows, mapper){
   const tb=document.querySelector(`#${id} tbody`);
@@ -2908,7 +2763,7 @@ async function loadStats(){
   const res=await fetch(`/api/v1/stats?minutes=${minutes}`);
   const data=await res.json();
   const version=document.getElementById('stats-server-version'),serverVersion=String(data.server_version||'dev');
-  version.className=`version-pill ${serverVersion==='dev'?'warn':''}`;
+  version.className=`version-pill ${serverVersion==='dev'?'warn':'ok'}`;
   version.innerText=serverVersion==='dev'?'Server dev':`Server v${serverVersion}`;
   document.getElementById('kpi-containers').innerText=data.container_count||0;
   document.getElementById('kpi-samples').innerText=data.samples||0;
@@ -2950,6 +2805,7 @@ async function loadStats(){
     <td>${x.samples}</td>
   `);
 }
+NW.initReveal('[data-reveal]');NW.decorateIcons();NW.initTheme();NW.initSheen('.card,.kpi-card,.section-card,.panel,.alert-card,.container-card,.host-group,.page-header');
 loadStats();
 </script>
 </main></body></html>

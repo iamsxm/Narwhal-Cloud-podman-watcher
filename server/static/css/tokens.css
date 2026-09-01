@@ -1,0 +1,169 @@
+/**
+ * Narwhal Monitor - iOS 18 Design Tokens (tokens.css)
+ * Apple iOS 18 Design Language & Human Interface Guidelines
+ */
+
+:root {
+  /* ==========================================================================
+     1. iOS 18 Dynamic System Colors (Dark Mode Default)
+     ========================================================================== */
+  --color-primary: #0A84FF;          /* iOS System Blue */
+  --color-primary-hover: #409CFF;
+  --color-primary-active: #0062CC;
+  --color-primary-tint: rgba(10, 132, 255, 0.15);
+  --color-on-primary: #FFFFFF;
+
+  --color-secondary: #1C1C1E;        /* iOS systemGroupedBackground Dark */
+  --color-surface: rgba(28, 28, 30, 0.78);
+  --color-surface-subtle: rgba(44, 44, 46, 0.62);
+  --color-surface-card: rgba(36, 36, 38, 0.72);
+  --color-surface-hover: rgba(58, 58, 60, 0.82);
+  --color-surface-elevated: #2C2C2E;
+  --color-background: #000000;       /* iOS Pure OLED Black */
+
+  /* Typography Colors (iOS Label Vibrancy) */
+  --color-foreground: #FFFFFF;                  /* iOS Primary Label */
+  --color-foreground-muted: rgba(235, 235, 245, 0.68);  /* iOS Secondary Label */
+  --color-foreground-subtle: rgba(235, 235, 245, 0.42); /* iOS Tertiary Label */
+
+  /* Border & Separator Colors */
+  --color-border: rgba(255, 255, 255, 0.12);
+  --color-border-subtle: rgba(255, 255, 255, 0.07);
+  --color-border-input: rgba(255, 255, 255, 0.16);
+  --color-border-reveal: rgba(10, 132, 255, 0.55);
+  --color-border-glass: rgba(255, 255, 255, 0.14);
+  --glass-inner-bevel: inset 0 1px 0.5px rgba(255, 255, 255, 0.18);
+
+  /* Status Accents (iOS 18 Vibrant System Palette) */
+  --color-accent: #0A84FF;
+  --color-success: #30D158;          /* iOS System Green */
+  --color-warning: #FF9F0A;          /* iOS System Orange */
+  --color-destructive: #FF453A;      /* iOS System Red */
+  --color-info: #0A84FF;             /* iOS System Blue */
+  --color-purple: #BF5AF2;           /* iOS System Purple */
+  --color-cyan: #64D2FF;             /* iOS System Cyan */
+  --color-pink: #FF375F;             /* iOS System Pink */
+  --color-ring: #0A84FF;
+
+  /* ==========================================================================
+     2. iOS 18 Frosted Glass & Liquid Acrylic Materials
+     ========================================================================== */
+  --acrylic-bg: rgba(24, 24, 26, 0.82);
+  --acrylic-bg-card: rgba(32, 32, 35, 0.75);
+  --acrylic-bg-hover: rgba(48, 48, 52, 0.88);
+  --acrylic-blur: blur(28px) saturate(190%);
+  --acrylic-blur-lg: blur(40px) saturate(210%);
+
+  /* ==========================================================================
+     3. iOS 18 Layered Ambient Soft Shadows
+     ========================================================================== */
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.2), 0 1px 2px rgba(0, 0, 0, 0.15);
+  --shadow-md: 0 8px 24px -4px rgba(0, 0, 0, 0.32), 0 2px 6px rgba(0, 0, 0, 0.18);
+  --shadow-lg: 0 16px 44px -8px rgba(0, 0, 0, 0.45), 0 4px 12px rgba(0, 0, 0, 0.22);
+  --shadow-hover: 0 14px 36px -4px rgba(0, 0, 0, 0.42), 0 4px 12px rgba(0, 0, 0, 0.25);
+  --shadow-focus: 0 0 0 3.5px rgba(10, 132, 255, 0.35);
+  --shadow-xl: 0 24px 64px -12px rgba(0, 0, 0, 0.6), 0 8px 24px rgba(0, 0, 0, 0.3);
+
+  /* Chart Colors (iOS Health & Activity Palette) */
+  --chart-cpu: #0A84FF;              /* Blue */
+  --chart-mem: #30D158;              /* Green */
+  --chart-conn: #BF5AF2;             /* Purple */
+  --chart-speed: #FF9F0A;            /* Orange */
+  --chart-rx: #30D158;               /* Green */
+  --chart-tx: #64D2FF;               /* Cyan */
+  --chart-grid: rgba(255, 255, 255, 0.08);
+
+  /* ==========================================================================
+     4. Typography (San Francisco / Apple System)
+     ========================================================================== */
+  --font-heading: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Rounded", "PingFang SC", "Hiragino Sans GB", "Helvetica Neue", sans-serif;
+  --font-body: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro", "PingFang SC", "Hiragino Sans GB", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Fira Code", monospace;
+
+  /* Font Sizes */
+  --font-size-xs: 0.75rem;    /* 12px */
+  --font-size-sm: 0.8125rem;  /* 13px */
+  --font-size-base: 0.875rem; /* 14px */
+  --font-size-md: 1rem;       /* 16px */
+  --font-size-lg: 1.125rem;   /* 18px */
+  --font-size-xl: 1.25rem;    /* 20px */
+  --font-size-2xl: 1.5rem;    /* 24px */
+  --font-size-3xl: 2.125rem;  /* 34px - iOS Large Title */
+
+  /* ==========================================================================
+     5. Spacing Variables (iOS 8-pt Grid System)
+     ========================================================================== */
+  --space-xs: 4px;
+  --space-sm: 6px;
+  --space-md: 10px;
+  --space-lg: 14px;
+  --space-xl: 18px;
+  --space-2xl: 26px;
+  --space-3xl: 36px;
+
+  /* ==========================================================================
+     6. iOS 18 Squircles & Fluid Spring Transitions
+     ========================================================================== */
+  --radius-xs: 6px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-xl: 26px;
+  --radius-2xl: 34px;
+  --radius-full: 9999px;
+
+  --transition-control: all 200ms cubic-bezier(0.16, 1, 0.3, 1);
+  --transition-card: all 260ms cubic-bezier(0.16, 1, 0.3, 1);
+  --transition-icon: transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  --transition-spring: all 320ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* ==========================================================================
+   iOS 18 Light Theme Overrides (Apple iOS 18 Light Appearance)
+   ========================================================================== */
+[data-theme='light'] {
+  --color-primary: #007AFF;          /* iOS Light System Blue */
+  --color-primary-hover: #0066D6;
+  --color-primary-active: #0051A8;
+  --color-primary-tint: rgba(0, 122, 255, 0.12);
+  --color-on-primary: #FFFFFF;
+
+  --color-secondary: #F2F2F7;        /* iOS systemGroupedBackground Light */
+  --color-surface: rgba(255, 255, 255, 0.84);
+  --color-surface-subtle: rgba(242, 242, 247, 0.85);
+  --color-surface-card: rgba(255, 255, 255, 0.92);
+  --color-surface-hover: rgba(235, 235, 240, 0.96);
+  --color-surface-elevated: #FFFFFF;
+  --color-background: #F2F2F7;       /* iOS Light Grouped Background */
+
+  --color-foreground: #000000;                  /* Primary Label */
+  --color-foreground-muted: rgba(60, 60, 67, 0.68);  /* Secondary Label */
+  --color-foreground-subtle: rgba(60, 60, 67, 0.42); /* Tertiary Label */
+
+  --color-border: rgba(60, 60, 67, 0.12);
+  --color-border-subtle: rgba(60, 60, 67, 0.08);
+  --color-border-input: rgba(60, 60, 67, 0.22);
+  --color-border-reveal: rgba(0, 122, 255, 0.45);
+  --color-border-glass: rgba(255, 255, 255, 0.8);
+  --glass-inner-bevel: inset 0 1px 0.5px rgba(255, 255, 255, 0.9);
+
+  --color-success: #34C759;
+  --color-warning: #FF9500;
+  --color-destructive: #FF3B30;
+  --color-info: #007AFF;
+  --color-purple: #AF52DE;
+  --color-cyan: #32ADE6;
+
+  --acrylic-bg: rgba(255, 255, 255, 0.82);
+  --acrylic-bg-card: rgba(255, 255, 255, 0.9);
+  --acrylic-bg-hover: #FFFFFF;
+
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 8px 24px -4px rgba(0, 0, 0, 0.1), 0 2px 6px rgba(0, 0, 0, 0.05);
+  --shadow-lg: 0 16px 44px -8px rgba(0, 0, 0, 0.14), 0 4px 12px rgba(0, 0, 0, 0.06);
+  --shadow-hover: 0 14px 36px -4px rgba(0, 0, 0, 0.16), 0 4px 12px rgba(0, 0, 0, 0.08);
+  --shadow-focus: 0 0 0 3.5px rgba(0, 122, 255, 0.3);
+  --shadow-xl: 0 24px 64px -12px rgba(0, 0, 0, 0.2), 0 8px 24px rgba(0, 0, 0, 0.1);
+
+  --chart-grid: rgba(60, 60, 67, 0.08);
+}

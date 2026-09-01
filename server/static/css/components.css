@@ -1,0 +1,711 @@
+/**
+ * Narwhal Monitor - Components System (components.css)
+ * Apple iOS 18 Design Component Library
+ */
+
+/* ==========================================================================
+   1. Base Reset & iOS 18 Typography
+   ========================================================================== */
+html, body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-body);
+  font-size: var(--font-size-base);
+  line-height: 1.45;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+  color: var(--color-foreground);
+  margin: 0;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+}
+
+/* Accessibility: Skip Link (iOS Pill Style) */
+.skip-link {
+  position: absolute;
+  top: -100px;
+  left: var(--space-lg);
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+  padding: var(--space-sm) var(--space-xl);
+  font-weight: 600;
+  font-family: var(--font-body);
+  border-radius: var(--radius-full);
+  z-index: 9999;
+  text-decoration: none;
+  box-shadow: var(--shadow-md);
+  transition: top var(--transition-control);
+}
+
+.skip-link:focus {
+  top: var(--space-lg);
+}
+
+/* Accessibility: iOS 18 Focus Glow */
+:focus-visible {
+  outline: none !important;
+  box-shadow: var(--shadow-focus) !important;
+}
+
+/* ==========================================================================
+   2. iOS 18 Frosted Glass & Material Primitives
+   ========================================================================== */
+.glass-panel,
+.section-card,
+.panel {
+  background: var(--acrylic-bg-card);
+  backdrop-filter: var(--acrylic-blur);
+  -webkit-backdrop-filter: var(--acrylic-blur);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--glass-inner-bevel), var(--shadow-sm);
+  position: relative;
+  overflow: hidden;
+  transition: var(--transition-card);
+}
+
+.glass-card,
+.kpi-card,
+.alert-card,
+.container-card,
+.card {
+  background: var(--color-surface-card);
+  backdrop-filter: var(--acrylic-blur);
+  -webkit-backdrop-filter: var(--acrylic-blur);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--glass-inner-bevel), var(--shadow-sm);
+  position: relative;
+  overflow: hidden;
+  transition: var(--transition-card);
+}
+
+/* iOS 18 Subtle Hover Elevation & Edge Luminance */
+.glass-card:hover,
+.kpi-card:hover,
+.alert-card:hover,
+.container-card:hover,
+.card:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--glass-inner-bevel), var(--shadow-hover);
+  border-color: var(--color-border-reveal);
+  background: var(--color-surface-hover);
+}
+
+/* Fallback for browsers without backdrop-filter support */
+@supports not (backdrop-filter: blur(10px)) {
+  .glass-panel,
+  .section-card,
+  .panel,
+  .modal-card,
+  .page-header {
+    background-color: var(--color-surface-elevated) !important;
+  }
+}
+
+/* ==========================================================================
+   3. iOS 18 Buttons & Interactive Controls
+   ========================================================================== */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-sm);
+  padding: 8px 16px;
+  font-family: var(--font-body);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  color: var(--color-foreground);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--color-border-input);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  text-decoration: none;
+  transition: var(--transition-control);
+  user-select: none;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+  background: rgba(255, 255, 255, 0.14);
+  border-color: var(--color-border-reveal);
+}
+
+/* iOS Tactile Press Spring Scale */
+.btn:active:not(:disabled) {
+  transform: scale(0.96) translateY(0) !important;
+  opacity: 0.88;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+/* Primary Button: iOS System Blue */
+.btn-primary {
+  background: linear-gradient(180deg, #0A84FF 0%, #0070E0 100%);
+  color: #FFFFFF;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 2px 10px rgba(10, 132, 255, 0.35);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #2491FF 0%, #0A84FF 100%);
+  box-shadow: 0 4px 16px rgba(10, 132, 255, 0.45);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.btn-primary:active:not(:disabled) {
+  background: #0062CC;
+}
+
+/* Secondary Button */
+.btn-secondary {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-foreground);
+  border: 1px solid var(--color-border);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: var(--color-foreground-muted);
+}
+
+/* Destructive / Danger Button: iOS System Red */
+.btn-danger {
+  background: linear-gradient(180deg, #FF453A 0%, #E6352A 100%);
+  color: #FFFFFF;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 2px 10px rgba(255, 69, 58, 0.35);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: linear-gradient(180deg, #FF5B52 0%, #FF453A 100%);
+  box-shadow: 0 4px 16px rgba(255, 69, 58, 0.45);
+}
+
+/* Success Button: iOS System Green */
+.btn-success {
+  background: linear-gradient(180deg, #30D158 0%, #25B84B 100%);
+  color: #FFFFFF;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 2px 10px rgba(48, 209, 88, 0.35);
+}
+
+.btn-success:hover:not(:disabled) {
+  background: linear-gradient(180deg, #44DB6A 0%, #30D158 100%);
+  box-shadow: 0 4px 16px rgba(48, 209, 88, 0.45);
+}
+
+/* Navigation Links (iOS Frosted Capsule Buttons) */
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: 6px 14px;
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--color-foreground-muted);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-full);
+  text-decoration: none;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: var(--transition-control);
+}
+
+.nav-link:hover {
+  color: var(--color-foreground);
+  background: rgba(255, 255, 255, 0.12);
+  border-color: var(--color-border-reveal);
+  transform: translateY(-1px);
+}
+
+.nav-link:active {
+  transform: scale(0.96) translateY(0);
+}
+
+/* ==========================================================================
+   4. Status Pills, Chips & iOS 18 Segmented Controls
+   ========================================================================== */
+.pill,
+.version-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: 4px 10px;
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  border-radius: var(--radius-full);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--color-border);
+  color: var(--color-foreground-muted);
+  white-space: nowrap;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.version-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+
+/* Status variants (iOS Vibrant Accents) */
+.pill-ok,
+.version-pill.ok,
+.pill.active,
+.pill.resolved,
+.pill.remediated {
+  background: rgba(48, 209, 88, 0.14);
+  border-color: rgba(48, 209, 88, 0.35);
+  color: #30D158;
+}
+
+.pill-warn,
+.version-pill.warn,
+.pill.dismissed,
+.pill.suppressed {
+  background: rgba(255, 159, 10, 0.14);
+  border-color: rgba(255, 159, 10, 0.35);
+  color: #FF9F0A;
+}
+
+.pill-bad,
+.version-pill.bad,
+.pill.critical {
+  background: rgba(255, 69, 58, 0.14);
+  border-color: rgba(255, 69, 58, 0.35);
+  color: #FF453A;
+}
+
+/* iOS 18 Segmented Control Track */
+.status-tabs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-full);
+  margin-top: var(--space-lg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.status-chip {
+  padding: 5px 14px;
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-full);
+  color: var(--color-foreground-muted);
+  cursor: pointer;
+  transition: var(--transition-control);
+}
+
+.status-chip:hover {
+  color: var(--color-foreground);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.status-chip.active {
+  background: var(--color-primary);
+  color: #FFFFFF;
+  box-shadow: 0 2px 8px rgba(10, 132, 255, 0.4);
+}
+
+.status-chip:active {
+  transform: scale(0.96);
+}
+
+.ok {
+  color: #30D158;
+}
+
+.bad,
+.bad-text {
+  color: #FF453A;
+}
+
+.warn {
+  color: #FF9F0A;
+}
+
+/* ==========================================================================
+   5. Form Inputs & Filters (iOS 18 Input Styling)
+   ========================================================================== */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  min-width: 140px;
+}
+
+.field label {
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-muted);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+input[type='text'],
+input[type='search'],
+input[type='number'],
+select {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--color-border-input);
+  border-radius: var(--radius-md);
+  padding: 8px 14px;
+  color: var(--color-foreground);
+  font-family: var(--font-body);
+  font-size: var(--font-size-sm);
+  outline: none;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: var(--transition-control);
+}
+
+input[type='search']::-webkit-search-cancel-button {
+  filter: invert(1);
+  cursor: pointer;
+}
+
+select {
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,0.7)' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 34px;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+select option {
+  background-color: #1C1C1E;
+  color: #FFFFFF;
+}
+
+input:focus,
+select:focus {
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-focus) !important;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-lg);
+  padding-top: var(--space-xs);
+}
+
+.filter-actions {
+  display: flex;
+  gap: var(--space-md);
+  margin-left: auto;
+}
+
+/* ==========================================================================
+   6. Data Tables & Scroll Wrappers (iOS Inset List Style)
+   ========================================================================== */
+.table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-border-subtle);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  text-align: left;
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+}
+
+thead {
+  background: rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid var(--color-border);
+}
+
+th {
+  padding: 10px 16px;
+  font-family: var(--font-heading);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--color-foreground-muted);
+  letter-spacing: -0.01em;
+  border-bottom: 1px solid var(--color-border);
+}
+
+tbody tr {
+  border-bottom: 1px solid var(--color-border-subtle);
+  transition: background-color var(--transition-control);
+}
+
+tbody tr:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+td {
+  padding: 12px 16px;
+  color: var(--color-foreground);
+  border-bottom: 1px solid var(--color-border-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+td.severity-critical {
+  color: #FF453A;
+  font-weight: 600;
+}
+
+td.severity-warning {
+  color: #FF9F0A;
+  font-weight: 600;
+}
+
+td.severity-info {
+  color: #0A84FF;
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   7. Modals & iOS 18 Frosted Dialog Sheets
+   ========================================================================== */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: var(--acrylic-blur-lg);
+  -webkit-backdrop-filter: var(--acrylic-blur-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-xl);
+  overflow-y: auto;
+}
+
+.modal-overlay[hidden] {
+  display: none !important;
+}
+
+.modal-card {
+  background: var(--acrylic-bg-card);
+  backdrop-filter: var(--acrylic-blur);
+  -webkit-backdrop-filter: var(--acrylic-blur);
+  border: 1px solid var(--color-border-glass);
+  border-radius: var(--radius-2xl);
+  box-shadow: var(--glass-inner-bevel), var(--shadow-xl);
+  max-width: 980px;
+  width: 100%;
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: var(--space-3xl);
+  position: relative;
+  animation: iosModalPop 280ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes iosModalPop {
+  from {
+    opacity: 0;
+    transform: scale(0.94) translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.modal-close {
+  position: absolute;
+  top: var(--space-xl);
+  right: var(--space-xl);
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--color-border);
+  color: var(--color-foreground-muted);
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-full);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: var(--transition-control);
+}
+
+.modal-close:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: var(--color-foreground);
+  border-color: var(--color-primary);
+  transform: scale(1.05);
+}
+
+.modal-close:active {
+  transform: scale(0.92);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--space-2xl);
+}
+
+/* ==========================================================================
+   8. Icons & Micro-Interactions
+   ========================================================================== */
+.theme-toggle {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--color-border);
+  color: var(--color-foreground);
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-full);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: var(--transition-control);
+}
+
+.theme-toggle:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: var(--color-primary);
+  transform: scale(1.06);
+}
+
+.theme-toggle:active {
+  transform: scale(0.92);
+}
+
+[data-icon] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  transition: var(--transition-icon);
+}
+
+.group:hover [data-icon],
+.btn:hover [data-icon],
+.nav-link:hover [data-icon] {
+  transform: scale(1.08);
+}
+
+[data-icon] svg,
+.nw-icon {
+  width: 16px;
+  height: 16px;
+  stroke-width: 2.2;
+  stroke: currentColor;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vertical-align: middle;
+}
+
+/* ==========================================================================
+   9. iOS Dynamic Island & Toast Notifications
+   ========================================================================== */
+.nw-toast-container {
+  position: fixed;
+  bottom: var(--space-2xl);
+  right: var(--space-2xl);
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  pointer-events: none;
+}
+
+.nw-toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: 10px 20px;
+  background: rgba(28, 28, 30, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: var(--radius-full);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5), inset 0 1px 0.5px rgba(255, 255, 255, 0.2);
+  color: #FFFFFF;
+  font-family: var(--font-body);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  animation: toastPopIn 260ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  transition: var(--transition-card);
+}
+
+.nw-toast.error {
+  border-color: rgba(255, 69, 58, 0.4);
+  color: #FF453A;
+}
+
+@keyframes toastPopIn {
+  from {
+    opacity: 0;
+    transform: translateY(16px) scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ==========================================================================
+   10. Reduced Motion Preference
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,0 +1,983 @@
+/**
+ * Narwhal Monitor - Page Layouts & Specific Styles (pages.css)
+ * Apple iOS 18 Design Layouts & Views
+ */
+
+/* ==========================================================================
+   1. Page Shell & iOS Base Canvas
+   ========================================================================== */
+body {
+  min-height: 100vh;
+  background-color: var(--color-background);
+  background-image: 
+    radial-gradient(at 0% 0%, rgba(10, 132, 255, 0.08) 0px, transparent 50%),
+    radial-gradient(at 100% 100%, rgba(191, 90, 242, 0.06) 0px, transparent 50%);
+  background-attachment: fixed;
+}
+
+[data-theme='light'] body {
+  background-image: 
+    radial-gradient(at 0% 0%, rgba(0, 122, 255, 0.06) 0px, transparent 50%),
+    radial-gradient(at 100% 100%, rgba(175, 82, 222, 0.04) 0px, transparent 50%);
+}
+
+.page-shell {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: var(--space-xl) var(--space-2xl) var(--space-3xl);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xl);
+}
+
+/* ==========================================================================
+   2. Page Header & iOS 18 Glass Navigation Bar
+   ========================================================================== */
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-xl);
+  padding: 12px 24px;
+  background: var(--acrylic-bg);
+  backdrop-filter: var(--acrylic-blur);
+  -webkit-backdrop-filter: var(--acrylic-blur);
+  border: 1px solid var(--color-border-glass);
+  border-radius: var(--radius-2xl);
+  box-shadow: var(--glass-inner-bevel), var(--shadow-md);
+  position: sticky;
+  top: var(--space-lg);
+  z-index: 100;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+}
+
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  background: linear-gradient(135deg, #0A84FF 0%, #5E5CE6 100%);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 12px;
+  box-shadow: 0 4px 14px rgba(10, 132, 255, 0.4), inset 0 1px 0.5px rgba(255, 255, 255, 0.35);
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: var(--font-size-sm);
+  color: #FFFFFF;
+  letter-spacing: -0.02em;
+  transition: transform var(--transition-card);
+}
+
+.brand:hover .brand-mark {
+  transform: scale(1.06);
+}
+
+.page-title {
+  font-size: 1.375rem; /* 22px */
+  font-weight: 700;
+  color: var(--color-foreground);
+  line-height: 1.2;
+  letter-spacing: -0.025em;
+}
+
+.page-subtitle {
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-muted);
+  margin-top: 2px;
+}
+
+.page-header-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+}
+
+.refresh-time {
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   3. KPI Grid & iOS 18 Interactive Widgets
+   ========================================================================== */
+.kpi-grid,
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-xl);
+}
+
+.kpi-card,
+.card {
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  border-radius: var(--radius-xl);
+}
+
+.kpi-label,
+.card > div:first-child {
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--color-foreground-muted);
+  letter-spacing: -0.01em;
+}
+
+.kpi-value,
+.card .value {
+  font-family: var(--font-heading);
+  font-size: var(--font-size-3xl);
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  color: var(--color-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.kpi-value.danger {
+  color: #FF453A;
+  text-shadow: 0 0 16px rgba(255, 69, 58, 0.35);
+}
+
+/* ==========================================================================
+   4. Section Card & iOS Inset Grouped Host Accordions
+   ========================================================================== */
+.section-card {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius-2xl);
+}
+
+.section-head {
+  padding: 18px 26px;
+  border-bottom: 1px solid var(--color-border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  flex-wrap: wrap;
+}
+
+.section-head h2 {
+  font-size: 1.125rem; /* 18px */
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.section-head p {
+  margin: var(--space-xs) 0 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-muted);
+}
+
+.section-body {
+  padding: 20px 26px;
+}
+
+.host-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xl);
+}
+
+.host-group {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  background: var(--color-surface-card);
+  backdrop-filter: var(--acrylic-blur);
+  -webkit-backdrop-filter: var(--acrylic-blur);
+  box-shadow: var(--glass-inner-bevel), var(--shadow-sm);
+  overflow: hidden;
+  transition: var(--transition-card);
+}
+
+.host-group.is-open {
+  border-color: var(--color-border-reveal);
+  box-shadow: var(--glass-inner-bevel), var(--shadow-md);
+}
+
+.host-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+  padding: 16px 24px;
+  background: transparent;
+  border: none;
+  color: var(--color-foreground);
+  cursor: pointer;
+  text-align: left;
+  transition: background-color var(--transition-control);
+}
+
+.host-toggle:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.host-chevron {
+  width: 18px;
+  height: 18px;
+  color: var(--color-foreground-muted);
+  transition: transform var(--transition-spring);
+  flex-shrink: 0;
+}
+
+.host-group.is-open .host-chevron {
+  transform: rotate(90deg);
+  color: var(--color-primary);
+}
+
+.host-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.host-name {
+  font-family: var(--font-heading);
+  font-size: var(--font-size-md);
+  font-weight: 700;
+  color: var(--color-foreground);
+  letter-spacing: -0.015em;
+}
+
+.host-subtitle {
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-muted);
+}
+
+.host-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  margin-left: auto;
+}
+
+.host-panel {
+  padding: 22px 24px;
+  border-top: 1px solid var(--color-border-subtle);
+  background: rgba(0, 0, 0, 0.15);
+}
+
+[data-theme='light'] .host-panel {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.host-panel[hidden] {
+  display: none;
+}
+
+/* ==========================================================================
+   5. Container Cards & Metric Layouts (iOS App Card Grid)
+   ========================================================================== */
+.containers-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: var(--space-xl);
+}
+
+.container-card {
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+  border-radius: var(--radius-xl);
+}
+
+.container-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-md);
+}
+
+.container-name {
+  font-family: var(--font-heading);
+  font-size: var(--font-size-md);
+  font-weight: 700;
+  color: var(--color-foreground);
+  letter-spacing: -0.015em;
+  word-break: break-all;
+}
+
+.container-meta {
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-muted);
+  margin-top: 2px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--space-md);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.metric-label {
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-subtle);
+  font-weight: 500;
+}
+
+.metric-value {
+  font-family: var(--font-heading);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  color: var(--color-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.metric-value.bad {
+  color: #FF453A;
+}
+
+.metric-value.severity-warning {
+  color: #FF9F0A;
+}
+
+.container-info-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-md);
+}
+
+.info-block {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+}
+
+.info-block h4 {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--color-foreground-muted);
+  margin-bottom: var(--space-sm);
+  letter-spacing: -0.01em;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px var(--space-md);
+  margin: 0;
+  font-size: var(--font-size-xs);
+}
+
+.kv dt {
+  color: var(--color-foreground-subtle);
+  font-family: var(--font-body);
+}
+
+.kv dd {
+  margin: 0;
+  color: var(--color-foreground);
+  word-break: break-all;
+  font-variant-numeric: tabular-nums;
+}
+
+.container-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-md);
+  margin-top: auto;
+  padding-top: var(--space-xs);
+}
+
+.container-actions .btn {
+  width: 100%;
+}
+
+/* ==========================================================================
+   6. Security Alerts & History Page (iOS Notification Cards)
+   ========================================================================== */
+.alert-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xl);
+  padding: 20px 24px;
+}
+
+.alert-card {
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  border-left: 4px solid var(--color-border);
+  border-radius: var(--radius-xl);
+}
+
+.alert-card.critical {
+  border-left-color: #FF453A;
+  background: linear-gradient(90deg, rgba(255, 69, 58, 0.08) 0%, var(--color-surface-card) 30%);
+}
+
+.alert-card.warning {
+  border-left-color: #FF9F0A;
+  background: linear-gradient(90deg, rgba(255, 159, 10, 0.08) 0%, var(--color-surface-card) 30%);
+}
+
+.alert-card.info {
+  border-left-color: #0A84FF;
+  background: linear-gradient(90deg, rgba(10, 132, 255, 0.08) 0%, var(--color-surface-card) 30%);
+}
+
+.alert-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-md);
+}
+
+.alert-title h3 {
+  font-size: var(--font-size-md);
+  font-weight: 700;
+  color: var(--color-foreground);
+  letter-spacing: -0.015em;
+}
+
+.alert-title .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  margin-top: var(--space-xs);
+}
+
+.alert-card .message {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-foreground);
+  line-height: 1.5;
+}
+
+.evidence {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-md);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+}
+
+.evidence-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.evidence-block span {
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-subtle);
+}
+
+.evidence-block strong {
+  font-family: var(--font-heading);
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground);
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.result {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-size: var(--font-size-xs);
+  font-family: var(--font-body);
+  color: var(--color-foreground-muted);
+}
+
+.card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  flex-wrap: wrap;
+  margin-top: var(--space-xs);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.card-footer .timestamps {
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+.card-footer .actions {
+  display: flex;
+  gap: var(--space-md);
+}
+
+.security-action-state {
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  margin-bottom: var(--space-xs);
+}
+
+.security-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+}
+
+.action-status {
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-subtle);
+  margin-top: var(--space-xs);
+}
+
+.load-more {
+  display: flex;
+  justify-content: center;
+  padding: var(--space-xl);
+}
+
+/* ==========================================================================
+   7. Container Detail Page & SVG Chart Visualizations
+   ========================================================================== */
+.status {
+  padding: 14px 20px;
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-card);
+  border: 1px solid var(--color-border);
+  font-family: var(--font-body);
+  font-size: var(--font-size-sm);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: var(--glass-inner-bevel), var(--shadow-sm);
+}
+
+.diagnostic {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+}
+
+.diagnostic-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  flex-wrap: wrap;
+}
+
+.diagnostic-head h2 {
+  font-size: 1.125rem;
+}
+
+.diagnostic-head p {
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-muted);
+  margin: var(--space-xs) 0 0;
+}
+
+.diagnostic-state {
+  font-family: var(--font-body);
+  font-size: var(--font-size-sm);
+  padding: 10px 16px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--color-border-subtle);
+}
+
+.comm-note {
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-subtle);
+  font-family: var(--font-body);
+}
+
+.deep-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--space-md);
+  margin: var(--space-lg) 0;
+}
+
+.deep-metric {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+}
+
+.deep-metric span {
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-subtle);
+  font-family: var(--font-body);
+}
+
+.deep-metric strong {
+  font-size: var(--font-size-md);
+  color: var(--color-foreground);
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.deep-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: var(--space-lg);
+  margin-bottom: var(--space-lg);
+}
+
+.deep-section {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+}
+
+.deep-section h3 {
+  font-size: var(--font-size-sm);
+  margin-bottom: var(--space-md);
+  color: var(--color-foreground-muted);
+}
+
+.deep-list {
+  max-height: 280px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.deep-row {
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  line-height: 1.5;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-lg);
+}
+
+.metrics .metric {
+  background: var(--color-surface-card);
+  backdrop-filter: var(--acrylic-blur);
+  -webkit-backdrop-filter: var(--acrylic-blur);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 16px 20px;
+  box-shadow: var(--glass-inner-bevel), var(--shadow-sm);
+}
+
+.metrics .metric.metric-alert {
+  border-color: #FF453A;
+  background: rgba(255, 69, 58, 0.1);
+}
+
+.charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+  gap: var(--space-xl);
+}
+
+.charts .panel,
+.detail-grid .panel,
+.traffic-panel {
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-lg);
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-muted);
+}
+
+.legend-item,
+.legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  box-shadow: 0 0 6px currentColor;
+}
+
+svg#chart,
+svg#bandwidth,
+svg#traffic,
+svg#resource-chart,
+svg#network-chart {
+  width: 100%;
+  height: 180px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  overflow: visible;
+}
+
+[data-theme='light'] svg#chart,
+[data-theme='light'] svg#bandwidth,
+[data-theme='light'] svg#traffic,
+[data-theme='light'] svg#resource-chart,
+[data-theme='light'] svg#network-chart {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: var(--space-xl);
+}
+
+.details .panel {
+  padding: 22px;
+}
+
+.snapshot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--space-xl);
+  margin-top: var(--space-xl);
+}
+
+.snapshot-list,
+.list {
+  margin: var(--space-sm) 0 0;
+  padding-left: var(--space-xl);
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  color: var(--color-foreground-muted);
+}
+
+.comm-process-grid,
+.socket-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--space-md);
+  margin-top: var(--space-md);
+}
+
+.comm-process,
+.socket-card {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+}
+
+.socket-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-xs);
+}
+
+.direction {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+}
+
+.direction.inbound {
+  background: rgba(48, 209, 88, 0.18);
+  color: #30D158;
+}
+
+.direction.outbound {
+  background: rgba(10, 132, 255, 0.18);
+  color: #0A84FF;
+}
+
+.samples {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.sample {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-muted);
+  padding: 8px 14px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--radius-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   8. Stats Page Specifics
+   ========================================================================== */
+.topbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+}
+
+.topbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  color: var(--color-foreground-muted);
+}
+
+.topbar input[type='number'] {
+  width: 90px;
+}
+
+.detail-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  color: var(--color-primary);
+  text-decoration: none;
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: var(--font-size-xs);
+  transition: color var(--transition-control);
+}
+
+.detail-link:hover {
+  color: var(--color-primary-hover);
+  text-decoration: underline;
+}
+
+.empty,
+.empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-md);
+  padding: var(--space-3xl);
+  color: var(--color-foreground-subtle);
+  font-family: var(--font-body);
+  font-size: var(--font-size-sm);
+}
+
+/* ==========================================================================
+   9. Responsive Breakpoints (375px, 640px, 768px, 1024px, 1440px)
+   ========================================================================== */
+@media (max-width: 1024px) {
+  .page-shell {
+    padding: var(--space-lg);
+  }
+  .charts {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    position: static;
+    padding: var(--space-lg);
+  }
+  .page-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .containers-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .page-shell {
+    padding: var(--space-md);
+    gap: var(--space-lg);
+  }
+  .filters {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .filter-actions {
+    margin-left: 0;
+    width: 100%;
+  }
+  .filter-actions .btn {
+    flex: 1;
+  }
+  .host-toggle {
+    padding: var(--space-md) var(--space-lg);
+    flex-wrap: wrap;
+  }
+  .host-summary {
+    width: 100%;
+    margin-left: 0;
+    margin-top: var(--space-sm);
+  }
+  .host-panel {
+    padding: var(--space-md);
+  }
+  .modal-card {
+    padding: var(--space-xl);
+  }
+}
+
+@media (max-width: 375px) {
+  .page-title {
+    font-size: var(--font-size-lg);
+  }
+  .kpi-grid {
+    grid-template-columns: 1fr;
+  }
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
+}
